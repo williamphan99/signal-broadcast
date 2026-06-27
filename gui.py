@@ -2,11 +2,11 @@
 """Tkinter front end for Signal Broadcast.
 
 A thin UI over engine.py: a first-run Link screen (renders the QR you scan with
-your phone) and a tabbed main screen — Send (type, attach, send, watch, resend)
-and Schedule (set daily times, turn the launchd job on/off). All sending happens
-on a worker thread; the engine talks back through a thread-safe queue that the Tk
-main loop drains. Colours are chosen explicitly so the log is readable in both
-macOS Light and Dark mode.
+your phone) and a tabbed main screen — Send (type, attach, send, resend), Groups
+(pick which to send to), Schedule (daily auto-send), and Security (station-mode
+wipe-on-unplug). All sending happens on a worker thread; the engine talks back
+through a thread-safe queue that the Tk main loop drains. Colours are chosen
+explicitly so the log is readable in both macOS Light and Dark mode.
 """
 
 from __future__ import annotations

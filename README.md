@@ -17,7 +17,7 @@ that they only ever click one icon and type.
 
 1. **Clone the folder onto their Mac:**
    ```bash
-   git clone <repo-url> ~/signal-broadcast
+   git clone https://github.com/williamphan99/signal-broadcast.git ~/signal-broadcast
    ```
    (Cloning — rather than downloading a zip — avoids macOS's "unidentified developer"
    warning. See [Distribution notes](#distribution-notes).)
@@ -202,5 +202,22 @@ so it isn't committed to the repo — `Setup.command` creates it.
 | `scripts/link-device.sh`, `scripts/pull-groups.sh` | CLI-only setup helpers |
 | `signal-cli-data/` | link keys — **never commit or share this** |
 | `logs/` | run logs and failure ledgers |
+
+> `signal-cli-data/`, `groups.txt`, `message.txt`, `attachments.txt`, `logs/`, the
+> built `.app`, and the generated plist are all `.gitignore`d — your number, groups,
+> and message never get committed.
+
+---
+
+## Responsible use
+
+This automates sending to many Signal groups, which is in tension with Signal's terms
+(bulk/automated messaging). Keep it slow, prefer once a day over many times, only send
+to groups that expect your messages, and don't use it to spam. You are responsible for
+how you use it.
+
+## License
+
+[MIT](LICENSE) © William Phan. Do whatever you like with it; no warranty.
 </content>
 </invoke>
