@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import threading
 import tkinter as tk
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -317,7 +318,9 @@ class App(tk.Tk):
     def _build_schedule_tab(self, tab) -> None:
         ttk.Label(tab, text="Daily auto-send", font=("", 12, "bold")).pack(anchor="w")
         self.sched_status = ttk.Label(tab, text="", font=("", 14, "bold"))
-        self.sched_status.pack(anchor="w", pady=(4, 10))
+        self.sched_status.pack(anchor="w", pady=(4, 4))
+        self.last_send_label = ttk.Label(tab, text="", foreground=PALETTE["muted"])
+        self.last_send_label.pack(anchor="w", pady=(0, 10))
         ttk.Label(tab, wraplength=600, justify="left", foreground=PALETTE["muted"], text=(
             "Automatically send your saved message to every group at set times each "
             "day — you don't need to be at the computer.")
@@ -329,9 +332,11 @@ class App(tk.Tk):
         self.times_entry = ttk.Entry(row)
         self.times_entry.pack(side="left", fill="x", expand=True, padx=8)
         try:
-            self.times_entry.insert(0, ", ".join(engine.load_config().send_times))
+            saved_times = engine.load_config().send_times
         except engine.BroadcastError:
-            self.times_entry.insert(0, "12:00, 16:00")
+            saved_times = []
+        # After a wipe, send_times is empty — fall back to a sensible default.
+        self.times_entry.insert(0, ", ".join(saved_times) if saved_times else "12:00, 16:00")
         ttk.Label(tab, foreground=PALETTE["muted"], text=(
             "24-hour time, separated by commas.   e.g. 09:00 (9am),  13:30 (1:30pm),  17:00 (5pm)")
         ).pack(anchor="w", pady=(4, 12))
@@ -353,6 +358,7 @@ class App(tk.Tk):
             "saved with “Send” or “Save for auto-send”, so set your message first.")
         ).pack(anchor="w", pady=(8, 0))
         self._refresh_schedule_status()
+        self._refresh_last_send()
 
     # ------------------------------------------------------------ small refresh
     def _refresh_status(self) -> None:
@@ -381,6 +387,21 @@ class App(tk.Tk):
             self.sched_status.configure(text=f"● On — daily at {times}", foreground=PALETTE["ok"])
         else:
             self.sched_status.configure(text="○ Off", foreground=PALETTE["muted"])
+
+    def _refresh_last_send(self) -> None:
+        """Show the last completed send (counts only) so a scheduled run's result
+        is visible without opening logs. Cleared with everything else on unlink."""
+        s = engine.read_run_summary()
+        if not s:
+            self.last_send_label.configure(text="No sends yet.", foreground=PALETTE["muted"])
+            return
+        try:
+            when = datetime.fromisoformat(s.at).strftime("%d %b %H:%M")
+        except ValueError:
+            when = s.at
+        self.last_send_label.configure(
+            text=f"Last send: {when} — sent {s.sent}, failed {s.failed}",
+            foreground=PALETTE["error"] if s.failed else PALETTE["muted"])
 
     # ----------------------------------------------------------------- images
     def _add_images(self) -> None:
@@ -471,10 +492,27 @@ class App(tk.Tk):
         messagebox.showinfo("Times saved", f"Times {verb}: {', '.join(times)}.")
         self._refresh_schedule_status()
 
+    def _has_saved_message(self) -> bool:
+        try:
+            engine.read_message()
+            return True
+        except engine.BroadcastError:
+            return False
+
     def _enable_schedule(self) -> None:
         times = self._read_times()
         try:
-            engine.parse_times(times)
+            engine.parse_times(times)  # validate before warning or enabling
+        except engine.BroadcastError as exc:
+            messagebox.showerror("Can't turn on schedule", str(exc))
+            return
+        if not self._has_saved_message() and not messagebox.askyesno(
+                "No message saved",
+                "You haven't saved a message yet, so a scheduled run will have "
+                "nothing to send. Save one on the Send tab first.\n\n"
+                "Turn the schedule on anyway?"):
+            return
+        try:
             engine.save_send_times(times)
             engine.enable_schedule(times)
         except engine.BroadcastError as exc:
@@ -597,7 +635,8 @@ class App(tk.Tk):
         mins = max(1, round(len(groups) * max(engine.MIN_DELAY_S, cfg.base_delay_seconds) / 60))
         return messagebox.askyesno("Send now?",
             f"Send to {len(groups)} groups?\n\n“{preview}”\n{img_note}\n\n"
-            f"This takes about {mins} min. Keep the Mac awake and this app open.")
+            f"This takes about {mins} min (longer if Signal throttles). "
+            "Keep the Mac awake and this app open.")
 
     def _on_resend(self) -> None:
         if not self.failed_results:
@@ -631,6 +670,7 @@ class App(tk.Tk):
                 on_progress=lambda d, t, n, ok: self.events.put(("progress", (d, t, n, ok))),
                 should_stop=self.stop_event.is_set)
             engine.stamp_run()
+            engine.write_run_summary(results)
             self.events.put(("send_done", results))
         except engine.BroadcastError as exc:
             self.events.put(("log", f"Error: {exc}"))
@@ -691,7 +731,8 @@ class App(tk.Tk):
         elif kind == "log":
             m = payload
             low = m.lower()
-            if "gave up" in low or "error" in low:
+            # Final failures are red; retries ("backing off", "retrying") stay neutral.
+            if "gave up" in low or "failed after retries" in low or low.startswith("error"):
                 tag = "error"
             elif m.startswith("Done"):
                 tag = "ok"
@@ -723,6 +764,8 @@ class App(tk.Tk):
             self._log(f"Failed groups saved to {out}. Use “Resend failed” to retry them.", "muted")
             self.resend_btn.configure(state="normal")
         self._refresh_status()
+        if hasattr(self, "last_send_label"):
+            self._refresh_last_send()
 
 
 if __name__ == "__main__":

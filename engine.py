@@ -30,6 +30,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_DIR / "signal-cli-data"
 LOGS_DIR = PROJECT_DIR / "logs"
 LAST_RUN_FILE = LOGS_DIR / "last-run.txt"
+LAST_SEND_FILE = LOGS_DIR / "last-send.json"  # counts-only summary for the UI
 CONFIG_FILE = PROJECT_DIR / "config.toml"
 GROUPS_FILE = PROJECT_DIR / "groups.txt"
 MESSAGE_FILE = PROJECT_DIR / "message.txt"
@@ -91,6 +92,14 @@ class GroupEntry:
     group_id: str
     name: str
     enabled: bool  # False = commented out in groups.txt = skipped
+
+
+@dataclass
+class RunSummary:
+    at: str  # ISO timestamp of the last completed broadcast
+    total: int
+    sent: int
+    failed: int
 
 
 _GROUPS_HEADER = (
@@ -449,6 +458,30 @@ def write_failures(failures: list[GroupSendResult]) -> Path | None:
     # group_id only — it's needed to resend; names are never written to disk.
     out.write_text("".join(f"{r.group_id}\n" for r in failures), encoding="utf-8")
     return out
+
+
+def write_run_summary(results: list[GroupSendResult]) -> None:
+    """Record a counts-only summary of the last broadcast for the UI — no group
+    names, ids, or message text, just totals. Lives in logs/ so it's wiped with
+    everything else on unlink (incl. a station-mode trip) and never committed."""
+    if not results:
+        return
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    failed = sum(1 for r in results if not r.ok)
+    summary = {"at": datetime.now().isoformat(timespec="seconds"),
+               "total": len(results), "sent": len(results) - failed, "failed": failed}
+    LAST_SEND_FILE.write_text(json.dumps(summary), encoding="utf-8")
+
+
+def read_run_summary() -> RunSummary | None:
+    if not LAST_SEND_FILE.exists():
+        return None
+    try:
+        d = json.loads(LAST_SEND_FILE.read_text(encoding="utf-8"))
+        return RunSummary(at=str(d["at"]), total=int(d["total"]),
+                          sent=int(d["sent"]), failed=int(d["failed"]))
+    except (ValueError, KeyError):
+        return None
 
 
 # --------------------------------------------------------------------------- #

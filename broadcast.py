@@ -83,6 +83,7 @@ def run(args: argparse.Namespace) -> int:
             "[%d/%d] %s", done, total, "sent" if ok else "FAILED"),
     )
     engine.stamp_run()
+    engine.write_run_summary(results)
 
     failed = [r for r in results if not r.ok]
     log.info("Done. Sent %d, failed %d.", len(results) - len(failed), len(failed))
