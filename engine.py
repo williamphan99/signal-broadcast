@@ -382,28 +382,28 @@ def _deliver_to_group(binary: str, account: str, group_id: str,
                       on_log: LogFn, should_stop: StopFn) -> bool:
     """Try one group with retries. Throttled sends back off exponentially; other
     failures get a couple of quick retries. Returns True on success. Log lines carry
-    no group name or id — only counts and the failure reason."""
+    no group name, id, or raw signal-cli output — only counts and retry timing, since
+    signal-cli error text can contain the group id or a recipient number."""
     throttle_attempt = 0
     quick_attempt = 0
     while not should_stop():
         ok, throttled, err = _send_one(binary, account, group_id, message, attachments)
         if ok:
             return True
-        short = err.splitlines()[0] if err else "(no error output)"
         if throttled:
             throttle_attempt += 1
             if throttle_attempt > max_retries:
                 on_log(f"Gave up after {max_retries} throttled retries")
                 return False
-            wait = _throttle_wait(throttle_attempt, err)
+            wait = _throttle_wait(throttle_attempt, err)  # err parsed for retry-after, never logged
             on_log(f"Throttled — backing off {wait:.0f}s (retry {throttle_attempt}/{max_retries})")
             _interruptible_sleep(wait, should_stop)
         else:
             quick_attempt += 1
             if quick_attempt > NON_THROTTLE_RETRIES:
-                on_log(f"Send error: {short}")
+                on_log("Send failed after retries.")
                 return False
-            on_log(f"Send error: {short} — retrying in {NON_THROTTLE_WAIT_S:.0f}s")
+            on_log(f"Send error — retrying in {NON_THROTTLE_WAIT_S:.0f}s")
             _interruptible_sleep(NON_THROTTLE_WAIT_S, should_stop)
     return False
 

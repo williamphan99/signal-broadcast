@@ -51,7 +51,8 @@ class PowerWatcher:
 
     def tick(self) -> None:
         if self._on_ac():
-            self._stand_down(awake=True)           # plugged in — all clear
+            # Stay awake to notice an unplug only while there's a link worth protecting.
+            self._stand_down(awake=self._is_linked())
             return
         if not self._is_linked():
             self._stand_down(awake=False)          # nothing to protect; allow sleep

@@ -168,6 +168,7 @@ class App(tk.Tk):
         threading.Thread(target=self._link_worker, daemon=True).start()
 
     def _link_worker(self) -> None:
+        png = None
         try:
             binary = engine.signal_cli_bin()
             qrencode = shutil.which("qrencode")
@@ -207,6 +208,10 @@ class App(tk.Tk):
             self.events.put(("linked_done", None))
         except Exception as exc:
             self.events.put(("link_error", str(exc)))
+        finally:
+            # The QR encodes a one-time link token — don't leave it in /tmp.
+            if png is not None:
+                png.unlink(missing_ok=True)
 
     # ------------------------------------------------------- plug-in gate
     def _show_plug_in_prompt(self) -> None:
