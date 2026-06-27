@@ -1,4 +1,5 @@
-# Signal broadcast settings. Edit these values, not the code.
+# Template for config.toml. Setup (and the app) copy this to config.toml on first
+# run; your real settings live there, gitignored. Edit these values, not the code.
 
 account            = "+61XXXXXXXXX"  # your Signal number, linked as a secondary device
 base_delay_seconds = 16               # avg pause between groups; raise to go slower / safer

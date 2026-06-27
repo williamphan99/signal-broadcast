@@ -193,7 +193,8 @@ so it isn't committed to the repo — `Setup.command` creates it.
 | `broadcast.py` | command-line front end (used by the schedule) |
 | `engine.py` | shared core: loop, pacing, retry, failure ledger |
 | `watcher.py` | station-mode background agent: wipes everything if unplugged |
-| `config.toml` | settings: number, pacing, cooldown, schedule times |
+| `config.example.toml` | settings template (committed; no personal data) |
+| `config.toml` | your live settings — number, pacing, schedule (created from the template on setup; not in git) |
 | `message.txt` | the message body (the app saves it on Send; safe to hand-edit) |
 | `attachments.txt` | image paths (managed by the app; safe to hand-edit) |
 | `groups.txt` | your group list; comment out a line to skip a group |
@@ -203,9 +204,10 @@ so it isn't committed to the repo — `Setup.command` creates it.
 | `signal-cli-data/` | link keys — **never commit or share this** |
 | `logs/` | run logs and failure ledgers |
 
-> `signal-cli-data/`, `groups.txt`, `message.txt`, `attachments.txt`, `logs/`, the
-> built `.app`, and the generated plist are all `.gitignore`d — your number, groups,
-> and message never get committed.
+> `config.toml`, `signal-cli-data/`, `groups.txt`, `message.txt`, `attachments.txt`,
+> `logs/`, the built `.app`, and the generated plist are all `.gitignore`d — your
+> number, groups, and message never get committed. Only the placeholder
+> `config.example.toml` is in git.
 
 ---
 

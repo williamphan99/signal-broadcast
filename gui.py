@@ -654,6 +654,7 @@ class App(tk.Tk):
     def _begin_send(self, cfg, groups, message, attachments) -> None:
         self.stop_event.clear()
         self.failed_results = []
+        self._sending_groups = list(groups)  # so a stop can resume the un-sent tail
         self.send_btn.set_enabled(False)
         self.resend_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
@@ -669,8 +670,9 @@ class App(tk.Tk):
                 on_log=lambda m: self.events.put(("log", m)),
                 on_progress=lambda d, t, n, ok: self.events.put(("progress", (d, t, n, ok))),
                 should_stop=self.stop_event.is_set)
-            engine.stamp_run()
-            engine.write_run_summary(results)
+            if not self.stop_event.is_set():  # a stopped run is incomplete — don't arm the cooldown
+                engine.stamp_run()
+                engine.write_run_summary(results)
             self.events.put(("send_done", results))
         except engine.BroadcastError as exc:
             self.events.put(("log", f"Error: {exc}"))
@@ -755,13 +757,28 @@ class App(tk.Tk):
     def _finish_send(self, results: list[engine.GroupSendResult]) -> None:
         self.stop_btn.configure(state="disabled")
         self.send_btn.set_enabled(True)
-        self.failed_results = [r for r in results if not r.ok]
-        sent = len(results) - len(self.failed_results)
-        self._log(f"Done. Sent {sent}, failed {len(self.failed_results)}.",
-                  "error" if self.failed_results else "ok")
+        stopped = self.stop_event.is_set()
+        failed = [r for r in results if not r.ok]
+        sent = len(results) - len(failed)
+        # On a stop, the groups never reached are resumable too — fold them in so
+        # “Resend failed” finishes the run.
+        pending: list[engine.GroupSendResult] = []
+        if stopped:
+            done_ids = {r.group_id for r in results}
+            pending = [engine.GroupSendResult(gid, name, False)
+                       for gid, name in getattr(self, "_sending_groups", [])
+                       if gid not in done_ids]
+        self.failed_results = failed + pending
+        if stopped:
+            self._log(f"Stopped. Sent {sent}; {len(self.failed_results)} not sent.", "muted")
+        else:
+            self._log(f"Done. Sent {sent}, failed {len(failed)}.",
+                      "error" if failed else "ok")
         if self.failed_results:
             out = engine.write_failures(self.failed_results)
-            self._log(f"Failed groups saved to {out}. Use “Resend failed” to retry them.", "muted")
+            label = "Unsent + failed" if stopped else "Failed"
+            verb = "finish." if stopped else "retry them."
+            self._log(f"{label} groups saved to {out}. Use “Resend failed” to {verb}", "muted")
             self.resend_btn.configure(state="normal")
         self._refresh_status()
         if hasattr(self, "last_send_label"):

@@ -1,7 +1,9 @@
 # signal-cli link state — contains your device KEYS. Never commit this.
 signal-cli-data/
 
-# Per-user runtime data — your groups, message, and image paths. Never commit.
+# Per-user runtime data — your number, groups, message, and image paths. Never
+# commit. config.toml is created from config.example.toml on first run.
+config.toml
 groups.txt
 message.txt
 attachments.txt

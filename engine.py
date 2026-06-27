@@ -31,7 +31,8 @@ DATA_DIR = PROJECT_DIR / "signal-cli-data"
 LOGS_DIR = PROJECT_DIR / "logs"
 LAST_RUN_FILE = LOGS_DIR / "last-run.txt"
 LAST_SEND_FILE = LOGS_DIR / "last-send.json"  # counts-only summary for the UI
-CONFIG_FILE = PROJECT_DIR / "config.toml"
+CONFIG_FILE = PROJECT_DIR / "config.toml"          # per-user (holds the number); gitignored
+CONFIG_EXAMPLE_FILE = PROJECT_DIR / "config.example.toml"  # tracked template
 GROUPS_FILE = PROJECT_DIR / "groups.txt"
 MESSAGE_FILE = PROJECT_DIR / "message.txt"
 ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
@@ -111,7 +112,17 @@ _GROUPS_HEADER = (
 # --------------------------------------------------------------------------- #
 # Config + input files
 # --------------------------------------------------------------------------- #
+def ensure_config() -> None:
+    """Materialise config.toml from the tracked template on first run / after a
+    wipe. config.toml holds the linked number, so it's gitignored and never
+    committed — only this placeholder template is. No-op once it exists."""
+    if CONFIG_FILE.exists() or not CONFIG_EXAMPLE_FILE.exists():
+        return
+    shutil.copyfile(CONFIG_EXAMPLE_FILE, CONFIG_FILE)
+
+
 def load_config() -> Config:
+    ensure_config()
     if not CONFIG_FILE.exists():
         raise BroadcastError(f"Missing {CONFIG_FILE.name}.")
     raw = tomllib.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -131,6 +142,7 @@ def load_config() -> Config:
 def save_account(number: str) -> None:
     """Persist a detected/linked number into config.toml without disturbing the
     rest of the file (simple line rewrite — config.toml stays hand-editable)."""
+    ensure_config()
     if not CONFIG_FILE.exists():
         return
     lines = CONFIG_FILE.read_text(encoding="utf-8").splitlines()
@@ -145,6 +157,7 @@ def save_account(number: str) -> None:
 
 def save_send_times(times: list[str]) -> None:
     """Persist schedule times into config.toml, preserving the trailing comment."""
+    ensure_config()
     if not CONFIG_FILE.exists():
         return
     lines = CONFIG_FILE.read_text(encoding="utf-8").splitlines()
@@ -633,8 +646,9 @@ def unlink() -> None:
     disable_schedule()
     LOCAL_PLIST.unlink(missing_ok=True)
     shutil.rmtree(DATA_DIR, ignore_errors=True)        # link keys + account.db cache
-    for f in (GROUPS_FILE, MESSAGE_FILE, ATTACHMENTS_FILE):
+    # Delete config.toml outright — it holds the number — then recreate a fresh
+    # placeholder from the template, so no local copy of the number survives.
+    for f in (GROUPS_FILE, MESSAGE_FILE, ATTACHMENTS_FILE, CONFIG_FILE):
         f.unlink(missing_ok=True)
     _clear_dir(LOGS_DIR, keep={".gitkeep"})
-    save_account("+61XXXXXXXXX")                        # drop the phone number from config
-    save_send_times([])
+    ensure_config()

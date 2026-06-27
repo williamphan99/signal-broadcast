@@ -11,6 +11,9 @@ echo
 # (Folders from 'git clone' are not quarantined, so this is usually a no-op.)
 xattr -dr com.apple.quarantine . 2>/dev/null || true
 
+# Your settings live in config.toml (gitignored); seed it from the template once.
+[ -f config.toml ] || cp config.example.toml config.toml
+
 # 1. Homebrew (the macOS package installer)
 if ! command -v brew >/dev/null 2>&1; then
   echo "Installing Homebrew — you may be asked for your Mac password…"
