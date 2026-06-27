@@ -585,7 +585,10 @@ def _clear_dir(path: Path, keep: set[str] = frozenset()) -> None:
     for item in path.iterdir():
         if item.name in keep:
             continue
-        shutil.rmtree(item, ignore_errors=True) if item.is_dir() else item.unlink(missing_ok=True)
+        if item.is_dir():
+            shutil.rmtree(item, ignore_errors=True)
+        else:
+            item.unlink(missing_ok=True)
 
 
 def unlink() -> None:

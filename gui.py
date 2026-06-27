@@ -686,8 +686,12 @@ class App(tk.Tk):
         elif kind == "log":
             m = payload
             low = m.lower()
-            tag = "error" if ("gave up" in low or "error" in low) else (
-                "ok" if m.startswith("Done") else "muted")
+            if "gave up" in low or "error" in low:
+                tag = "error"
+            elif m.startswith("Done"):
+                tag = "ok"
+            else:
+                tag = "muted"
             self._log(m, tag)
         elif kind == "progress":
             done, total, _name, ok = payload
