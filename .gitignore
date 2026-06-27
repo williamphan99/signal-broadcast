@@ -1,0 +1,19 @@
+# signal-cli link state — contains your device KEYS. Never commit this.
+signal-cli-data/
+
+# Per-user runtime data — your groups, message, and image paths. Never commit.
+groups.txt
+message.txt
+attachments.txt
+
+# Generated launchd job (machine-specific paths)
+com.user.signal-broadcast.plist
+
+# Dock launcher built locally by Setup (bakes in this machine's absolute path)
+Signal Broadcast.app/
+
+# Run logs, failure ledgers, last-run marker
+logs/*
+!logs/.gitkeep
+
+__pycache__/
