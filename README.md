@@ -197,7 +197,7 @@ iPhone default) often won't display for non-Apple recipients.
 part to test text-only):
 ```bash
 cd ~/signal-broadcast
-NUM=$(signal-cli --config ./signal-cli-data -o json listAccounts | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["number"])')
+NUM="+61XXXXXXXXX"   # your number, WITH country code (set by hand — QR linking doesn't change it)
 signal-cli --config ./signal-cli-data -a "$NUM" send -m "test" -a /full/path/to/image.jpg "$NUM"
 ```
 
@@ -215,7 +215,7 @@ Replace `+61XXXXXXXXX` only if the auto-detect line doesn't work.
 cd ~/signal-broadcast
 
 # Your linked number (used by the commands below)
-NUM=$(signal-cli --config ./signal-cli-data -o json listAccounts | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["number"])')
+NUM="+61XXXXXXXXX"   # your number, WITH country code (set by hand — QR linking doesn't change it)
 echo "linked as: ${NUM:-<not linked>}"
 
 # Is this device linked? (lists the linked account, or nothing)
