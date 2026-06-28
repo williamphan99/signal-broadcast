@@ -208,8 +208,8 @@ cd ~/signal-broadcast && python3 broadcast.py --limit 2 --dry-run
 
 ### Diagnostic cheat sheet
 
-Run these from the project folder. Set `NUM` once, then use whichever you need.
-Replace `+61XXXXXXXXX` only if the auto-detect line doesn't work.
+Run these from the project folder. Set `NUM` to your number once (with country code),
+then use whichever check you need.
 
 ```bash
 cd ~/signal-broadcast
