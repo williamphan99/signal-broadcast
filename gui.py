@@ -444,8 +444,9 @@ class App(tk.Tk):
             when = datetime.fromisoformat(s.at).strftime("%d %b %H:%M")
         except ValueError:
             when = s.at
+        tail = f", skipped {s.skipped}" if s.skipped else ""
         self.last_send_label.configure(
-            text=f"Last send: {when} — sent {s.sent}, failed {s.failed}",
+            text=f"Last send: {when} — sent {s.sent}, failed {s.failed}{tail}",
             foreground=PALETTE["error"] if s.failed else PALETTE["muted"])
 
     # ----------------------------------------------------------------- images
@@ -506,19 +507,38 @@ class App(tk.Tk):
         self.group_vars: dict[str, tk.BooleanVar] = {
             e.group_id: tk.BooleanVar(value=e.enabled) for e in self.group_entries}
         self._render_groups()
+        self._check_group_perms()  # mark admin-only groups in the background
+
+    def _check_group_perms(self) -> None:
+        """Find which groups are admin-only (can't post) off the UI thread, then
+        re-render to label them. Best-effort — a failure just leaves them unmarked."""
+        if not self.group_entries:
+            return
+
+        def work():
+            try:
+                account = engine.detect_account() or engine.load_config().account
+                ids = engine.unsendable_groups(account)
+            except engine.BroadcastError:
+                ids = set()
+            self.events.put(("group_perms", ids))
+        threading.Thread(target=work, daemon=True).start()
 
     def _render_groups(self) -> None:
         """Draw the checkboxes for groups matching the search box, reusing the
-        existing vars so selections persist across filtering."""
+        existing vars so selections persist across filtering. Admin-only groups
+        (you can't post in them) are labelled and will be skipped at send time."""
         for child in self.groups_inner.winfo_children():
             child.destroy()
         query = self.group_search.get().strip().lower() if hasattr(self, "group_search") else ""
+        blocked = getattr(self, "_unsendable_ids", set())
         self._visible_ids: list[str] = []
         for e in self.group_entries:
             if query and query not in e.name.lower():
                 continue
             self._visible_ids.append(e.group_id)
-            ttk.Checkbutton(self.groups_inner, text=e.name, variable=self.group_vars[e.group_id],
+            label = f"{e.name}   ·  admin-only (skipped)" if e.group_id in blocked else e.name
+            ttk.Checkbutton(self.groups_inner, text=label, variable=self.group_vars[e.group_id],
                             command=self._update_group_count).pack(anchor="w", pady=1)
         if not self.group_entries:
             ttk.Label(self.groups_inner, text="No groups yet — link your phone first.",
@@ -1012,8 +1032,11 @@ class App(tk.Tk):
             done, total, _name, ok = payload
             self.progress.configure(value=done)
             self.counter.configure(text=f"{done} / {total}")
-            self._log(f"[{done}/{total}] sent" if ok else f"[{done}/{total}] failed",
-                      "ok" if ok else "error")
+            if ok is None:
+                self._log(f"[{done}/{total}] skipped — admin-only", "muted")
+            else:
+                self._log(f"[{done}/{total}] sent" if ok else f"[{done}/{total}] failed",
+                          "ok" if ok else "error")
         elif kind == "send_done":
             self._finish_send(payload)
         elif kind == "refresh_status":
@@ -1023,13 +1046,18 @@ class App(tk.Tk):
             self._finish_refresh(payload)
         elif kind == "update_done":
             self._finish_update(payload)
+        elif kind == "group_perms":
+            self._unsendable_ids = payload
+            if hasattr(self, "group_search"):
+                self._render_groups()
 
     def _finish_send(self, results: list[engine.GroupSendResult]) -> None:
         self.stop_btn.configure(state="disabled", text="Stop")
         self.send_btn.set_enabled(True)
         stopped = self.stop_event.is_set()
-        failed = [r for r in results if not r.ok]
-        sent = len(results) - len(failed)
+        skipped = [r for r in results if r.skipped]
+        failed = [r for r in results if not r.ok and not r.skipped]
+        sent = sum(1 for r in results if r.ok)
         # On a stop, the groups never reached are resumable too — fold them in so
         # “Resend failed” finishes the run.
         pending: list[engine.GroupSendResult] = []
@@ -1038,11 +1066,17 @@ class App(tk.Tk):
             pending = [engine.GroupSendResult(gid, name, False)
                        for gid, name in getattr(self, "_sending_groups", [])
                        if gid not in done_ids]
+        # Skipped (admin-only) groups are NOT added to failed_results — resending
+        # them would just fail again. They're reported, not retried.
         self.failed_results = failed + pending
+        if skipped:
+            names = ", ".join(r.name for r in skipped)
+            self._log(f"Skipped {len(skipped)} admin-only group(s) you can't post in: {names}", "muted")
         if stopped:
             self._log(f"Stopped. Sent {sent}; {len(self.failed_results)} not sent.", "muted")
         else:
-            self._log(f"Done. Sent {sent}, failed {len(failed)}.",
+            tail = f", skipped {len(skipped)}" if skipped else ""
+            self._log(f"Done. Sent {sent}, failed {len(failed)}{tail}.",
                       "error" if failed else "ok")
         if self.failed_results:
             out = engine.write_failures(self.failed_results)

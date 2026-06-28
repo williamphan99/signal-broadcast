@@ -41,7 +41,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -130,6 +130,8 @@ class GroupSendResult:
     group_id: str
     name: str
     ok: bool
+    skipped: bool = False   # not attempted on purpose (e.g. admin-only group)
+    reason: str = ""        # short why, for skips/failures (PII-safe category)
 
 
 @dataclass
@@ -145,6 +147,7 @@ class RunSummary:
     total: int
     sent: int
     failed: int
+    skipped: int = 0  # admin-only groups not attempted
 
 
 _GROUPS_HEADER = (
@@ -560,6 +563,34 @@ def pull_groups(account: str) -> int:
     return len(lines)
 
 
+def unsendable_groups(account: str) -> set[str]:
+    """Group ids the linked account CANNOT post to: announcement groups
+    (permissionSendMessage == ONLY_ADMINS) where this account is a non-admin member.
+    Used to skip those cleanly instead of letting the send fail. Best-effort — returns
+    an empty set on any error, and only flags a group when we can positively confirm
+    we're a non-admin member, so a quirk never wrongly skips a group you can post in."""
+    try:
+        binary = signal_cli_bin()
+        proc = subprocess.run(
+            _cli(binary, "--config", str(DATA_DIR), "-o", "json", "-a", account, "listGroups"),
+            capture_output=True, text=True, errors="replace",
+            timeout=LISTGROUPS_TIMEOUT_S, env=_signal_env(binary))
+        if proc.returncode != 0:
+            return set()
+        groups = json.loads(proc.stdout or "[]")
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return set()
+    blocked: set[str] = set()
+    for g in groups:
+        gid = g.get("id")
+        if not gid or g.get("permissionSendMessage") != "ONLY_ADMINS":
+            continue
+        me = next((m for m in (g.get("members") or []) if m.get("number") == account), None)
+        if me is not None and not me.get("isAdmin"):
+            blocked.add(gid)  # confirmed non-admin in an admin-only group
+    return blocked
+
+
 # --------------------------------------------------------------------------- #
 # Sending
 # --------------------------------------------------------------------------- #
@@ -596,9 +627,17 @@ def _interruptible_sleep(seconds: float, should_stop: StopFn) -> None:
         time.sleep(min(0.25, deadline - time.monotonic()))
 
 
+# Posting to an announcement group as a non-admin: a permanent "you can't post here"
+# condition, never worth retrying. We normally catch these up front (unsendable_groups),
+# but this is the safety net for when that pre-check couldn't run.
+ADMIN_ONLY_PATTERN = re.compile(
+    r"only admins|only administrators|announcement group|not allowed to send|"
+    r"sending is restricted|admins?[\s_-]*only", re.I)
+
 # Map signal-cli's error text to a short, PII-safe reason. We never log the raw
 # text (it can contain a group id or recipient number) — only the category here.
 _ERROR_CATEGORIES = [
+    (ADMIN_ONLY_PATTERN, "admin-only group (you can't post here)"),
     (re.compile(r"timed?\s*out|timeout|connection|unreachable|unknownhost|refused|"
                 r"ssl|certificate|\bcdn\b|\bdns\b", re.I), "network or connection problem"),
     (re.compile(r"attachment|upload|file too large|too large", re.I), "attachment or upload problem"),
@@ -641,6 +680,10 @@ def _deliver_to_group(binary: str, account: str, group_id: str,
             wait = _throttle_wait(throttle_attempt, err)  # err parsed for retry-after, never logged
             on_log(f"Throttled — backing off {wait:.0f}s (retry {throttle_attempt}/{max_retries})")
             _interruptible_sleep(wait, should_stop)
+        elif ADMIN_ONLY_PATTERN.search(err):
+            # Non-admin in an announcement group — retrying can never succeed.
+            on_log("Send failed — admin-only group (you can't post here).")
+            return False
         else:
             quick_attempt += 1
             reason = classify_error(err)
@@ -669,12 +712,24 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
     total = len(groups)
     results: list[GroupSendResult] = []
 
+    # Admin-only (announcement) groups you can't post in: skip them up front rather
+    # than burning a doomed send + retries on each. Best-effort; empty on any error.
+    blocked = unsendable_groups(config.account)
+    if blocked:
+        n = sum(1 for gid, _ in groups if gid in blocked)
+        if n:
+            on_log(f"{n} selected group(s) are admin-only — you can't post there; skipping them.")
+
     on_log(f"Broadcasting to {total} groups | {len(attachments)} attachment(s) | "
            f"~{delay:.0f}s between sends")
     for i, (gid, name) in enumerate(groups, start=1):
         if should_stop():
             on_log("Stopped.")
             break
+        if gid in blocked:
+            results.append(GroupSendResult(gid, name, ok=False, skipped=True, reason="admin-only"))
+            on_progress(i, total, name, None)  # None = skipped, not a failure
+            continue  # no send, no pacing delay — nothing left the machine
         ok = _deliver_to_group(binary, config.account, gid, message,
                                attachments, config.max_retries, on_log, should_stop,
                                config.debug)
@@ -703,9 +758,11 @@ def write_run_summary(results: list[GroupSendResult]) -> None:
     if not results:
         return
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    failed = sum(1 for r in results if not r.ok)
+    skipped = sum(1 for r in results if r.skipped)
+    failed = sum(1 for r in results if not r.ok and not r.skipped)
     summary = {"at": datetime.now().isoformat(timespec="seconds"),
-               "total": len(results), "sent": len(results) - failed, "failed": failed}
+               "total": len(results), "sent": sum(1 for r in results if r.ok),
+               "failed": failed, "skipped": skipped}
     LAST_SEND_FILE.write_text(json.dumps(summary), encoding="utf-8")
 
 
@@ -715,7 +772,8 @@ def read_run_summary() -> RunSummary | None:
     try:
         d = json.loads(LAST_SEND_FILE.read_text(encoding="utf-8"))
         return RunSummary(at=str(d["at"]), total=int(d["total"]),
-                          sent=int(d["sent"]), failed=int(d["failed"]))
+                          sent=int(d["sent"]), failed=int(d["failed"]),
+                          skipped=int(d.get("skipped", 0)))
     except (ValueError, KeyError):
         return None
 
