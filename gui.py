@@ -3,8 +3,9 @@
 
 A thin UI over engine.py: a first-run Link screen (renders the QR you scan with
 your phone) and a tabbed main screen — Send (type, attach, send, resend), Groups
-(pick which to send to), Schedule (daily auto-send), and Security (station-mode
-wipe-on-unplug). All sending happens on a worker thread; the engine talks back
+(pick which to send to), Schedule (daily auto-send), and Security (send speed,
+logging, wipe-on-quit, and station-mode wipe-on-unplug). All sending happens on a
+worker thread; the engine talks back
 through a thread-safe queue that the Tk main loop drains. Colours are chosen
 explicitly so the log is readable in both macOS Light and Dark mode.
 """
@@ -93,6 +94,10 @@ class App(tk.Tk):
 
         self.container = ttk.Frame(self, padding=16)
         self.container.pack(fill="both", expand=True)
+
+        # Closing the window (red button / Cmd-Q / Quit) routes through _quit so an
+        # armed "wipe on close" actually fires.
+        self.protocol("WM_DELETE_WINDOW", self._quit)
 
         if os.environ.get("SB_SKIP_LINK") or engine.is_linked():
             self.show_main()
@@ -566,7 +571,79 @@ class App(tk.Tk):
         self._refresh_schedule_status()
 
     # --------------------------------------------------------------- station mode
+    # Send-speed presets: (base_delay_seconds, jitter_seconds). The 10s hard floor
+    # in engine still applies, so even "Faster" never bursts below 10s.
+    SPEED_PRESETS = {
+        "fast": ("Faster — more risky", 12, 3),
+        "balanced": ("Balanced — recommended", 16, 6),  # matches the shipped default
+        "slow": ("Slower — safest", 24, 6),
+    }
+
     def _build_security_tab(self, tab) -> None:
+        # ---- Send speed -----------------------------------------------------
+        ttk.Label(tab, text="Send speed", font=("", 12, "bold")).pack(anchor="w")
+        ttk.Label(tab, wraplength=600, justify="left", foreground=PALETTE["muted"], text=(
+            "How long to pause between groups. Slower is safer against Signal's rate "
+            "limit; faster finishes sooner. Applies to manual and scheduled sends.")
+        ).pack(anchor="w", pady=(2, 6))
+        try:
+            cfg = engine.load_config()
+            current = (cfg.base_delay_seconds, cfg.jitter_seconds)
+        except engine.BroadcastError:
+            current = (15, 5)
+        self.speed_var = tk.StringVar(value="")
+        for key, (label, base, jit) in self.SPEED_PRESETS.items():
+            if (base, jit) == current:
+                self.speed_var.set(key)
+            ttk.Radiobutton(tab, text=f"{label}   (~{base}s ± {jit}s between groups)",
+                            value=key, variable=self.speed_var,
+                            command=self._apply_speed).pack(anchor="w")
+        self.speed_note = ttk.Label(tab, text="", foreground=PALETTE["muted"])
+        self.speed_note.pack(anchor="w", pady=(2, 0))
+        if not self.speed_var.get():
+            self.speed_note.configure(
+                text=f"Custom: ~{current[0]:g}s ± {current[1]:g}s (set in config.toml).")
+
+        ttk.Separator(tab).pack(fill="x", pady=12)
+
+        # ---- Logging --------------------------------------------------------
+        ttk.Label(tab, text="Logging", font=("", 12, "bold")).pack(anchor="w")
+        try:
+            debug_on = engine.load_config().debug
+        except engine.BroadcastError:
+            debug_on = False
+        self.debug_var = tk.BooleanVar(value=debug_on)
+        ttk.Checkbutton(tab, variable=self.debug_var, command=self._toggle_debug,
+                        text="Save a debug log of send errors (off by default)").pack(anchor="w", pady=(2, 0))
+        ttk.Label(tab, wraplength=600, justify="left", foreground=PALETTE["muted"], text=(
+            "Off keeps things private: only a counts-only activity log is kept. Turn on "
+            "only while troubleshooting — the debug log can contain group ids. Every log "
+            "line is timestamped.")
+        ).pack(anchor="w", pady=(0, 4))
+        logbtns = ttk.Frame(tab)
+        logbtns.pack(anchor="w")
+        ttk.Button(logbtns, text="Open logs folder", command=self._open_logs).pack(side="left")
+        ttk.Button(logbtns, text="Clear logs", command=self._clear_logs).pack(side="left", padx=6)
+
+        ttk.Separator(tab).pack(fill="x", pady=12)
+
+        # ---- Wipe on quit ---------------------------------------------------
+        ttk.Label(tab, text="Wipe when I quit", font=("", 12, "bold")).pack(anchor="w")
+        try:
+            wipe_on = engine.load_config().wipe_on_close
+        except engine.BroadcastError:
+            wipe_on = False
+        self.wipe_var = tk.BooleanVar(value=wipe_on)
+        ttk.Checkbutton(tab, variable=self.wipe_var, command=self._toggle_wipe_on_close,
+                        text="Erase all data every time I close the app").pack(anchor="w", pady=(2, 0))
+        ttk.Label(tab, wraplength=600, justify="left", foreground=PALETTE["muted"], text=(
+            "When armed, quitting erases the Signal link, groups, message, schedule, and "
+            "logs (you confirm once at quit, then re-link next time). Off by default.")
+        ).pack(anchor="w", pady=(0, 4))
+
+        ttk.Separator(tab).pack(fill="x", pady=12)
+
+        # ---- Station mode ---------------------------------------------------
         ttk.Label(tab, text="Station mode", font=("", 12, "bold")).pack(anchor="w")
         self.station_status = ttk.Label(tab, text="", font=("", 14, "bold"))
         self.station_status.pack(anchor="w", pady=(4, 10))
@@ -590,6 +667,39 @@ class App(tk.Tk):
             "Settings → Privacy & Security.")
         ).pack(anchor="w")
         self._refresh_station_status()
+
+    def _apply_speed(self) -> None:
+        key = self.speed_var.get()
+        label, base, jit = self.SPEED_PRESETS[key]
+        engine.set_config_value("base_delay_seconds", base)
+        engine.set_config_value("jitter_seconds", jit)
+        self.speed_note.configure(text=f"Saved: {label} (~{base}s ± {jit}s).")
+
+    def _toggle_debug(self) -> None:
+        engine.set_config_value("debug", self.debug_var.get())
+
+    def _open_logs(self) -> None:
+        engine.LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["open", str(engine.LOGS_DIR)])
+
+    def _clear_logs(self) -> None:
+        if not messagebox.askyesno("Clear logs?",
+                "Delete all activity and debug logs kept by this app? This does not "
+                "touch your Signal link, groups, or message.", icon="warning"):
+            return
+        engine.clear_logs()
+        messagebox.showinfo("Logs cleared", "All logs were deleted.")
+
+    def _toggle_wipe_on_close(self) -> None:
+        on = self.wipe_var.get()
+        if on and not messagebox.askyesno("Arm wipe-on-quit?",
+                "From now on, every time you quit the app it will ERASE all of its data "
+                "(the Signal link, groups, message, schedule, and logs) — you'll confirm "
+                "once at quit, then re-link next time you open it.\n\nArm it?",
+                icon="warning", default="no"):
+            self.wipe_var.set(False)
+            return
+        engine.set_config_value("wipe_on_close", on)
 
     def _arm_station(self) -> None:
         if not engine.on_ac_power():
@@ -778,6 +888,27 @@ class App(tk.Tk):
                             "from your account, open Signal on your phone → Settings → "
                             "Linked Devices and delete it there.")
         self.show_link()
+
+    def _quit(self) -> None:
+        """Close the app. If 'wipe on close' is armed (Security tab), erase all data
+        first — with one confirmation, since it's destructive and re-links next time."""
+        try:
+            armed = engine.load_config().wipe_on_close
+        except engine.BroadcastError:
+            armed = False  # not linked / no valid config yet — nothing to protect
+        if armed:
+            if not messagebox.askyesno("Wipe everything and quit?",
+                    "“Wipe when I quit” is armed, so quitting now ERASES all of this "
+                    "app's data — the Signal link, your groups, the message, the "
+                    "schedule, and logs. You'll scan the QR to link again next time.\n\n"
+                    "Quit and erase?", icon="warning", default="no"):
+                return
+            try:
+                engine.unlink()
+                engine.disable_watcher()
+            except Exception:
+                pass  # best effort — still quit
+        self.destroy()
 
     # --------------------------------------------------------------- event loop
     def _poll(self) -> None:

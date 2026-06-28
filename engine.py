@@ -41,7 +41,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 
 def app_version() -> str:
@@ -105,6 +105,7 @@ class Config:
     max_retries: int
     send_times: list[str]
     debug: bool = False  # write raw signal-cli errors to logs/debug-*.txt
+    wipe_on_close: bool = False  # erase all data when the app is quit (armed in Security)
 
 
 @dataclass
@@ -163,6 +164,7 @@ def load_config() -> Config:
         max_retries=int(raw.get("max_retries", 4)),
         send_times=[str(t) for t in raw.get("send_times", [])],
         debug=bool(raw.get("debug", False)),
+        wipe_on_close=bool(raw.get("wipe_on_close", False)),
     )
 
 
@@ -195,6 +197,37 @@ def save_send_times(times: list[str]) -> None:
             comment = "  #" + line.split("#", 1)[1] if "#" in line else ""
             lines[i] = f"{indent}send_times         = {arr}{comment}"
             break
+    CONFIG_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def set_config_value(key: str, value: bool | int | float | str) -> None:
+    """Update a single scalar key in config.toml in place, preserving its trailing
+    comment; append the key if it isn't there yet. Keeps config.toml hand-editable
+    and is how the Security tab persists the speed / logging / wipe settings."""
+    ensure_config()
+    if not CONFIG_FILE.exists():
+        return
+    if isinstance(value, bool):
+        rendered = "true" if value else "false"   # bool before int: bool IS an int
+    elif isinstance(value, (int, float)):
+        rendered = f"{value:g}"
+    else:
+        rendered = f'"{value}"'
+    lines = CONFIG_FILE.read_text(encoding="utf-8").splitlines()
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if not stripped.startswith(key):
+            continue
+        # Guard against prefix collisions (e.g. a future 'debug_x' vs 'debug').
+        rest = stripped[len(key):]
+        if rest[:1] not in ("", " ", "\t", "="):
+            continue
+        indent = line[: len(line) - len(stripped)]
+        comment = "  #" + line.split("#", 1)[1] if "#" in line else ""
+        lines[i] = f"{indent}{key} = {rendered}{comment}"
+        CONFIG_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return
+    lines.append(f"{key} = {rendered}")
     CONFIG_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -670,6 +703,13 @@ def append_debug(line: str) -> None:
         fh.write(f"{datetime.now():%H:%M:%S}  {line}\n")
 
 
+def clear_logs() -> None:
+    """Delete everything in logs/ — activity logs, debug logs, the last-send summary,
+    the last-run marker — keeping only the tracked .gitkeep. The Security tab's
+    'Clear logs' button calls this; it does not touch the Signal link or your groups."""
+    _clear_dir(LOGS_DIR, keep={".gitkeep"})
+
+
 # --------------------------------------------------------------------------- #
 # Power source
 # --------------------------------------------------------------------------- #
@@ -798,7 +838,7 @@ def watcher_enabled() -> bool:
 # --------------------------------------------------------------------------- #
 # Unlink + wipe (security: leave nothing behind on a borrowed Mac)
 # --------------------------------------------------------------------------- #
-def _clear_dir(path: Path, keep: set[str] = frozenset()) -> None:
+def _clear_dir(path: Path, keep: frozenset[str] | set[str] = frozenset()) -> None:
     if not path.exists():
         return
     for item in path.iterdir():
