@@ -43,7 +43,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.9.2"
+APP_VERSION = "1.9.3"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -451,14 +451,22 @@ def _java_home() -> str | None:
 def _signal_env(binary: str) -> dict | None:
     """Environment for a signal-cli call. For the JVM build, point it at a Java 25+
     home and enlarge every thread's stack via JAVA_OPTS — this is the actual fix for
-    the StackOverflowError. Returns None for the native build (inherit the parent env)."""
+    the StackOverflowError. Returns None for the native build (inherit the parent env).
+
+    We also force IPv4 (-Djava.net.preferIPv4Stack=true): on machines whose network
+    advertises IPv6 but can't actually route it (common behind some VPNs/routers),
+    Java tries the IPv6 address first and stalls or fails with NoRouteToHostException —
+    which shows up as failed image (CDN) uploads and a daemon that times out on start.
+    Forcing IPv4 sidesteps that. Safe on any machine with working IPv4 (i.e. all but
+    the rare IPv6-only host)."""
     if not _is_jvm_build(binary):
         return None
     env = dict(os.environ)
     home = _java_home()
     if home:
         env["JAVA_HOME"] = home
-    env["JAVA_OPTS"] = f"{env.get('JAVA_OPTS', '')} -Xss{THREAD_STACK}".strip()
+    extra = f"-Xss{THREAD_STACK} -Djava.net.preferIPv4Stack=true"
+    env["JAVA_OPTS"] = f"{env.get('JAVA_OPTS', '')} {extra}".strip()
     return env
 
 
