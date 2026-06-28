@@ -57,6 +57,20 @@ def _print_dry_run(cfg, message, attachments, groups, delay) -> None:
         print(f"    ... and {len(groups) - 5} more")
 
 
+def _log_progress(done: int, total: int, _name: str, status: str, secs: float) -> None:
+    """CLI progress line. Must match engine.ProgressFn exactly (done, total, name,
+    status, secs) — kept in lockstep with the GUI's handler and covered by a test,
+    since a silent arity drift here only shows up in unattended scheduled runs."""
+    if status == "sent":
+        log.info("[%d/%d] sent in %.1fs", done, total, secs)
+    elif status == "uncertain":
+        log.warning("[%d/%d] timed out after %.0fs — MAY have sent", done, total, secs)
+    elif status == "skipped":
+        log.info("[%d/%d] skipped — admin-only", done, total)
+    else:
+        log.info("[%d/%d] FAILED after %.1fs", done, total, secs)
+
+
 def run(args: argparse.Namespace) -> int:
     cfg = engine.load_config()
     message = engine.read_message(Path(args.message))
@@ -79,19 +93,28 @@ def run(args: argparse.Namespace) -> int:
         config=cfg, groups=groups, message=message, attachments=attachments,
         base_delay=args.delay,
         on_log=log.info,
-        on_progress=lambda done, total, _name, ok: log.info(
-            "[%d/%d] %s", done, total, "sent" if ok else "FAILED"),
+        on_progress=_log_progress,
     )
     engine.stamp_run()
     engine.write_run_summary(results)
 
-    failed = [r for r in results if not r.ok]
-    log.info("Done. Sent %d, failed %d.", len(results) - len(failed), len(failed))
+    # Uncertain (timed out — may have sent) and skipped (admin-only) groups are NOT
+    # written to the resend list: resending an uncertain one could duplicate a
+    # message that already went out, and a skipped one would just fail again.
+    failed = [r for r in results if not r.ok and not r.skipped and not r.uncertain]
+    uncertain = [r for r in results if r.uncertain]
+    skipped = [r for r in results if r.skipped]
+    sent = len(results) - len(failed) - len(uncertain) - len(skipped)
+    log.info("Done. Sent %d, failed %d, uncertain %d, skipped %d.",
+             sent, len(failed), len(uncertain), len(skipped))
+    if uncertain:
+        log.warning("%d group(s) timed out and MAY have sent — left off the resend "
+                    "list to avoid duplicates; check Signal before resending.", len(uncertain))
     out = engine.write_failures(failed)
     if out:
         log.warning("Resend the %d failed with: python3 broadcast.py --groups %s",
                     len(failed), out)
-    return 1 if failed else 0
+    return 1 if (failed or uncertain) else 0
 
 
 def main() -> int:
