@@ -23,10 +23,30 @@ fi
 if [ -x /opt/homebrew/bin/brew ]; then eval "$(/opt/homebrew/bin/brew shellenv)"
 elif [ -x /usr/local/bin/brew ]; then eval "$(/usr/local/bin/brew shellenv)"; fi
 
-# 2. The actual requirements: signal-cli (Signal), qrencode (the QR), python-tk (the window)
+# 2. Requirements: Java 25 (runs signal-cli), qrencode (the QR), python-tk (the window).
+#    We run the JVM build of signal-cli (downloaded in step 2b), NOT Homebrew's
+#    native build — the native build crashes (StackOverflowError) when encrypting
+#    for some groups. We still install the native one as a last-resort fallback.
 echo
-echo "Installing signal-cli, qrencode, and python-tk (this can take a few minutes)…"
-brew install signal-cli qrencode python-tk
+echo "Installing Java, signal-cli, qrencode, and python-tk (this can take a few minutes)…"
+brew install openjdk@25 signal-cli qrencode python-tk
+
+# 2b. Download the JVM build of signal-cli into ./vendor (version-pinned). The app
+#     prefers this over the native build; see engine.py's signal_cli_bin().
+SIGNAL_CLI_VERSION="0.14.5"
+JVM_CLI="vendor/signal-cli-${SIGNAL_CLI_VERSION}/bin/signal-cli"
+if [ ! -x "$JVM_CLI" ]; then
+  echo "Downloading signal-cli ${SIGNAL_CLI_VERSION} (JVM build)…"
+  mkdir -p vendor
+  URL="https://github.com/AsamK/signal-cli/releases/download/v${SIGNAL_CLI_VERSION}/signal-cli-${SIGNAL_CLI_VERSION}.tar.gz"
+  if curl -fsSL "$URL" -o vendor/signal-cli.tar.gz; then
+    tar -xzf vendor/signal-cli.tar.gz -C vendor && rm -f vendor/signal-cli.tar.gz
+    echo "Installed JVM signal-cli to $JVM_CLI"
+  else
+    rm -f vendor/signal-cli.tar.gz
+    echo "(Could not download the JVM build — the app will fall back to the native one.)"
+  fi
+fi
 
 # 3. Find a Python that can run the app (needs tkinter + tomllib).
 find_python() {

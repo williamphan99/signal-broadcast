@@ -18,4 +18,7 @@ Signal Broadcast.app/
 logs/*
 !logs/.gitkeep
 
+# Bundled JVM build of signal-cli (~110 MB), downloaded by Setup per machine
+vendor/
+
 __pycache__/

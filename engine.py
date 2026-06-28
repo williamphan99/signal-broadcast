@@ -41,7 +41,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 
 def app_version() -> str:
@@ -324,7 +324,36 @@ def stamp_run() -> None:
 # --------------------------------------------------------------------------- #
 # signal-cli plumbing
 # --------------------------------------------------------------------------- #
+# Why we bundle a JVM build of signal-cli in vendor/ (installed by Setup):
+# Homebrew's signal-cli is a GraalVM *native image* that crashes with
+# "java.lang.StackOverflowError" when encrypting for some groups — the overflow
+# happens on a thread inside libsignal whose ~2 MB stack the native build's
+# -XX:StackSize can't enlarge, so every send to that group fails. The JVM build
+# runs that same encryption on ordinary Java threads whose stack size IS
+# controllable via -Xss (see THREAD_STACK below), which clears the crash.
+VENDOR_DIR = PROJECT_DIR / "vendor"
+THREAD_STACK = "32m"  # per-thread stack for the JVM build; the native thread that
+                      # overflowed had only ~2 MB, so this is generous headroom.
+
+# Stack-size flag for the native build (fallback when no JVM build is bundled).
+# It rarely helps the crashing group — kept only so a native-only machine isn't
+# left with nothing — and must precede the subcommand.
+SIGNAL_CLI_RUNTIME_OPTS = ["-XX:StackSize=16m"]
+
+
+def _jvm_signal_cli() -> Path | None:
+    """The bundled JVM build's launcher, if Setup installed one. Preferred over the
+    Homebrew native build because the native build crashes on some group sends."""
+    if not VENDOR_DIR.is_dir():
+        return None
+    found = sorted(VENDOR_DIR.glob("signal-cli-*/bin/signal-cli"))
+    return found[-1] if found else None
+
+
 def signal_cli_bin() -> str:
+    jvm = _jvm_signal_cli()
+    if jvm:
+        return str(jvm)
     found = shutil.which("signal-cli")
     if found:
         return found
@@ -335,16 +364,42 @@ def signal_cli_bin() -> str:
     raise BroadcastError("signal-cli is not installed. Run Setup first.")
 
 
-# Homebrew ships signal-cli as a GraalVM native image whose default thread stack
-# is too small for some groups (large membership or long history), so it crashes
-# mid-send with "java.lang.StackOverflowError" and exits non-zero — one group
-# silently fails. This GraalVM runtime option enlarges the stack and must precede
-# the subcommand. It's a no-op (ignored) on a JVM-based signal-cli build.
-SIGNAL_CLI_RUNTIME_OPTS = ["-XX:StackSize=16m"]
+def _is_jvm_build(binary: str) -> bool:
+    jvm = _jvm_signal_cli()
+    return jvm is not None and str(jvm) == binary
+
+
+def _java_home() -> str | None:
+    """A Java 25+ home for the JVM build. signal-cli 0.14.x is compiled for Java 25,
+    so an older JDK would fail to load it — only offer @25 and the unversioned
+    (newer) Homebrew kegs, never @21."""
+    for base in ("/opt/homebrew/opt/openjdk@25", "/usr/local/opt/openjdk@25",
+                 "/opt/homebrew/opt/openjdk", "/usr/local/opt/openjdk"):
+        if (Path(base) / "bin" / "java").exists():
+            return base
+    return os.environ.get("JAVA_HOME")  # last resort: whatever the machine has set
+
+
+def _signal_env(binary: str) -> dict | None:
+    """Environment for a signal-cli call. For the JVM build, point it at a Java 25+
+    home and enlarge every thread's stack via JAVA_OPTS — this is the actual fix for
+    the StackOverflowError. Returns None for the native build (inherit the parent env)."""
+    if not _is_jvm_build(binary):
+        return None
+    env = dict(os.environ)
+    home = _java_home()
+    if home:
+        env["JAVA_HOME"] = home
+    env["JAVA_OPTS"] = f"{env.get('JAVA_OPTS', '')} -Xss{THREAD_STACK}".strip()
+    return env
 
 
 def _cli(binary: str, *args: str) -> list[str]:
-    """Build a signal-cli argv with the stack-size fix applied up front."""
+    """Build a signal-cli argv. The native build takes the stack-size fix as a
+    leading runtime flag; the JVM build gets its stack size from JAVA_OPTS instead
+    (passing -XX:StackSize to it would be rejected as an unknown argument)."""
+    if _is_jvm_build(binary):
+        return [binary, *args]
     return [binary, *SIGNAL_CLI_RUNTIME_OPTS, *args]
 
 
@@ -355,7 +410,7 @@ def detect_account() -> str | None:
     except BroadcastError:
         return None
     proc = subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-o", "json", "listAccounts"),
-                          capture_output=True, text=True, errors="replace")
+                          capture_output=True, text=True, errors="replace", env=_signal_env(binary))
     if proc.returncode != 0:
         return None
     try:
@@ -378,7 +433,7 @@ def _request_sync(binary: str, account: str) -> None:
     """Best-effort nudge: ask the phone (primary) to (re)send contacts + groups.
     Ignored on failure — the phone usually pushes a sync on linking anyway."""
     subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-a", account, "sendSyncRequest"),
-                   capture_output=True, text=True, errors="replace")
+                   capture_output=True, text=True, errors="replace", env=_signal_env(binary))
 
 
 def sync_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
@@ -394,7 +449,7 @@ def sync_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
     while time.monotonic() < deadline and stable < SYNC_STABLE_ROUNDS:
         subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-a", account,
                             "receive", "--timeout", str(SYNC_BURST_S)),
-                       capture_output=True, text=True, errors="replace")
+                       capture_output=True, text=True, errors="replace", env=_signal_env(binary))
         try:
             count = pull_groups(account)
         except BroadcastError:
@@ -413,7 +468,8 @@ def pull_groups(account: str) -> int:
     binary = signal_cli_bin()
     try:
         proc = subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-o", "json", "-a", account, "listGroups"),
-                              capture_output=True, text=True, errors="replace", timeout=LISTGROUPS_TIMEOUT_S)
+                              capture_output=True, text=True, errors="replace", timeout=LISTGROUPS_TIMEOUT_S,
+                              env=_signal_env(binary))
     except subprocess.TimeoutExpired:
         raise BroadcastError("Timed out fetching groups. Check the connection and try again.")
     if proc.returncode != 0:
@@ -445,7 +501,7 @@ def _send_one(binary: str, account: str, group_id: str,
     try:
         # errors="replace": signal-cli can emit non-UTF-8 bytes (names, locale text)
         proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                              timeout=SEND_TIMEOUT_S)
+                              timeout=SEND_TIMEOUT_S, env=_signal_env(binary))
     except subprocess.TimeoutExpired:
         return False, False, f"timed out after {SEND_TIMEOUT_S}s"
     if proc.returncode == 0:
