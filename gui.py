@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -374,6 +375,11 @@ class App(tk.Tk):
         self.progress.pack(fill="x", pady=(6, 2))
         self.counter = ttk.Label(tab, text="", foreground=PALETTE["muted"])
         self.counter.pack(anchor="w")
+        # Live "still working" line: the bar only moves when a group finishes, and a big
+        # group can take minutes, so without this a slow send looks frozen. Ticks every
+        # second while sending (see _tick_heartbeat) and clears when the run ends.
+        self.heartbeat = ttk.Label(tab, text="", foreground=PALETTE["muted"])
+        self.heartbeat.pack(anchor="w")
 
         activity_row = ttk.Frame(tab)
         activity_row.pack(fill="x", pady=(12, 2))
@@ -991,6 +997,8 @@ class App(tk.Tk):
         self.counter.configure(text=f"0 / {len(groups)}")
         self._done_count = 0  # completions so far; drives the bar (progress arrives out
         #                       of order under parallel sending, so we can't use position)
+        self._last_progress_at = time.monotonic()  # for the "still working" heartbeat
+        self._tick_heartbeat()
         threading.Thread(target=self._send_worker,
                          args=(cfg, groups, message, attachments), daemon=True).start()
 
@@ -1170,6 +1178,7 @@ class App(tk.Tk):
             # position so each line maps to a specific group even when sends finish
             # out of order under parallel sending.
             self._done_count = getattr(self, "_done_count", 0) + 1
+            self._last_progress_at = time.monotonic()  # reset the heartbeat: a group just finished
             self.progress.configure(value=self._done_count)
             self.counter.configure(text=f"{self._done_count} / {total}")
             if status == "skipped":
@@ -1194,8 +1203,33 @@ class App(tk.Tk):
             if hasattr(self, "group_search"):
                 self._render_groups()
 
+    def _tick_heartbeat(self) -> None:
+        """While a send runs, refresh a live 'still working' line every second. The bar
+        only advances when a group finishes and a large group can take minutes, so this
+        is how the user tells a slow-but-healthy send from a frozen one: as long as this
+        keeps ticking, the app is alive. Resets to 0 whenever a group completes."""
+        if not getattr(self, "_sending", False):
+            self.heartbeat.configure(text="")
+            return
+        waiting = time.monotonic() - getattr(self, "_last_progress_at", time.monotonic())
+        text = f"⏳ Still working — {self._fmt_secs(waiting)} since the last group finished"
+        if waiting > 90:  # reassure that a long single send is expected, not a hang
+            text += "  ·  a large group can take several minutes (it reports by 10 min)"
+        self.heartbeat.configure(text=text)
+        self._heartbeat_job = self.after(1000, self._tick_heartbeat)
+
+    @staticmethod
+    def _fmt_secs(s: float) -> str:
+        s = int(s)
+        return f"{s}s" if s < 60 else f"{s // 60}m{s % 60:02d}s"
+
     def _finish_send(self, results: list[engine.GroupSendResult]) -> None:
         self._sending = False  # release the in-progress guard set in _begin_send
+        job = getattr(self, "_heartbeat_job", None)
+        if job:
+            self.after_cancel(job)
+            self._heartbeat_job = None
+        self.heartbeat.configure(text="")
         self.stop_btn.configure(state="disabled", text="Stop")
         self.send_btn.set_enabled(True)
         stopped = self.stop_event.is_set()

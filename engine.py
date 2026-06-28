@@ -51,7 +51,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.12.2"
+APP_VERSION = "1.13.0"
 
 
 def git_pull() -> tuple[bool, str]:
