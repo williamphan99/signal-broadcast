@@ -474,6 +474,16 @@ class App(tk.Tk):
         self.group_count_label = ttk.Label(tab, text="", foreground=PALETTE["muted"])
         self.group_count_label.pack(anchor="w")
 
+        search_row = ttk.Frame(tab)
+        search_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(search_row, text="Search:").pack(side="left")
+        self.group_search = tk.StringVar()
+        self.group_search.trace_add("write", lambda *_: self._render_groups())
+        self.group_search_entry = ttk.Entry(search_row, textvariable=self.group_search)
+        self.group_search_entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        ttk.Button(search_row, text="Clear", width=6,
+                   command=lambda: self.group_search.set("")).pack(side="left", padx=(6, 0))
+
         listwrap = ttk.Frame(tab)
         listwrap.pack(fill="both", expand=True, pady=(4, 8))
         self.groups_inner = self._scrollable(listwrap)
@@ -490,29 +500,49 @@ class App(tk.Tk):
         self._populate_groups()
 
     def _populate_groups(self) -> None:
+        """Load the groups once: one persistent BooleanVar per group (so tick state
+        survives search filtering), then draw them via _render_groups."""
+        self.group_entries = engine.read_group_entries()
+        self.group_vars: dict[str, tk.BooleanVar] = {
+            e.group_id: tk.BooleanVar(value=e.enabled) for e in self.group_entries}
+        self._render_groups()
+
+    def _render_groups(self) -> None:
+        """Draw the checkboxes for groups matching the search box, reusing the
+        existing vars so selections persist across filtering."""
         for child in self.groups_inner.winfo_children():
             child.destroy()
-        self.group_vars: dict[str, tk.BooleanVar] = {}
-        entries = engine.read_group_entries()
-        for e in entries:
-            var = tk.BooleanVar(value=e.enabled)
-            self.group_vars[e.group_id] = var
-            ttk.Checkbutton(self.groups_inner, text=e.name, variable=var,
+        query = self.group_search.get().strip().lower() if hasattr(self, "group_search") else ""
+        self._visible_ids: list[str] = []
+        for e in self.group_entries:
+            if query and query not in e.name.lower():
+                continue
+            self._visible_ids.append(e.group_id)
+            ttk.Checkbutton(self.groups_inner, text=e.name, variable=self.group_vars[e.group_id],
                             command=self._update_group_count).pack(anchor="w", pady=1)
-        if not entries:
+        if not self.group_entries:
             ttk.Label(self.groups_inner, text="No groups yet — link your phone first.",
+                      foreground=PALETTE["muted"]).pack(anchor="w")
+        elif not self._visible_ids:
+            ttk.Label(self.groups_inner, text="No groups match your search.",
                       foreground=PALETTE["muted"]).pack(anchor="w")
         self._update_group_count()
 
     def _set_all_groups(self, value: bool) -> None:
-        for var in self.group_vars.values():
-            var.set(value)
+        """Select all / none — limited to the groups currently shown, so it respects
+        an active search (with no search, that's every group)."""
+        for gid in (self._visible_ids or list(self.group_vars)):
+            self.group_vars[gid].set(value)
         self._update_group_count()
 
     def _update_group_count(self) -> None:
         total = len(self.group_vars)
         selected = sum(1 for v in self.group_vars.values() if v.get())
-        self.group_count_label.configure(text=f"{selected} of {total} selected")
+        text = f"{selected} of {total} selected"
+        shown = len(getattr(self, "_visible_ids", []))
+        if shown != total:
+            text += f"   ·   showing {shown}"
+        self.group_count_label.configure(text=text)
 
     def _save_groups(self) -> None:
         enabled = {gid for gid, var in self.group_vars.items() if var.get()}
