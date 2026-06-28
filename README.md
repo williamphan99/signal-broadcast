@@ -206,6 +206,58 @@ signal-cli --config ./signal-cli-data -a "$NUM" send -m "test" -a /full/path/to/
 cd ~/signal-broadcast && python3 broadcast.py --limit 2 --dry-run
 ```
 
+### Diagnostic cheat sheet
+
+Run these from the project folder. Set `NUM` once, then use whichever you need.
+Replace `+61XXXXXXXXX` only if the auto-detect line doesn't work.
+
+```bash
+cd ~/signal-broadcast
+
+# Your linked number (used by the commands below)
+NUM=$(signal-cli --config ./signal-cli-data -o json listAccounts | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["number"])')
+echo "linked as: ${NUM:-<not linked>}"
+
+# Is this device linked? (lists the linked account, or nothing)
+signal-cli --config ./signal-cli-data -o json listAccounts
+
+# How many groups does signal-cli itself know? (0 here = a sync/network issue, not the app)
+signal-cli --config ./signal-cli-data -a "$NUM" -o json listGroups | python3 -c 'import sys,json; print(len(json.load(sys.stdin)), "groups")'
+
+# Force a fresh sync from the phone, then recount (keep the phone unlocked + online)
+signal-cli --config ./signal-cli-data -a "$NUM" sendSyncRequest
+signal-cli --config ./signal-cli-data -a "$NUM" receive --timeout 20 >/dev/null
+signal-cli --config ./signal-cli-data -a "$NUM" -o json listGroups | python3 -c 'import sys,json; print(len(json.load(sys.stdin)), "groups")'
+
+# Can it reach Signal's servers? (any HTTP code = OK; timeout or SSL error = blocked by VPN/firewall/AV)
+#   chat = text, storage = groups, cdn/cdn2 = attachments
+for h in chat storage cdn cdn2; do curl -sS -m 8 -o /dev/null -w "$h: %{http_code}\n" "https://$h.signal.org/" || echo "$h: FAILED"; done
+
+# Send a test to yourself — text only, then with an image (shows the real error)
+signal-cli --config ./signal-cli-data -a "$NUM" send -m "test" "$NUM"
+signal-cli --config ./signal-cli-data -a "$NUM" send -m "test" -a /full/path/to/image.jpg "$NUM"
+
+# Dry run: confirm config + groups + attachment paths parse (sends nothing)
+python3 broadcast.py --limit 2 --dry-run
+
+# Read today's activity log (plain text); list everything in logs/
+cat ~/signal-broadcast/logs/activity-$(date +%F).txt
+open ~/signal-broadcast/logs/
+
+# Versions / where things are
+signal-cli --version
+which signal-cli qrencode python3
+```
+
+What the results mean:
+- **0 groups from `listGroups`** → the phone's sync didn't reach this Mac; check the
+  `storage.signal.org` line below and keep the phone unlocked + online while syncing.
+- **`storage`/`cdn` time out or SSL-error** → a **VPN, firewall, or antivirus** is
+  blocking Signal's non-chat servers — that breaks group sync *and* image sends while
+  text still works. Turn the VPN off (or split-tunnel `*.signal.org`) / disable HTTPS
+  scanning, then re-sync with **Update list from phone**.
+- **a send-to-yourself error mentioning SSL / connection / upload** → same network cause.
+
 ---
 
 ## Distribution notes
