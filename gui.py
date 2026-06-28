@@ -134,6 +134,13 @@ class App(tk.Tk):
         self.log_box.configure(state="disabled")
         engine.append_activity(msg)  # PII-safe; also persisted to logs/activity-*.txt
 
+    def _clear_activity(self) -> None:
+        """Empty the on-screen Activity log. Only clears the live view — the on-disk
+        log (if logging is on) is untouched; use Security → Clear logs for the files."""
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+
     def _scrollable(self, parent) -> ttk.Frame:
         """A vertically scrollable frame (Canvas + inner ttk.Frame). Returns the
         inner frame to pack children into."""
@@ -354,7 +361,10 @@ class App(tk.Tk):
         self.counter = ttk.Label(tab, text="", foreground=PALETTE["muted"])
         self.counter.pack(anchor="w")
 
-        ttk.Label(tab, text="Activity", font=("", 12, "bold")).pack(anchor="w", pady=(12, 2))
+        activity_row = ttk.Frame(tab)
+        activity_row.pack(fill="x", pady=(12, 2))
+        ttk.Label(activity_row, text="Activity", font=("", 12, "bold")).pack(side="left")
+        ttk.Button(activity_row, text="Clear", command=self._clear_activity).pack(side="right")
         log_frame = ttk.Frame(tab)
         log_frame.pack(fill="both", expand=True)
         self.log_box = self._text_widget(log_frame, height=9, wrap="word", state="disabled")
