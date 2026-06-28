@@ -169,6 +169,45 @@ To rebuild the Dock app by hand (e.g. after moving the folder):
 
 ---
 
+## Troubleshooting
+
+**"Send failed" — find the reason.** The app shows a short, safe category (e.g.
+*network or connection problem*, *attachment or upload problem*, *rate limited*) in the
+**Send** tab, and saves the activity to a plain-text log you can reopen later:
+```bash
+open ~/signal-broadcast/logs/                          # the logs folder
+cat  ~/signal-broadcast/logs/activity-$(date +%F).txt  # today's activity
+```
+(`.out`/`.err`/`.log` files have no default app — read them with `cat`, or
+`open -a TextEdit <file>`. `failures-*.txt` is just group IDs for "Resend failed", not
+error text, so it looks like random characters — that's normal.)
+
+**Images fail but text sends fine.** Attachments are uploaded to Signal's CDN
+(`cdn.signal.org`) — a different server than text uses — so a VPN, firewall, or
+antivirus that blocks or inspects that host breaks image sends while text still works.
+Check the CDN is reachable (any HTTP code = OK; a timeout or SSL error = blocked):
+```bash
+curl -sS -m 8 -o /dev/null -w "%{http_code}\n" https://cdn.signal.org/
+```
+If it fails: turn the **VPN off** (or split-tunnel `*.signal.org`) and disable any
+antivirus "HTTPS/SSL scanning". JPEG/PNG are the most reliable formats; HEIC (the
+iPhone default) often won't display for non-Apple recipients.
+
+**See signal-cli's raw error** by sending a test to yourself (drop the `-a <image>`
+part to test text-only):
+```bash
+cd ~/signal-broadcast
+NUM=$(signal-cli --config ./signal-cli-data -o json listAccounts | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["number"])')
+signal-cli --config ./signal-cli-data -a "$NUM" send -m "test" -a /full/path/to/image.jpg "$NUM"
+```
+
+**Check config, groups, and attachment paths parse** (sends nothing):
+```bash
+cd ~/signal-broadcast && python3 broadcast.py --limit 2 --dry-run
+```
+
+---
+
 ## Distribution notes
 
 `git clone` is the recommended way to hand this to someone, because it sidesteps
