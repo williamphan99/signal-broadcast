@@ -126,9 +126,10 @@ class App(tk.Tk):
         # Prefix the live line with a clock time so the gaps between sends are
         # visible at a glance. The on-disk log adds its own timestamp, so we pass
         # the bare message to append_activity (no double stamp there).
-        # The live view may show group names (so the user can act on them), but the
-        # on-disk activity log must stay PII-safe: pass disk_msg (a counts-only
-        # rephrase) for any line that names groups.
+        # No group names or message text are ever passed here — not to the live view
+        # and not to disk (only counts, positions, and error categories). disk_msg
+        # stays as a safety valve: if a line ever must name a group on screen, pass a
+        # counts-only rephrase so the on-disk activity log still leaks nothing.
         stamp = datetime.now().strftime("%H:%M:%S")
         self.log_box.configure(state="normal")
         self.log_box.insert("end", f"{stamp}  ", "muted")
@@ -1216,14 +1217,10 @@ class App(tk.Tk):
         # resending an uncertain one could DUPLICATE a message that already went out.
         self.failed_results = failed + pending
         if skipped:
-            names = ", ".join(r.name for r in skipped)
-            self._log(f"Skipped {len(skipped)} admin-only group(s) you can't post in: {names}", "muted",
-                      disk_msg=f"Skipped {len(skipped)} admin-only group(s) you can't post in")
+            self._log(f"Skipped {len(skipped)} admin-only group(s) you can't post in.", "muted")
         if uncertain:
-            unames = ", ".join(r.name for r in uncertain)
-            self._log(f"⚠ {len(uncertain)} group(s) timed out and MAY already have sent — NOT resent, "
-                      f"to avoid duplicates. Check Signal before resending these: {unames}", "error",
-                      disk_msg=f"{len(uncertain)} group(s) timed out and may have sent — not resent")
+            self._log(f"⚠ {len(uncertain)} group(s) timed out and MAY already have sent — NOT "
+                      "resent, to avoid duplicates. Check Signal before resending.", "error")
         if stopped:
             self._log(f"Stopped. Sent {sent}; {len(self.failed_results)} not sent.", "muted")
         else:
