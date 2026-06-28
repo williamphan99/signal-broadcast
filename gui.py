@@ -123,7 +123,12 @@ class App(tk.Tk):
                        highlightbackground="#888", padx=8, pady=6, **kw)
 
     def _log(self, msg: str, tag: str = "") -> None:
+        # Prefix the live line with a clock time so the gaps between sends are
+        # visible at a glance. The on-disk log adds its own timestamp, so we pass
+        # the bare message to append_activity (no double stamp there).
+        stamp = datetime.now().strftime("%H:%M:%S")
         self.log_box.configure(state="normal")
+        self.log_box.insert("end", f"{stamp}  ", "muted")
         self.log_box.insert("end", msg + "\n", tag)
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
