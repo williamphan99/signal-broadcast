@@ -56,11 +56,11 @@ class SendPathTests(unittest.TestCase):
          engine._send_one, engine.MIN_DELAY_S, engine.NON_THROTTLE_WAIT_S) = self._orig
         engine.clear_run_progress()  # don't leave a test's crash marker behind
 
-    def _run(self, groups, **kw):
+    def _run(self, groups, attachments=None, **kw):
         cfg = engine.Config(account="+test", base_delay_seconds=0.0, jitter_seconds=0.0,
                             cooldown_hours=0, max_retries=4, send_times=[])
         return engine.broadcast(config=cfg, groups=groups, message="m",
-                                attachments=[], **kw)
+                                attachments=attachments or [], **kw)
 
     def test_timeout_is_uncertain_and_not_retried(self):
         FakeDaemon.plan = {"g1": [(False, False, "daemon timed out after 120s")]}
@@ -125,6 +125,16 @@ class SendPathTests(unittest.TestCase):
             self._run([("g1", "G1")])
         self.assertIsNotNone(engine.read_interrupted_run(),
                              "an aborted run must keep its resume marker")
+
+    def test_missing_attachments_detected(self):
+        self.assertEqual(engine.missing_attachments(["/no/such/file.jpg"]), ["/no/such/file.jpg"])
+        self.assertEqual(engine.missing_attachments([__file__]), [])  # this test file exists
+
+    def test_broadcast_aborts_before_sending_on_missing_attachment(self):
+        FakeDaemon.plan = {"g1": [(True, False, "")]}
+        with self.assertRaises(engine.BroadcastError):
+            self._run([("g1", "G1")], attachments=["/no/such/file.jpg"])
+        self.assertNotIn("g1", FakeDaemon.calls, "must abort before any send")
 
     def test_progress_callbacks_match_engine_signature(self):
         # Drive the REAL callback each front-end passes; a wrong arity raises here.

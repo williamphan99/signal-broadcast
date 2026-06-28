@@ -20,6 +20,7 @@ import random
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -50,7 +51,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.9.8"
+APP_VERSION = "1.9.9"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -970,6 +971,40 @@ def _start_daemon(account: str, on_log: LogFn, debug: bool) -> "SignalCliDaemon 
         return None
 
 
+def missing_attachments(attachments: list[str]) -> list[str]:
+    """Attachment paths that no longer point at a real file. Checked before a run so
+    a moved/deleted image fails fast once, instead of failing every single group."""
+    return [a for a in attachments if not Path(a).is_file()]
+
+
+# Signal hosts a preflight probe tries (any one reachable = OK). Hardcoded but stable.
+_SIGNAL_HOSTS = (("chat.signal.org", 443), ("cdn.signal.org", 443), ("cdn2.signal.org", 443))
+
+
+def check_signal_reachable(timeout: float = 3.0) -> str | None:
+    """Best-effort: can this machine open a TCP connection to Signal? Returns None if
+    reachable, else a short reason. Forces IPv4 (AF_INET) to mirror signal-cli's
+    preferIPv4Stack, so a machine with broken IPv6 isn't wrongly flagged. Only a total
+    inability to reach ANY host counts — a cert/TLS issue doesn't (we just open a
+    socket; signal-cli trusts Signal's pinned cert)."""
+    last = ""
+    for host, port in _SIGNAL_HOSTS:
+        try:
+            infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        except OSError:
+            last = f"can't resolve {host}"
+            continue
+        for *_, sockaddr in infos:
+            ip, prt = sockaddr[0], sockaddr[1]  # AF_INET -> (ip, port)
+            try:
+                socket.create_connection((ip, prt), timeout=timeout).close()
+                return None  # reached at least one Signal host
+            except OSError as exc:
+                last = str(exc)
+    return ("Couldn't reach Signal's servers — check the internet connection and turn "
+            "off any VPN" + (f" ({last})" if last else "") + ".")
+
+
 def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
               attachments: list[str], base_delay: float | None = None,
               on_log: LogFn = lambda *_: None,
@@ -982,10 +1017,22 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
     total = len(groups)
     results: list[GroupSendResult] = []
 
+    # Preflight: a moved/deleted image would otherwise fail every group, so fail fast
+    # and clearly before sending anything (and before taking the lock).
+    missing = missing_attachments(attachments)
+    if missing:
+        raise BroadcastError("These attachment files are missing — re-add or remove "
+                             "them before sending:\n  " + "\n  ".join(missing))
+
     # One broadcast at a time: a second app window — or the scheduler firing while
     # the app is mid-send — would fight over signal-cli's account lock and both
     # stall. send_lock() raises BroadcastError if a send is already running.
     with send_lock():
+        # Soft preflight: warn (don't block — the probe could be wrong) if we can't
+        # reach Signal, so the user gets an early heads-up instead of N timeouts.
+        unreachable = check_signal_reachable()
+        if unreachable:
+            on_log(f"⚠ {unreachable} Trying anyway — sends may time out; Stop if needed.")
         # Admin-only (announcement) groups you can't post in: skip them up front rather
         # than burning a doomed send + retries on each. Best-effort; empty on any error.
         # NOTE: run this BEFORE starting the daemon — both want the account lock.

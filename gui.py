@@ -900,6 +900,12 @@ class App(tk.Tk):
         except engine.BroadcastError as exc:
             messagebox.showerror("Can't send", str(exc))
             return
+        missing = engine.missing_attachments(attachments)
+        if missing:
+            messagebox.showerror("Missing images",
+                "These attached images can't be found:\n\n" + "\n".join(missing) +
+                "\n\nRe-add them or clear the attachments, then try again.")
+            return
         if not self._confirm_send(cfg, groups, message, attachments):
             return
         blocked = engine.cooldown_blocks_run(cfg.cooldown_hours)
