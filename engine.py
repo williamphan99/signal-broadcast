@@ -41,7 +41,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -721,7 +721,7 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
             on_log(f"{n} selected group(s) are admin-only — you can't post there; skipping them.")
 
     on_log(f"Broadcasting to {total} groups | {len(attachments)} attachment(s) | "
-           f"~{delay:.0f}s between sends")
+           f"~{delay:.0f}s minimum between sends")
     for i, (gid, name) in enumerate(groups, start=1):
         if should_stop():
             on_log("Stopped.")
@@ -738,7 +738,13 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
         results.append(GroupSendResult(gid, name, ok))
         on_progress(i, total, name, ok, secs)
         if i < total and not should_stop():
-            _interruptible_sleep(_pace_delay(delay, config.jitter_seconds), should_stop)
+            # Adaptive pacing: the gap is a MINIMUM interval between sends, and the
+            # time the send already took counts toward it. A send that took longer
+            # than the target has already spaced itself out, so the next one goes
+            # immediately; a fast send waits out only the remainder.
+            wait = max(0.0, _pace_delay(delay, config.jitter_seconds) - secs)
+            if wait > 0:
+                _interruptible_sleep(wait, should_stop)
     return results
 
 
