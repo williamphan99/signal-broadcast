@@ -51,7 +51,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.9.9"
+APP_VERSION = "1.9.10"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -103,7 +103,11 @@ THROTTLE_BACKOFF_BASE_S = 30.0   # first throttle wait; doubles each retry
 THROTTLE_BACKOFF_CAP_S = 300.0   # never wait longer than 5 min between retries
 NON_THROTTLE_RETRIES = 2         # quick retries for transient (non-rate) errors
 NON_THROTTLE_WAIT_S = 5.0
-SEND_TIMEOUT_S = 120             # generous: JVM start + network per send
+SEND_TIMEOUT_S = 300             # per-send ceiling. Big groups legitimately take
+                                 # 90-120s+ to fan out to every member; 120s cut
+                                 # those off and wrongly marked them "uncertain". 5
+                                 # min leaves headroom (incl. signal-cli's own throttle
+                                 # retries) while still bounding a genuinely stuck send.
 # First-sync after linking. A big account's groups don't all arrive in one
 # receive, so we drain in short bursts until the count stops growing (or the cap).
 SYNC_BURST_S = 5                 # one receive burst while draining the phone's sync
@@ -1014,8 +1018,21 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
     per attempted group. Honours ``should_stop`` between and during sends."""
     binary = signal_cli_bin()
     delay = base_delay if base_delay is not None else config.base_delay_seconds
-    total = len(groups)
     results: list[GroupSendResult] = []
+
+    # Guarantee at most ONE send per group, even if the list has duplicates — a group
+    # listed twice (e.g. two enabled lines in groups.txt) would otherwise be delivered
+    # to twice in a single run. This is the single enforcement point for every caller.
+    seen: set[str] = set()
+    deduped: list[tuple[str, str]] = []
+    for gid, name in groups:
+        if gid not in seen:
+            seen.add(gid)
+            deduped.append((gid, name))
+    if len(deduped) != len(groups):
+        on_log(f"Ignoring {len(groups) - len(deduped)} duplicate group(s) in the list.")
+    groups = deduped
+    total = len(groups)
 
     # Preflight: a moved/deleted image would otherwise fail every group, so fail fast
     # and clearly before sending anything (and before taking the lock).
@@ -1056,12 +1073,18 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
             if daemon is not None:
                 res = daemon.send(gid, msg, atts)
                 if not res[0] and not daemon.is_running():
-                    # Daemon died mid-run — drop to one-shot for the rest.
+                    # Daemon died mid-run — switch to one-shot for the rest. But if THIS
+                    # send timed out (ambiguous — it may already have gone out), do NOT
+                    # re-send it: that could duplicate. Report the timeout as-is (the
+                    # caller turns it into "uncertain") and only re-send clean failures.
                     on_log("signal-cli daemon stopped; falling back to per-send.")
+                    timed_out = bool(CLIENT_TIMEOUT_PATTERN.search(res[2]))
                     try:
                         daemon.close()
                     finally:
                         daemon = None
+                    if timed_out:
+                        return res
                     return _send_one(binary, config.account, gid, msg, atts)
                 return res
             return _send_one(binary, config.account, gid, msg, atts)

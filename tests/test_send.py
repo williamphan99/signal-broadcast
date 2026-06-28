@@ -25,7 +25,7 @@ class FakeDaemon:
     def __init__(self, account, start_timeout=30.0):
         pass
 
-    def is_running(self):
+    def is_running(self) -> bool:
         return True
 
     def send(self, gid, msg, atts):
@@ -135,6 +135,31 @@ class SendPathTests(unittest.TestCase):
         with self.assertRaises(engine.BroadcastError):
             self._run([("g1", "G1")], attachments=["/no/such/file.jpg"])
         self.assertNotIn("g1", FakeDaemon.calls, "must abort before any send")
+
+    def test_duplicate_groups_are_sent_only_once(self):
+        FakeDaemon.plan = {"g1": [(True, False, "")], "g2": [(True, False, "")]}
+        res = self._run([("g1", "G1"), ("g1", "G1-dup"), ("g2", "G2")])
+        self.assertEqual(FakeDaemon.calls.get("g1"), 1, "a duplicate group must be sent once")
+        self.assertEqual(len(res), 2, "the duplicate is dropped from the run")
+
+    def test_timeout_with_dead_daemon_is_not_resent(self):
+        # Daemon both times out AND reports dead: the fallback must NOT re-send (the
+        # timed-out message may already have gone out) — it stays uncertain.
+        resends = []
+        engine._send_one = lambda b, a, gid, m, at: (resends.append(gid), (True, False, ""))[1]
+
+        class DeadAfterTimeout(FakeDaemon):
+            def is_running(self):
+                return False
+
+            def send(self, gid, msg, atts):
+                FakeDaemon.calls[gid] = FakeDaemon.calls.get(gid, 0) + 1
+                return (False, False, "daemon timed out after 300s")
+
+        engine.SignalCliDaemon = DeadAfterTimeout
+        res = self._run([("g1", "G1")])
+        self.assertTrue(res[0].uncertain, "timeout+dead daemon must be uncertain")
+        self.assertEqual(resends, [], "must NOT re-send a timed-out group via per-send")
 
     def test_progress_callbacks_match_engine_signature(self):
         # Drive the REAL callback each front-end passes; a wrong arity raises here.
