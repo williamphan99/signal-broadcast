@@ -43,7 +43,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.9.3"
+APP_VERSION = "1.9.4"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -111,7 +111,8 @@ class BroadcastError(Exception):
 
 # Callback aliases. Defaults are no-ops so callers can pass only what they need.
 LogFn = Callable[[str], None]
-ProgressFn = Callable[[int, int, str, "bool | None", float], None]  # done, total, name, ok, seconds
+# status is one of: "sent" | "failed" | "skipped" | "uncertain" (timed out — may have sent)
+ProgressFn = Callable[[int, int, str, str, float], None]  # done, total, name, status, seconds
 StopFn = Callable[[], bool]
 
 
@@ -133,6 +134,7 @@ class GroupSendResult:
     name: str
     ok: bool
     skipped: bool = False   # not attempted on purpose (e.g. admin-only group)
+    uncertain: bool = False  # send timed out — may have delivered; never auto-retried/resent
     reason: str = ""        # short why, for skips/failures (PII-safe category)
 
 
@@ -150,6 +152,7 @@ class RunSummary:
     sent: int
     failed: int
     skipped: int = 0  # admin-only groups not attempted
+    uncertain: int = 0  # sends that timed out and may have delivered
 
 
 _GROUPS_HEADER = (
@@ -770,43 +773,56 @@ def classify_error(stderr: str) -> str:
     return "unknown error"
 
 
+# Our own client-side timeout strings — the daemon read-timeout ("daemon timed out
+# after 120s") and the one-shot subprocess timeout ("timed out after 120s"). Hitting
+# these means we DISPATCHED the send but never got signal-cli's verdict, so the
+# message may well have gone out. We must not auto-retry (that risks a duplicate)
+# and must not mark it a clean failure (that would feed it to "Resend failed").
+CLIENT_TIMEOUT_PATTERN = re.compile(r"timed out after \d+\s*s", re.I)
+
+
 def _deliver_to_group(send_one: SendFn, group_id: str,
                       message: str, attachments: list[str], max_retries: int,
-                      on_log: LogFn, should_stop: StopFn, debug: bool = False) -> bool:
+                      on_log: LogFn, should_stop: StopFn, debug: bool = False) -> str:
     """Try one group with retries via ``send_one`` (one-shot or daemon — same shape).
-    Throttled sends back off exponentially; other failures get a couple of quick
-    retries. Returns True on success. Log lines carry no group name, id, or raw
-    signal-cli output — only counts, retry timing, and a sanitised error category,
-    since the raw text can contain a group id or number."""
+    Returns "sent", "failed", or "uncertain". "uncertain" is a client-side timeout:
+    we don't know whether it delivered, so we neither retry nor call it failed.
+    Throttled sends back off exponentially; other clean errors get a couple of quick
+    retries. Log lines carry no group name, id, or raw signal-cli output — only
+    counts, retry timing, and a sanitised error category."""
     throttle_attempt = 0
     quick_attempt = 0
     while not should_stop():
         ok, throttled, err = send_one(group_id, message, attachments)
         if ok:
-            return True
+            return "sent"
         if debug and err:
             append_debug(f"group {group_id} (throttled={throttled}): {err}")
+        if CLIENT_TIMEOUT_PATTERN.search(err):
+            # We stopped waiting before signal-cli answered — it may have delivered.
+            on_log("Send timed out — it may have gone through; not retrying, to avoid a duplicate.")
+            return "uncertain"
         if throttled:
             throttle_attempt += 1
             if throttle_attempt > max_retries:
                 on_log(f"Gave up after {max_retries} throttled retries")
-                return False
+                return "failed"
             wait = _throttle_wait(throttle_attempt, err)  # err parsed for retry-after, never logged
             on_log(f"Throttled — backing off {wait:.0f}s (retry {throttle_attempt}/{max_retries})")
             _interruptible_sleep(wait, should_stop)
         elif ADMIN_ONLY_PATTERN.search(err):
             # Non-admin in an announcement group — retrying can never succeed.
             on_log("Send failed — admin-only group (you can't post here).")
-            return False
+            return "failed"
         else:
             quick_attempt += 1
             reason = classify_error(err)
             if quick_attempt > NON_THROTTLE_RETRIES:
                 on_log(f"Send failed — {reason}.")
-                return False
+                return "failed"
             on_log(f"Send error ({reason}) — retrying in {NON_THROTTLE_WAIT_S:.0f}s")
             _interruptible_sleep(NON_THROTTLE_WAIT_S, should_stop)
-    return False
+    return "failed"
 
 
 def _pace_delay(base: float, jitter: float) -> float:
@@ -867,14 +883,20 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
                 break
             if gid in blocked:
                 results.append(GroupSendResult(gid, name, ok=False, skipped=True, reason="admin-only"))
-                on_progress(i, total, name, None, 0.0)  # None = skipped, not a failure
+                on_progress(i, total, name, "skipped", 0.0)  # not a failure — never attempted
                 continue  # no send, no pacing delay — nothing left the machine
             t0 = time.monotonic()
-            ok = _deliver_to_group(send_one, gid, message, attachments,
-                                   config.max_retries, on_log, should_stop, config.debug)
+            status = _deliver_to_group(send_one, gid, message, attachments,
+                                       config.max_retries, on_log, should_stop, config.debug)
             secs = time.monotonic() - t0  # wall time for this group (includes any retries)
-            results.append(GroupSendResult(gid, name, ok))
-            on_progress(i, total, name, ok, secs)
+            if status == "uncertain":
+                # Timed out — the message may have gone out. NOT a clean failure, so it
+                # is kept out of "Resend failed" (resending could duplicate it).
+                results.append(GroupSendResult(gid, name, ok=False, uncertain=True,
+                                               reason="may have sent (timed out)"))
+            else:
+                results.append(GroupSendResult(gid, name, ok=(status == "sent")))
+            on_progress(i, total, name, status, secs)
             if i < total and not should_stop():
                 # Adaptive pacing: the gap is a MINIMUM interval between sends, and the
                 # time the send already took counts toward it. A send that took longer
@@ -908,10 +930,11 @@ def write_run_summary(results: list[GroupSendResult]) -> None:
         return
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     skipped = sum(1 for r in results if r.skipped)
-    failed = sum(1 for r in results if not r.ok and not r.skipped)
+    uncertain = sum(1 for r in results if r.uncertain)
+    failed = sum(1 for r in results if not r.ok and not r.skipped and not r.uncertain)
     summary = {"at": datetime.now().isoformat(timespec="seconds"),
                "total": len(results), "sent": sum(1 for r in results if r.ok),
-               "failed": failed, "skipped": skipped}
+               "failed": failed, "skipped": skipped, "uncertain": uncertain}
     LAST_SEND_FILE.write_text(json.dumps(summary), encoding="utf-8")
 
 
@@ -922,7 +945,8 @@ def read_run_summary() -> RunSummary | None:
         d = json.loads(LAST_SEND_FILE.read_text(encoding="utf-8"))
         return RunSummary(at=str(d["at"]), total=int(d["total"]),
                           sent=int(d["sent"]), failed=int(d["failed"]),
-                          skipped=int(d.get("skipped", 0)))
+                          skipped=int(d.get("skipped", 0)),
+                          uncertain=int(d.get("uncertain", 0)))
     except (ValueError, KeyError):
         return None
 

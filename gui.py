@@ -122,17 +122,20 @@ class App(tk.Tk):
                        insertbackground=PALETTE["text_fg"], relief="flat", highlightthickness=1,
                        highlightbackground="#888", padx=8, pady=6, **kw)
 
-    def _log(self, msg: str, tag: str = "") -> None:
+    def _log(self, msg: str, tag: str = "", disk_msg: str | None = None) -> None:
         # Prefix the live line with a clock time so the gaps between sends are
         # visible at a glance. The on-disk log adds its own timestamp, so we pass
         # the bare message to append_activity (no double stamp there).
+        # The live view may show group names (so the user can act on them), but the
+        # on-disk activity log must stay PII-safe: pass disk_msg (a counts-only
+        # rephrase) for any line that names groups.
         stamp = datetime.now().strftime("%H:%M:%S")
         self.log_box.configure(state="normal")
         self.log_box.insert("end", f"{stamp}  ", "muted")
         self.log_box.insert("end", msg + "\n", tag)
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
-        engine.append_activity(msg)  # PII-safe; also persisted to logs/activity-*.txt
+        engine.append_activity(msg if disk_msg is None else disk_msg)
 
     def _clear_activity(self) -> None:
         """Empty the on-screen Activity log. Only clears the live view — the on-disk
@@ -459,10 +462,11 @@ class App(tk.Tk):
             when = datetime.fromisoformat(s.at).strftime("%d %b %H:%M")
         except ValueError:
             when = s.at
-        tail = f", skipped {s.skipped}" if s.skipped else ""
+        tail = f", uncertain {s.uncertain}" if s.uncertain else ""
+        tail += f", skipped {s.skipped}" if s.skipped else ""
         self.last_send_label.configure(
             text=f"Last send: {when} — sent {s.sent}, failed {s.failed}{tail}",
-            foreground=PALETTE["error"] if s.failed else PALETTE["muted"])
+            foreground=PALETTE["error"] if (s.failed or s.uncertain) else PALETTE["muted"])
 
     # ----------------------------------------------------------------- images
     def _add_images(self) -> None:
@@ -899,7 +903,7 @@ class App(tk.Tk):
             results = engine.broadcast(
                 config=cfg, groups=groups, message=message, attachments=attachments,
                 on_log=lambda m: self.events.put(("log", m)),
-                on_progress=lambda d, t, n, ok, secs: self.events.put(("progress", (d, t, n, ok, secs))),
+                on_progress=lambda d, t, n, status, secs: self.events.put(("progress", (d, t, n, status, secs))),
                 should_stop=self.stop_event.is_set)
             if not self.stop_event.is_set():  # a stopped run is incomplete — don't arm the cooldown
                 engine.stamp_run()
@@ -1045,13 +1049,15 @@ class App(tk.Tk):
                 tag = "muted"
             self._log(m, tag)
         elif kind == "progress":
-            done, total, _name, ok, secs = payload
+            done, total, _name, status, secs = payload
             self.progress.configure(value=done)
             self.counter.configure(text=f"{done} / {total}")
-            if ok is None:
+            if status == "skipped":
                 self._log(f"[{done}/{total}] skipped — admin-only", "muted")
-            elif ok:
+            elif status == "sent":
                 self._log(f"[{done}/{total}] sent in {secs:.1f}s", "ok")
+            elif status == "uncertain":
+                self._log(f"[{done}/{total}] timed out after {secs:.0f}s — MAY have sent", "error")
             else:
                 self._log(f"[{done}/{total}] failed after {secs:.1f}s", "error")
         elif kind == "send_done":
@@ -1073,28 +1079,38 @@ class App(tk.Tk):
         self.send_btn.set_enabled(True)
         stopped = self.stop_event.is_set()
         skipped = [r for r in results if r.skipped]
-        failed = [r for r in results if not r.ok and not r.skipped]
+        uncertain = [r for r in results if r.uncertain]
+        failed = [r for r in results if not r.ok and not r.skipped and not r.uncertain]
         sent = sum(1 for r in results if r.ok)
         # On a stop, the groups never reached are resumable too — fold them in so
-        # “Resend failed” finishes the run.
+        # “Resend failed” finishes the run. (These never left the machine, so they're
+        # safe to resend, unlike the uncertain ones below.)
         pending: list[engine.GroupSendResult] = []
         if stopped:
             done_ids = {r.group_id for r in results}
             pending = [engine.GroupSendResult(gid, name, False)
                        for gid, name in getattr(self, "_sending_groups", [])
                        if gid not in done_ids]
-        # Skipped (admin-only) groups are NOT added to failed_results — resending
-        # them would just fail again. They're reported, not retried.
+        # Skipped (admin-only) and uncertain (timed out — may have delivered) groups
+        # are NOT added to failed_results. Resending a skipped one just fails again;
+        # resending an uncertain one could DUPLICATE a message that already went out.
         self.failed_results = failed + pending
         if skipped:
             names = ", ".join(r.name for r in skipped)
-            self._log(f"Skipped {len(skipped)} admin-only group(s) you can't post in: {names}", "muted")
+            self._log(f"Skipped {len(skipped)} admin-only group(s) you can't post in: {names}", "muted",
+                      disk_msg=f"Skipped {len(skipped)} admin-only group(s) you can't post in")
+        if uncertain:
+            unames = ", ".join(r.name for r in uncertain)
+            self._log(f"⚠ {len(uncertain)} group(s) timed out and MAY already have sent — NOT resent, "
+                      f"to avoid duplicates. Check Signal before resending these: {unames}", "error",
+                      disk_msg=f"{len(uncertain)} group(s) timed out and may have sent — not resent")
         if stopped:
             self._log(f"Stopped. Sent {sent}; {len(self.failed_results)} not sent.", "muted")
         else:
-            tail = f", skipped {len(skipped)}" if skipped else ""
+            tail = f", uncertain {len(uncertain)}" if uncertain else ""
+            tail += f", skipped {len(skipped)}" if skipped else ""
             self._log(f"Done. Sent {sent}, failed {len(failed)}{tail}.",
-                      "error" if failed else "ok")
+                      "error" if (failed or uncertain) else "ok")
         if self.failed_results:
             out = engine.write_failures(self.failed_results)
             label = "Unsent + failed" if stopped else "Failed"
