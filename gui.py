@@ -491,16 +491,25 @@ class App(tk.Tk):
             run = None
         self._interrupted = run
         if run:
-            self.resume_label.configure(text=(
-                f"⚠ A previous send was interrupted — {run.done} of {run.total} done. "
-                f"Resume the remaining {len(run.remaining)} (won't re-send the rest)?"))
+            parts = [f"⚠ A previous send was interrupted — {run.done} of {run.total} done."]
+            if run.uncertain:
+                # Killed mid-send or timed out — may already have gone out. Never resent.
+                parts.append(f"{len(run.uncertain)} may already have been sent (check Signal); "
+                             "those won't be re-sent.")
+            if run.remaining:
+                parts.append(f"Resume the remaining {len(run.remaining)} (won't re-send the rest)?")
+                self.resume_btn.configure(state="normal")
+            else:
+                parts.append("Nothing left to resume.")
+                self.resume_btn.configure(state="disabled")
+            self.resume_label.configure(text=" ".join(parts))
             self.resume_bar.pack(fill="x", pady=(2, 6))
         else:
             self.resume_bar.pack_forget()
 
     def _on_resume_interrupted(self) -> None:
         run = getattr(self, "_interrupted", None)
-        if not run:
+        if not run or not run.remaining:  # nothing safely resumable (button is disabled too)
             return
         try:
             cfg = engine.load_config()
@@ -523,9 +532,16 @@ class App(tk.Tk):
 
     # ----------------------------------------------------------------- images
     def _add_images(self) -> None:
+        skipped = []
         for p in filedialog.askopenfilenames(title="Choose images", filetypes=IMAGE_TYPES):
+            if not Path(p).is_file():  # vanished between dialog and now — warn at pick time
+                skipped.append(p)
+                continue
             if p not in self.selected_images:
                 self.selected_images.append(p)
+        if skipped:
+            messagebox.showwarning("Couldn't add some images",
+                "These files couldn't be read and were skipped:\n\n" + "\n".join(skipped))
         self._refresh_img_label()
 
     def _clear_images(self) -> None:
@@ -766,7 +782,8 @@ class App(tk.Tk):
                         text="Erase all data every time I close the app").pack(anchor="w", pady=(2, 0))
         ttk.Label(tab, wraplength=600, justify="left", foreground=PALETTE["muted"], text=(
             "When armed, quitting erases the Signal link, groups, message, schedule, and "
-            "logs (you confirm once at quit, then re-link next time). Off by default.")
+            "logs — and deletes the image files you attached, from wherever they live on "
+            "this Mac. You confirm once at quit, then re-link next time. Off by default.")
         ).pack(anchor="w", pady=(0, 4))
 
         ttk.Separator(tab).pack(fill="x", pady=12)
@@ -778,9 +795,10 @@ class App(tk.Tk):
         ttk.Label(tab, wraplength=600, justify="left", foreground=PALETTE["muted"], text=(
             "For a Mac that stays plugged in at one spot. When armed, unplugging the "
             "power automatically ERASES all of this app's data after a 10-second grace "
-            "— the Signal link, your groups, the message, the schedule, and logs. It "
-            "does not touch anything else on the Mac. Plug back in within those 10 "
-            "seconds to cancel. After a wipe you scan the QR to link again.")
+            "— the Signal link, your groups, the message, the schedule, logs, and the "
+            "image files you attached. Apart from those images it touches nothing else "
+            "on the Mac. Plug back in within those 10 seconds to cancel. After a wipe "
+            "you scan the QR to link again.")
         ).pack(anchor="w", pady=(0, 12))
 
         btns = ttk.Frame(tab)
@@ -808,7 +826,10 @@ class App(tk.Tk):
 
     def _open_logs(self) -> None:
         engine.LOGS_DIR.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["open", str(engine.LOGS_DIR)])
+        try:
+            subprocess.run(["open", str(engine.LOGS_DIR)], check=False)
+        except OSError as exc:
+            messagebox.showerror("Couldn't open logs", str(exc))
 
     def _clear_logs(self) -> None:
         if not messagebox.askyesno("Clear logs?",
@@ -822,8 +843,9 @@ class App(tk.Tk):
         on = self.wipe_var.get()
         if on and not messagebox.askyesno("Arm wipe-on-quit?",
                 "From now on, every time you quit the app it will ERASE all of its data "
-                "(the Signal link, groups, message, schedule, and logs) — you'll confirm "
-                "once at quit, then re-link next time you open it.\n\nArm it?",
+                "(the Signal link, groups, message, schedule, and logs) AND delete the "
+                "image files you attached, from wherever they live on this Mac. You'll "
+                "confirm once at quit, then re-link next time you open it.\n\nArm it?",
                 icon="warning", default="no"):
             self.wipe_var.set(False)
             return
@@ -836,7 +858,8 @@ class App(tk.Tk):
             return
         if not messagebox.askyesno("Arm station mode?",
                 "From now on, unplugging this Mac will ERASE all of this app's data "
-                "(the Signal link, groups, message, schedule, and logs) after a "
+                "(the Signal link, groups, message, schedule, and logs) AND delete the "
+                "image files you attached, from wherever they live on this Mac, after a "
                 "10-second grace, and you'll have to link again. Nothing else on the "
                 "Mac is touched.\n\nArm it now?",
                 icon="warning"):
@@ -890,16 +913,17 @@ class App(tk.Tk):
         if not text:
             messagebox.showwarning("Empty message", "Type a message before sending.")
             return
-        engine.write_message(text)
-        engine.write_attachments(self.selected_images)
         try:
             cfg = engine.load_config()
-            message = engine.read_message()
-            attachments = engine.read_attachments()
             groups = engine.read_groups()
         except engine.BroadcastError as exc:
             messagebox.showerror("Can't send", str(exc))
             return
+        # Work from the in-memory message/images; don't persist them to disk until the
+        # send is actually confirmed. Otherwise cancelling at the confirm or cooldown
+        # prompt would still overwrite the saved message that a scheduled run sends.
+        message = text
+        attachments = list(self.selected_images)
         missing = engine.missing_attachments(attachments)
         if missing:
             messagebox.showerror("Missing images",
@@ -911,6 +935,8 @@ class App(tk.Tk):
         blocked = engine.cooldown_blocks_run(cfg.cooldown_hours)
         if blocked and not messagebox.askyesno("Cooldown", f"{blocked}\n\nSend anyway?"):
             return
+        engine.write_message(message)          # commit only now that we're really sending
+        engine.write_attachments(attachments)
         self._begin_send(cfg, groups, message, attachments)
 
     def _confirm_send(self, cfg, groups, message, attachments) -> bool:
@@ -946,6 +972,14 @@ class App(tk.Tk):
         self._log("Stopping — finishing the current group first…", "muted")
 
     def _begin_send(self, cfg, groups, message, attachments) -> None:
+        # Single chokepoint for every send trigger (Send, Resend, Resume). Guard against
+        # a second concurrent run: without it, Resend/Resume could re-enter while a send
+        # is live and only the engine's flock would reject it (as a red log line). The
+        # flag is cleared in _finish_send, which always fires via the send_done event.
+        if getattr(self, "_sending", False):
+            self._log("A send is already running — wait for it to finish or press Stop.", "muted")
+            return
+        self._sending = True
         self.stop_event.clear()
         self.failed_results = []
         self._sending_groups = list(groups)  # so a stop can resume the un-sent tail
@@ -1065,8 +1099,9 @@ class App(tk.Tk):
             if not messagebox.askyesno("Wipe everything and quit?",
                     "“Wipe when I quit” is armed, so quitting now ERASES all of this "
                     "app's data — the Signal link, your groups, the message, the "
-                    "schedule, and logs. You'll scan the QR to link again next time.\n\n"
-                    "Quit and erase?", icon="warning", default="no"):
+                    "schedule, and logs — and deletes the image files you attached, from "
+                    "wherever they live on this Mac. You'll scan the QR to link again "
+                    "next time.\n\nQuit and erase?", icon="warning", default="no"):
                 return
             try:
                 engine.unlink()
@@ -1077,17 +1112,35 @@ class App(tk.Tk):
 
     # --------------------------------------------------------------- event loop
     def _poll(self) -> None:
+        # Drain worker events on the main thread. An exception in _handle must never
+        # escape: if it did, the self.after() re-arm below would be skipped and the
+        # whole event pump would die — freezing the log, progress, and link screens
+        # for the rest of the session. So guard each event and always re-arm.
         try:
             while True:
-                kind, payload = self.events.get_nowait()
-                self._handle(kind, payload)
-        except queue.Empty:
-            pass
-        self.after(80, self._poll)
+                try:
+                    kind, payload = self.events.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._handle(kind, payload)
+                except Exception as exc:  # noqa: BLE001 — one bad event can't kill the pump
+                    self._log(f"Internal error handling a '{kind}' event: {exc}", "error")
+        finally:
+            self.after(80, self._poll)
 
     def _handle(self, kind: str, payload) -> None:
         if kind == "qr":
-            self._qr_img = tk.PhotoImage(file=payload)
+            try:
+                self._qr_img = tk.PhotoImage(file=payload)
+            except tk.TclError:
+                # A missing/corrupt QR png would otherwise wedge the link screen on
+                # "Starting…" with the spinner running. Surface it and let them retry.
+                self._stop_link_progress()
+                self.link_status.configure(text="Couldn't render the QR code — try again.",
+                                           foreground=PALETTE["error"])
+                self.link_retry.configure(state="normal", text="Try again")
+                return
             self.qr_label.configure(image=self._qr_img, text="")
         elif kind == "link_status":
             self.link_status.configure(text=payload)
@@ -1136,6 +1189,7 @@ class App(tk.Tk):
                 self._render_groups()
 
     def _finish_send(self, results: list[engine.GroupSendResult]) -> None:
+        self._sending = False  # release the in-progress guard set in _begin_send
         self.stop_btn.configure(state="disabled", text="Stop")
         self.send_btn.set_enabled(True)
         stopped = self.stop_event.is_set()

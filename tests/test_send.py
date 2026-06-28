@@ -7,6 +7,7 @@ These cover the bugs that bit us in the field:
   * both front-ends' progress callbacks must match engine.ProgressFn (the CLI one
     silently drifted to the wrong arity and broke every scheduled run)
 """
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -160,6 +161,113 @@ class SendPathTests(unittest.TestCase):
         res = self._run([("g1", "G1")])
         self.assertTrue(res[0].uncertain, "timeout+dead daemon must be uncertain")
         self.assertEqual(resends, [], "must NOT re-send a timed-out group via per-send")
+
+    def test_group_marked_attempting_before_the_send(self):
+        # The progress marker must be written BEFORE the send leaves the machine, so a
+        # kill in the dispatch->record gap is recoverable (treated as uncertain).
+        observed = {}
+
+        class Spy(FakeDaemon):
+            def send(self, gid, msg, atts):
+                data = json.loads(engine.RUN_PROGRESS_FILE.read_text(encoding="utf-8"))
+                observed[gid] = data["done"].get(gid)
+                return (True, False, "")
+
+        engine.SignalCliDaemon = Spy
+        self._run([("g1", "G1")])
+        self.assertEqual(observed.get("g1"), "attempting",
+                         "the group must be marked attempting BEFORE its send")
+
+    def test_attempting_group_is_uncertain_not_resumed(self):
+        # A crash AFTER a send dispatched but BEFORE its outcome was recorded leaves the
+        # group "attempting": it may have gone out, so it is surfaced as uncertain and
+        # NEVER auto-resent.
+        groups = [("g1", "G1"), ("g2", "G2"), ("g3", "G3")]
+        engine.begin_run_progress(groups, "fp")
+        engine.record_group_progress("g1", "sent")
+        engine.record_group_progress("g2", "attempting")  # killed mid-send
+        run = engine.read_interrupted_run()
+        self.assertIsNotNone(run)
+        assert run is not None
+        self.assertEqual([g for g, _ in run.remaining], ["g3"], "only g3 is safely resumable")
+        self.assertIn("g2", [g for g, _ in run.uncertain], "g2 must be surfaced as uncertain")
+        self.assertNotIn("g2", [g for g, _ in run.remaining], "g2 must never be auto-resent")
+
+    def test_clear_run_progress_if_idle_refuses_while_a_send_holds_the_lock(self):
+        # A launchd fire (different message) must not wipe the resume marker of a GUI
+        # run that is mid-send and holding the lock.
+        engine.begin_run_progress([("g1", "G1")], "fp")
+        with engine.send_lock():  # stand in for another sender mid-send
+            self.assertFalse(engine.clear_run_progress_if_idle(),
+                             "must not clear a live run's marker")
+            self.assertTrue(engine.RUN_PROGRESS_FILE.exists(), "marker must survive")
+        # lock free again -> safe to clear
+        self.assertTrue(engine.clear_run_progress_if_idle())
+        self.assertFalse(engine.RUN_PROGRESS_FILE.exists())
+
+    def test_daemon_write_failure_is_uncertain_not_resent(self):
+        # A write that broke after the request line went out may already have dispatched;
+        # it must be uncertain, never re-sent one-shot.
+        resends = []
+        engine._send_one = lambda b, a, gid, m, at: (resends.append(gid), (True, False, ""))[1]
+
+        class WriteBroke(FakeDaemon):
+            def is_running(self):
+                return False
+
+            def send(self, gid, msg, atts):
+                FakeDaemon.calls[gid] = FakeDaemon.calls.get(gid, 0) + 1
+                return (False, False, "daemon send may have dispatched (write failed): EPIPE")
+
+        engine.SignalCliDaemon = WriteBroke
+        res = self._run([("g1", "G1")])
+        self.assertTrue(res[0].uncertain, "a post-write daemon failure is uncertain")
+        self.assertEqual(resends, [], "must not re-send a maybe-dispatched group")
+
+    def test_dead_daemon_before_write_falls_back_to_one_shot(self):
+        # If the daemon was already down before we wrote, nothing left us — re-sending
+        # this one group via per-send is safe (no duplicate risk).
+        oneshot = []
+        engine._send_one = lambda b, a, gid, m, at: (oneshot.append(gid), (True, False, ""))[1]
+
+        class DeadNotRunning(FakeDaemon):
+            def is_running(self):
+                return False
+
+            def send(self, gid, msg, atts):
+                FakeDaemon.calls[gid] = FakeDaemon.calls.get(gid, 0) + 1
+                return (False, False, "signal-cli daemon is not running")
+
+        engine.SignalCliDaemon = DeadNotRunning
+        res = self._run([("g1", "G1")])
+        self.assertTrue(res[0].ok, "a never-dispatched send is safe to re-send one-shot")
+        self.assertEqual(oneshot, ["g1"])
+
+    def test_daemon_timeout_retires_daemon_for_the_rest(self):
+        # A timeout leaves signal-cli still processing the request; reusing the daemon
+        # for the next group would run two sends at once on one account. The daemon is
+        # retired and the rest of the run goes one-shot.
+        closed = []
+        oneshot = []
+        engine._send_one = lambda b, a, gid, m, at: (oneshot.append(gid), (True, False, ""))[1]
+
+        class TimeoutThenOk(FakeDaemon):
+            def close(self):
+                closed.append(True)
+
+            def send(self, gid, msg, atts):
+                FakeDaemon.calls[gid] = FakeDaemon.calls.get(gid, 0) + 1
+                if gid == "g1":
+                    return (False, False, "daemon timed out after 120s")
+                return (True, False, "")  # would succeed via daemon — must NOT be used
+
+        engine.SignalCliDaemon = TimeoutThenOk
+        res = self._run([("g1", "G1"), ("g2", "G2")])
+        self.assertTrue(res[0].uncertain)
+        self.assertTrue(closed, "daemon must be retired after a timeout")
+        self.assertNotIn("g2", FakeDaemon.calls, "g2 must not use the retired daemon")
+        self.assertIn("g2", oneshot, "g2 must go one-shot after the daemon was retired")
+        self.assertTrue(res[1].ok)
 
     def test_progress_callbacks_match_engine_signature(self):
         # Drive the REAL callback each front-end passes; a wrong arity raises here.

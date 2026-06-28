@@ -27,8 +27,8 @@ import threading
 import time
 import tomllib
 from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -175,6 +175,10 @@ class InterruptedRun:
     total: int                           # groups in the original run
     done: int                            # already sent/uncertain/skipped — won't redo
     remaining: list[tuple[str, str]]     # still to send (unattempted + clean failures)
+    # Groups that were mid-send when the run died ("attempting"), or timed out: the
+    # message MAY already have gone out, so they are never auto-resent — only surfaced
+    # so the operator can check Signal and decide.
+    uncertain: list[tuple[str, str]] = field(default_factory=list)
 
 
 _GROUPS_HEADER = (
@@ -195,6 +199,17 @@ def ensure_config() -> None:
     shutil.copyfile(CONFIG_EXAMPLE_FILE, CONFIG_FILE)
 
 
+def _config_num(raw: dict, key: str, default, cast):
+    """Coerce a config scalar, turning a bad value into a clear BroadcastError instead
+    of a raw ValueError. A wrong-typed TOML value (base_delay_seconds = "fast") must
+    not crash an unattended scheduled run with a traceback main() can't explain."""
+    val = raw.get(key, default)
+    try:
+        return cast(val)
+    except (ValueError, TypeError):
+        raise BroadcastError(f"config.toml: {key} must be a number (got {val!r}).")
+
+
 def load_config() -> Config:
     ensure_config()
     if not CONFIG_FILE.exists():
@@ -205,10 +220,10 @@ def load_config() -> Config:
         raise BroadcastError('Signal number not set yet (config.toml: account = "+61...").')
     return Config(
         account=account,
-        base_delay_seconds=float(raw.get("base_delay_seconds", 12)),
-        jitter_seconds=float(raw.get("jitter_seconds", 5)),
-        cooldown_hours=float(raw.get("cooldown_hours", 0)),
-        max_retries=int(raw.get("max_retries", 4)),
+        base_delay_seconds=_config_num(raw, "base_delay_seconds", 12, float),
+        jitter_seconds=_config_num(raw, "jitter_seconds", 5, float),
+        cooldown_hours=_config_num(raw, "cooldown_hours", 0, float),
+        max_retries=_config_num(raw, "max_retries", 4, int),
         send_times=[str(t) for t in raw.get("send_times", [])],
         debug=bool(raw.get("debug", False)),
         wipe_on_close=bool(raw.get("wipe_on_close", False)),
@@ -388,17 +403,24 @@ def cooldown_blocks_run(cooldown_hours: float) -> str | None:
         last = datetime.fromisoformat(LAST_RUN_FILE.read_text(encoding="utf-8").strip())
     except ValueError:
         return None
+    # Compare in UTC so the cooldown can't be skewed by a DST shift or manual clock
+    # change (naive local times are non-monotonic — across a fall-back the wall clock
+    # repeats an hour, so "now" can read earlier than "last"). A legacy naive stamp
+    # (written before this fix) is interpreted as local time.
+    if last.tzinfo is None:
+        last = last.astimezone()
     next_ok = last + timedelta(hours=cooldown_hours)
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     if now < next_ok:
         mins = round((next_ok - now).total_seconds() / 60)
-        return f"last run was {last:%Y-%m-%d %H:%M}; cooldown clears in ~{mins} min"
+        return f"last run was {last.astimezone():%Y-%m-%d %H:%M}; cooldown clears in ~{mins} min"
     return None
 
 
 def stamp_run() -> None:
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    LAST_RUN_FILE.write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+    LAST_RUN_FILE.write_text(datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                             encoding="utf-8")
 
 
 @contextmanager
@@ -412,11 +434,14 @@ def send_lock() -> Iterator[None]:
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     fh = open(SEND_LOCK_FILE, "w")
     try:
-        try:
-            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            raise BroadcastError("A send is already in progress (this app or the "
-                                 "scheduler). Wait for it to finish, or Stop it first.")
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()  # not holding the lock — don't leak the descriptor
+        raise BroadcastError("A send is already in progress (this app or the "
+                             "scheduler). Wait for it to finish, or Stop it first.")
+    # We hold the lock now; the unlock/close belongs in a finally that only runs
+    # on this path (so it never touches an already-closed fd from the branch above).
+    try:
         try:
             fh.write(str(os.getpid()))
             fh.flush()
@@ -442,7 +467,7 @@ def _reap_orphan_signal_cli(on_log: LogFn = lambda *_: None) -> int:
                                capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
         return 0
-    killed = 0
+    killed: list[int] = []
     for tok in found.stdout.split():
         if not tok.isdigit():
             continue
@@ -459,13 +484,50 @@ def _reap_orphan_signal_cli(on_log: LogFn = lambda *_: None) -> int:
             continue
         try:
             os.kill(pid, signal.SIGTERM)
-            killed += 1
+            killed.append(pid)
         except OSError:
             pass
     if killed:
-        on_log(f"Cleared {killed} leftover signal-cli process(es) holding the account lock.")
-        time.sleep(1.0)  # let the OS release the account lock before we retry
-    return killed
+        on_log(f"Cleared {len(killed)} leftover signal-cli process(es) holding the account lock.")
+        # SIGTERM is async and a JVM signal-cli can take seconds to release the account
+        # lock (or ignore SIGTERM). Wait until each really exits before we let the caller
+        # retry the daemon — a fixed sleep risked retrying while the orphan still held the
+        # lock. Escalate to SIGKILL for anything still alive past the grace deadline.
+        _wait_for_pids_exit(killed, deadline_s=8.0)
+    return len(killed)
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if the process still exists. Signal 0 only probes; ESRCH means gone, and
+    EPERM means it exists but isn't ours (so still 'alive' for our purposes)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _wait_for_pids_exit(pids: list[int], deadline_s: float) -> None:
+    """Block until every pid has exited or the deadline passes; SIGKILL stragglers so
+    the account lock is actually free before the caller retries the daemon."""
+    deadline = time.monotonic() + deadline_s
+    remaining = list(pids)
+    while remaining and time.monotonic() < deadline:
+        remaining = [p for p in remaining if _pid_alive(p)]
+        if remaining:
+            time.sleep(0.1)
+    for pid in remaining:  # still alive past the grace period — force it
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    if remaining:
+        # Give the OS a moment to reap the SIGKILLed process and drop the lock.
+        time.sleep(0.5)
 
 
 # --------------------------------------------------------------------------- #
@@ -586,8 +648,12 @@ def detect_account() -> str | None:
         binary = signal_cli_bin()
     except BroadcastError:
         return None
-    proc = subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-o", "json", "listAccounts"),
-                          capture_output=True, text=True, errors="replace", env=_signal_env(binary))
+    try:
+        proc = subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-o", "json", "listAccounts"),
+                              capture_output=True, text=True, errors="replace",
+                              timeout=LISTGROUPS_TIMEOUT_S, env=_signal_env(binary))
+    except subprocess.TimeoutExpired:
+        return None  # a hung JVM must not block the GUI worker indefinitely
     if proc.returncode != 0:
         return None
     try:
@@ -609,8 +675,12 @@ def is_linked() -> bool:
 def _request_sync(binary: str, account: str) -> None:
     """Best-effort nudge: ask the phone (primary) to (re)send contacts + groups.
     Ignored on failure — the phone usually pushes a sync on linking anyway."""
-    subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-a", account, "sendSyncRequest"),
-                   capture_output=True, text=True, errors="replace", env=_signal_env(binary))
+    try:
+        subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-a", account, "sendSyncRequest"),
+                       capture_output=True, text=True, errors="replace",
+                       timeout=LISTGROUPS_TIMEOUT_S, env=_signal_env(binary))
+    except subprocess.TimeoutExpired:
+        pass  # best-effort nudge; a network stall must not hang the sync
 
 
 def sync_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
@@ -624,9 +694,15 @@ def sync_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
     deadline = time.monotonic() + SYNC_MAX_S
     last, stable = -1, 0
     while time.monotonic() < deadline and stable < SYNC_STABLE_ROUNDS:
-        subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-a", account,
-                            "receive", "--timeout", str(SYNC_BURST_S)),
-                       capture_output=True, text=True, errors="replace", env=_signal_env(binary))
+        try:
+            # --timeout is signal-cli's own burst cap; the outer subprocess timeout is
+            # a hard kill-switch for a wedged JVM that ignores it (with a little slack).
+            subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-a", account,
+                                "receive", "--timeout", str(SYNC_BURST_S)),
+                           capture_output=True, text=True, errors="replace",
+                           timeout=SYNC_BURST_S + 10, env=_signal_env(binary))
+        except subprocess.TimeoutExpired:
+            break  # a single hung burst must not block past SYNC_MAX_S
         try:
             count = pull_groups(account)
         except BroadcastError:
@@ -745,6 +821,13 @@ class SignalCliDaemon:
         self._lock = threading.Lock()
         self._next_id = 0
         self._pending: dict[int, queue.Queue] = {}
+        # A send that times out on our side may still complete: signal-cli answers
+        # late. Instead of discarding that answer, we keep listening — _timed_out are
+        # request ids we gave up waiting on, _late captures their eventual response,
+        # and _timeout_groups maps a timed-out group to its request id for reconciling.
+        self._timed_out: set[int] = set()
+        self._late: dict[int, dict] = {}
+        self._timeout_groups: dict[str, int] = {}
         self._stderr: collections.deque[str] = collections.deque(maxlen=50)
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
@@ -814,7 +897,11 @@ class SignalCliDaemon:
         except (BrokenPipeError, OSError) as exc:
             with self._lock:
                 self._pending.pop(mid, None)
-            raise BroadcastError(f"daemon write failed: {exc}")
+            # The write failed AFTER we started sending the request line — the bytes may
+            # already have reached signal-cli before the pipe broke, so the send may have
+            # dispatched. Mark it uncertain (don't retry, don't resend), unlike the
+            # pre-write "not running" check above which proves nothing left us.
+            raise BroadcastError(f"daemon send may have dispatched (write failed): {exc}")
         try:
             return box.get(timeout=timeout)
         except queue.Empty:
@@ -903,6 +990,17 @@ def classify_error(stderr: str) -> str:
 # and must not mark it a clean failure (that would feed it to "Resend failed").
 CLIENT_TIMEOUT_PATTERN = re.compile(r"timed out after \d+\s*s", re.I)
 
+# Daemon errors meaning the request MAY have been dispatched before we lost contact
+# (a write that broke after the line went out). Same "don't retry, don't call it
+# failed" treatment as a client-side timeout — re-sending could duplicate the message.
+DAEMON_UNCERTAIN_PATTERN = re.compile(r"may have dispatched", re.I)
+
+
+def _is_uncertain_send(err: str) -> bool:
+    """True if a send error means the message may already have gone out (timeout or a
+    post-write daemon failure). Such a group must never be retried or resent."""
+    return bool(CLIENT_TIMEOUT_PATTERN.search(err) or DAEMON_UNCERTAIN_PATTERN.search(err))
+
 
 def _deliver_to_group(send_one: SendFn, group_id: str,
                       message: str, attachments: list[str], max_retries: int,
@@ -921,8 +1019,8 @@ def _deliver_to_group(send_one: SendFn, group_id: str,
             return "sent"
         if debug and err:
             append_debug(f"group {group_id} (throttled={throttled}): {err}")
-        if CLIENT_TIMEOUT_PATTERN.search(err):
-            # We stopped waiting before signal-cli answered — it may have delivered.
+        if _is_uncertain_send(err):
+            # We lost contact before signal-cli confirmed — it may have delivered.
             on_log("Send timed out — it may have gone through; not retrying, to avoid a duplicate.")
             return "uncertain"
         if throttled:
@@ -1070,24 +1168,32 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
 
         def send_one(gid: str, msg: str, atts: list[str]) -> tuple[bool, bool, str]:
             nonlocal daemon
-            if daemon is not None:
-                res = daemon.send(gid, msg, atts)
-                if not res[0] and not daemon.is_running():
-                    # Daemon died mid-run — switch to one-shot for the rest. But if THIS
-                    # send timed out (ambiguous — it may already have gone out), do NOT
-                    # re-send it: that could duplicate. Report the timeout as-is (the
-                    # caller turns it into "uncertain") and only re-send clean failures.
-                    on_log("signal-cli daemon stopped; falling back to per-send.")
-                    timed_out = bool(CLIENT_TIMEOUT_PATTERN.search(res[2]))
-                    try:
-                        daemon.close()
-                    finally:
-                        daemon = None
-                    if timed_out:
-                        return res
-                    return _send_one(binary, config.account, gid, msg, atts)
+            if daemon is None:
+                return _send_one(binary, config.account, gid, msg, atts)
+            res = daemon.send(gid, msg, atts)
+            ok, err = res[0], res[2]
+            if ok:
                 return res
-            return _send_one(binary, config.account, gid, msg, atts)
+            uncertain = _is_uncertain_send(err)
+            # Retire the daemon — and switch the rest of the run to one-shot — when:
+            #  * the send is UNCERTAIN (timed out, or the write broke after the request
+            #    line went out). The daemon may STILL be processing the request we gave
+            #    up on, so reusing it for the next group would run two sends at once on
+            #    one account — the contention these fixes exist to prevent. Retire it and
+            #    do NOT re-send this group (the caller marks it "uncertain").
+            #  * the daemon has DIED. It can't send anything more; if the request
+            #    provably never left us, re-sending this one group one-shot is safe.
+            if uncertain or not daemon.is_running():
+                try:
+                    daemon.close()
+                finally:
+                    daemon = None
+                if uncertain:
+                    on_log("signal-cli send was abandoned mid-flight; per-send for the rest.")
+                    return res
+                on_log("signal-cli daemon stopped; falling back to per-send.")
+                return _send_one(binary, config.account, gid, msg, atts)
+            return res
 
         try:
             on_log(f"Broadcasting to {total} groups | {len(attachments)} attachment(s) | "
@@ -1100,6 +1206,12 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
                     results.append(GroupSendResult(gid, name, ok=False, skipped=True, reason="admin-only"))
                     on_progress(i, total, name, "skipped", 0.0)  # not a failure — never attempted
                     continue  # no send, no pacing delay — nothing left the machine
+                # Mark the group "attempting" BEFORE the send leaves the machine. If the
+                # process is killed (station-mode unplug, force-quit) in the window between
+                # a successful send and recording it, the marker stays "attempting" and a
+                # resume treats it as uncertain — never auto-resending a message that may
+                # already have gone out. Overwritten with the real status below.
+                record_group_progress(gid, "attempting")
                 t0 = time.monotonic()
                 status = _deliver_to_group(send_one, gid, message, attachments,
                                            config.max_retries, on_log, should_stop, config.debug)
@@ -1214,11 +1326,28 @@ def clear_run_progress() -> None:
     RUN_PROGRESS_FILE.unlink(missing_ok=True)
 
 
+def clear_run_progress_if_idle() -> bool:
+    """Clear the resume marker, but ONLY while no send is running (we can take the
+    send lock). The marker is a single account-global file; if another process (a
+    second window, or the scheduler firing while the app is mid-send) holds the lock,
+    the marker belongs to that LIVE run and clearing it would destroy its crash-resume
+    record. Returns True if cleared (lock was free), False if a send is in progress."""
+    try:
+        with send_lock():
+            clear_run_progress()
+            return True
+    except BroadcastError:
+        return False
+
+
 def read_interrupted_run() -> InterruptedRun | None:
     """If a previous broadcast was interrupted (process died mid-run), describe what's
     left to send. Only groups that were never attempted or were a CLEAN failure are
-    resumable — sent/uncertain/skipped are excluded so a resume can't duplicate a
-    message that already went out. Returns None if nothing is pending."""
+    resumable. A group recorded "attempting" (the run was killed AFTER the send was
+    dispatched but BEFORE its outcome was recorded) or "uncertain"/"sent"/"skipped" is
+    NEVER auto-resent — re-sending could duplicate a message that already went out.
+    "attempting"/"uncertain" groups are reported separately so the operator can check
+    Signal and decide. Returns None only when there's nothing left to resume OR flag."""
     if not RUN_PROGRESS_FILE.exists():
         return None
     try:
@@ -1228,10 +1357,13 @@ def read_interrupted_run() -> InterruptedRun | None:
     groups = [(str(g), str(n)) for g, n in data.get("groups", [])]
     done = data.get("done", {})
     remaining = [(g, n) for g, n in groups if done.get(g) in (None, "failed")]
-    if not groups or not remaining:
+    # "attempting" = killed mid-send; "uncertain" = timed out. Both may have delivered.
+    uncertain = [(g, n) for g, n in groups if done.get(g) in ("attempting", "uncertain")]
+    if not groups or (not remaining and not uncertain):
         return None
     return InterruptedRun(fingerprint=str(data.get("fp", "")), total=len(groups),
-                          done=len(groups) - len(remaining), remaining=remaining)
+                          done=len(groups) - len(remaining), remaining=remaining,
+                          uncertain=uncertain)
 
 
 def append_activity(line: str) -> None:
@@ -1301,7 +1433,17 @@ def parse_times(times: list[str]) -> list[dict]:
 
 def build_plist(times: list[str], python_exe: str) -> dict:
     """launchd job: run broadcast.py at each time, wrapped in caffeinate so the
-    Mac stays awake through the send."""
+    Mac stays awake through the send.
+
+    NOTE on missed runs: StartCalendarInterval fires on local wall-clock time. If the
+    Mac is asleep or off at a scheduled time, launchd runs the job ONCE at the next
+    wake — and COALESCES all slots missed during sleep into that single run. So a day's
+    sends don't each fire late; at most one catch-up fires after a long sleep, and the
+    cooldown gate (cooldown_hours) then suppresses any further catch-ups in that window.
+    A send can therefore land at a different local time than scheduled after a long
+    sleep. This is intended (better one late send than none); if you need strict
+    "skip if the window was missed" behaviour, gate it in broadcast.run() on the
+    current time vs send_times. Times are also re-interpreted after a DST change."""
     return {
         "Label": SCHEDULE_LABEL,
         "ProgramArguments": ["/usr/bin/caffeinate", "-i",
@@ -1403,15 +1545,39 @@ def _clear_dir(path: Path, keep: frozenset[str] | set[str] = frozenset()) -> Non
             item.unlink(missing_ok=True)
 
 
+def _delete_listed_attachments(path: Path = ATTACHMENTS_FILE) -> None:
+    """Delete the original image files that attachments.txt points at — the user's own
+    files, wherever they picked them (Desktop, Downloads, …). Part of the privacy wipe:
+    the app holds only paths, not copies, so without this the images survive a wipe.
+    Reads the raw paths (not read_attachments, which raises on a missing file) and is
+    best-effort: a file already gone or undeletable never blocks the wipe."""
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        p = Path(line)
+        if not p.is_absolute():
+            p = PROJECT_DIR / p
+        try:
+            if p.is_file():
+                p.unlink(missing_ok=True)
+        except OSError:
+            pass  # best-effort — a wipe must always finish
+
+
 def unlink() -> None:
     """Sign this Mac out of Signal and erase every local trace: the link keys and
-    signal-cli's cached groups/contacts, the group list, the message, attachments,
-    the schedule, and any logs. Leaves no personal data behind — use before handing
-    the Mac to someone else. The phone (primary device) is untouched; to also drop
-    this device from the phone, remove it under Signal → Linked Devices."""
+    signal-cli's cached groups/contacts, the group list, the message, the attached
+    image files, the schedule, and any logs. Leaves no personal data behind — use
+    before handing the Mac to someone else. The phone (primary device) is untouched;
+    to also drop this device from the phone, remove it under Signal → Linked Devices."""
     disable_schedule()
     LOCAL_PLIST.unlink(missing_ok=True)
     shutil.rmtree(DATA_DIR, ignore_errors=True)        # link keys + account.db cache
+    # Delete the original attached images before dropping the list that points at them.
+    _delete_listed_attachments()
     # Delete config.toml outright — it holds the number — then recreate a fresh
     # placeholder from the template, so no local copy of the number survives.
     for f in (GROUPS_FILE, MESSAGE_FILE, ATTACHMENTS_FILE, CONFIG_FILE):

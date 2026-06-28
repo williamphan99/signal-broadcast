@@ -52,6 +52,11 @@ class PowerWatcher:
     def tick(self) -> None:
         if self._on_ac():
             # Stay awake to notice an unplug only while there's a link worth protecting.
+            # Note: on_ac_power() returns True on a pmset read failure (fail-safe — a
+            # glitch must never trigger a wipe). The cost is that a string of transient
+            # pmset errors while genuinely on battery resets the unplug debounce here, so
+            # a real unplug can be deferred by pmset noise. We accept that bias: deferring
+            # a wipe is far safer than wiping by mistake.
             self._stand_down(awake=self._is_linked())
             return
         if not self._is_linked():

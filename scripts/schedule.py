@@ -28,4 +28,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except engine.BroadcastError as exc:
+        # e.g. no send_times set — show the reason, not a raw traceback.
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1)

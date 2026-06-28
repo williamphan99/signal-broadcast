@@ -35,7 +35,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=None, help="only send to the first N groups (testing)")
     p.add_argument("--dry-run", action="store_true", help="show what would send, send nothing")
     p.add_argument("--force", action="store_true", help="ignore the cooldown gate")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.delay is not None and args.delay < 0:
+        p.error("--delay must be >= 0")  # a negative pace is meaningless and misreports dry-run
+    return args
 
 
 def _print_dry_run(cfg, message, attachments, groups, delay) -> None:
@@ -79,19 +82,34 @@ def run(args: argparse.Namespace) -> int:
     if args.limit is not None:
         groups = groups[: args.limit]
     delay = args.delay if args.delay is not None else cfg.base_delay_seconds
+    if delay < engine.MIN_DELAY_S:
+        log.warning("--delay %.0fs is below the %.0fs floor; sends will be paced at the floor.",
+                    delay, engine.MIN_DELAY_S)
 
     # Resume an interrupted run instead of re-sending everything. Only when the
     # message+attachments are unchanged (same fingerprint) — otherwise the operator
-    # clearly intends a new send, so start fresh.
+    # clearly intends a new send, so start fresh. State is only mutated under the send
+    # lock (clear_run_progress_if_idle) so a launchd fire can't wipe the resume record
+    # of a GUI run that's mid-send; dry-run never mutates anything.
     interrupted = engine.read_interrupted_run()
     if interrupted:
         if interrupted.fingerprint == engine.message_fingerprint(message, attachments):
-            log.warning("Resuming interrupted run: %d of %d groups left (%d already sent, skipped).",
-                        len(interrupted.remaining), interrupted.total, interrupted.done)
+            if interrupted.uncertain:
+                log.warning("%d group(s) from the interrupted run may already have been sent "
+                            "— NOT resending them; check Signal.", len(interrupted.uncertain))
             groups = interrupted.remaining
-        else:
+            if groups:
+                log.warning("Resuming interrupted run: %d of %d groups left (%d already done).",
+                            len(groups), interrupted.total, interrupted.done)
+            elif not args.dry_run:
+                log.info("Nothing left to resume (the rest were sent or are uncertain).")
+                engine.clear_run_progress_if_idle()
+                return 0
+        elif not args.dry_run:
             log.warning("A previous run was interrupted, but the message changed — starting fresh.")
-            engine.clear_run_progress()
+            if not engine.clear_run_progress_if_idle():
+                log.error("A send is already in progress; not starting another. Try again later.")
+                return 2
 
     if args.dry_run:
         _print_dry_run(cfg, message, attachments, groups, delay)
