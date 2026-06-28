@@ -975,8 +975,9 @@ class App(tk.Tk):
         if not changed:
             messagebox.showinfo("Update", message)
             return
+        # Don't show the raw git output — just confirm and offer the restart.
         if messagebox.askyesno("Update installed",
-                f"{message}\n\nRestart now to use the new version?"):
+                "A new version was downloaded.\n\nRestart now to use the new version?"):
             self._restart()
 
     def _restart(self) -> None:
