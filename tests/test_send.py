@@ -81,6 +81,15 @@ class SendPathTests(unittest.TestCase):
         failed = [r for r in res if not r.ok and not r.skipped and not r.uncertain]
         self.assertEqual(failed, [], "uncertain groups must not be treated as failed")
 
+    def test_send_lock_blocks_a_second_sender(self):
+        with engine.send_lock():
+            with self.assertRaises(engine.BroadcastError):
+                with engine.send_lock():
+                    pass
+        # released — can acquire again afterwards
+        with engine.send_lock():
+            pass
+
     def test_progress_callbacks_match_engine_signature(self):
         # Drive the REAL callback each front-end passes; a wrong arity raises here.
         seen = []
