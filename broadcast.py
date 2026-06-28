@@ -80,6 +80,19 @@ def run(args: argparse.Namespace) -> int:
         groups = groups[: args.limit]
     delay = args.delay if args.delay is not None else cfg.base_delay_seconds
 
+    # Resume an interrupted run instead of re-sending everything. Only when the
+    # message+attachments are unchanged (same fingerprint) — otherwise the operator
+    # clearly intends a new send, so start fresh.
+    interrupted = engine.read_interrupted_run()
+    if interrupted:
+        if interrupted.fingerprint == engine.message_fingerprint(message, attachments):
+            log.warning("Resuming interrupted run: %d of %d groups left (%d already sent, skipped).",
+                        len(interrupted.remaining), interrupted.total, interrupted.done)
+            groups = interrupted.remaining
+        else:
+            log.warning("A previous run was interrupted, but the message changed — starting fresh.")
+            engine.clear_run_progress()
+
     if args.dry_run:
         _print_dry_run(cfg, message, attachments, groups, delay)
         return 0

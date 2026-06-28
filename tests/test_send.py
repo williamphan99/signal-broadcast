@@ -54,6 +54,7 @@ class SendPathTests(unittest.TestCase):
     def tearDown(self):
         (engine.signal_cli_bin, engine.unsendable_groups, engine.SignalCliDaemon,
          engine._send_one, engine.MIN_DELAY_S, engine.NON_THROTTLE_WAIT_S) = self._orig
+        engine.clear_run_progress()  # don't leave a test's crash marker behind
 
     def _run(self, groups, **kw):
         cfg = engine.Config(account="+test", base_delay_seconds=0.0, jitter_seconds=0.0,
@@ -89,6 +90,41 @@ class SendPathTests(unittest.TestCase):
         # released — can acquire again afterwards
         with engine.send_lock():
             pass
+
+    def test_progress_recorded_and_cleared_on_normal_finish(self):
+        FakeDaemon.plan = {"g1": [(True, False, "")], "g2": [(True, False, "")]}
+        self._run([("g1", "G1"), ("g2", "G2")])
+        # A clean finish must leave no crash marker.
+        self.assertIsNone(engine.read_interrupted_run())
+
+    def test_interrupted_run_resumes_only_unsent_and_failed(self):
+        # Simulate a crash: write progress for a 4-group run where g1 sent, g2 is a
+        # clean failure, g3 is uncertain (may have sent), g4 never attempted.
+        groups = [("g1", "G1"), ("g2", "G2"), ("g3", "G3"), ("g4", "G4")]
+        engine.begin_run_progress(groups, "fp123")
+        engine.record_group_progress("g1", "sent")
+        engine.record_group_progress("g2", "failed")
+        engine.record_group_progress("g3", "uncertain")
+        run = engine.read_interrupted_run()
+        self.assertIsNotNone(run)
+        assert run is not None  # narrow for type-checkers
+        remaining_ids = [g for g, _ in run.remaining]
+        self.assertEqual(remaining_ids, ["g2", "g4"], "resume = clean failures + unattempted only")
+        self.assertNotIn("g1", remaining_ids, "a sent group must never be resent")
+        self.assertNotIn("g3", remaining_ids, "an uncertain group must never be resent")
+        self.assertEqual(run.fingerprint, "fp123")
+        engine.clear_run_progress()
+        self.assertIsNone(engine.read_interrupted_run())
+
+    def test_marker_survives_a_run_that_aborts_with_an_error(self):
+        class Boom(FakeDaemon):
+            def send(self, gid, msg, atts):
+                raise RuntimeError("boom")
+        engine.SignalCliDaemon = Boom
+        with self.assertRaises(Exception):
+            self._run([("g1", "G1")])
+        self.assertIsNotNone(engine.read_interrupted_run(),
+                             "an aborted run must keep its resume marker")
 
     def test_progress_callbacks_match_engine_signature(self):
         # Drive the REAL callback each front-end passes; a wrong arity raises here.

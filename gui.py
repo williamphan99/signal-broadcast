@@ -359,6 +359,16 @@ class App(tk.Tk):
             "message so a scheduled run can send it later — it doesn't send now.")
         ).pack(anchor="w", pady=(4, 8))
 
+        # Shown only after an interrupted run (app killed mid-send): finish the un-sent
+        # groups without re-sending the ones that already went out. See _refresh_resume.
+        self.resume_bar = ttk.Frame(tab)
+        self.resume_label = ttk.Label(self.resume_bar, foreground=PALETTE["error"],
+                                      wraplength=440, justify="left")
+        self.resume_label.pack(side="left")
+        ttk.Button(self.resume_bar, text="Discard", command=self._discard_interrupted).pack(side="right")
+        self.resume_btn = ttk.Button(self.resume_bar, text="Resume", command=self._on_resume_interrupted)
+        self.resume_btn.pack(side="right", padx=6)
+
         self.progress = ttk.Progressbar(tab, mode="determinate")
         self.progress.pack(fill="x", pady=(6, 2))
         self.counter = ttk.Label(tab, text="", foreground=PALETTE["muted"])
@@ -377,6 +387,7 @@ class App(tk.Tk):
         self.log_box.configure(yscrollcommand=scroll.set)
         self.log_box.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
+        self._refresh_resume()
 
     def _build_schedule_tab(self, tab) -> None:
         ttk.Label(tab, text="Daily auto-send", font=("", 12, "bold")).pack(anchor="w")
@@ -467,6 +478,48 @@ class App(tk.Tk):
         self.last_send_label.configure(
             text=f"Last send: {when} — sent {s.sent}, failed {s.failed}{tail}",
             foreground=PALETTE["error"] if (s.failed or s.uncertain) else PALETTE["muted"])
+
+    def _refresh_resume(self) -> None:
+        """Show the resume banner only if a previous run was interrupted (the app was
+        killed mid-send). broadcast() clears the marker on a normal finish, so a
+        surviving one means a real crash/force-quit."""
+        if not hasattr(self, "resume_bar"):
+            return
+        try:
+            run = engine.read_interrupted_run()
+        except Exception:
+            run = None
+        self._interrupted = run
+        if run:
+            self.resume_label.configure(text=(
+                f"⚠ A previous send was interrupted — {run.done} of {run.total} done. "
+                f"Resume the remaining {len(run.remaining)} (won't re-send the rest)?"))
+            self.resume_bar.pack(fill="x", pady=(2, 6))
+        else:
+            self.resume_bar.pack_forget()
+
+    def _on_resume_interrupted(self) -> None:
+        run = getattr(self, "_interrupted", None)
+        if not run:
+            return
+        try:
+            cfg = engine.load_config()
+            message = engine.read_message()
+            attachments = engine.read_attachments()
+        except engine.BroadcastError as exc:
+            messagebox.showerror("Can't resume", str(exc))
+            return
+        if engine.message_fingerprint(message, attachments) != run.fingerprint:
+            if not messagebox.askyesno("Message changed",
+                    "The saved message has changed since the interrupted run.\n\n"
+                    "Resume and send the CURRENT message to the remaining groups?"):
+                return
+        self.resume_bar.pack_forget()
+        self._begin_send(cfg, run.remaining, message, attachments)
+
+    def _discard_interrupted(self) -> None:
+        engine.clear_run_progress()
+        self._refresh_resume()
 
     # ----------------------------------------------------------------- images
     def _add_images(self) -> None:
@@ -892,6 +945,8 @@ class App(tk.Tk):
         self._sending_groups = list(groups)  # so a stop can resume the un-sent tail
         self.send_btn.set_enabled(False)
         self.resend_btn.configure(state="disabled")
+        if hasattr(self, "resume_bar"):
+            self.resume_bar.pack_forget()  # a new run supersedes any interrupted one
         self.stop_btn.configure(state="normal", text="Stop")
         self.progress.configure(maximum=max(1, len(groups)), value=0)
         self.counter.configure(text=f"0 / {len(groups)}")
@@ -1120,6 +1175,7 @@ class App(tk.Tk):
         self._refresh_status()
         if hasattr(self, "last_send_label"):
             self._refresh_last_send()
+        self._refresh_resume()  # clears the banner after a clean finish; re-shows if still pending
 
 
 if __name__ == "__main__":

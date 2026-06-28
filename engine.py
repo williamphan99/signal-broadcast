@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import collections
 import fcntl
+import hashlib
 import json
 import os
 import plistlib
@@ -38,6 +39,7 @@ LOGS_DIR = PROJECT_DIR / "logs"
 LAST_RUN_FILE = LOGS_DIR / "last-run.txt"
 LAST_SEND_FILE = LOGS_DIR / "last-send.json"  # counts-only summary for the UI
 SEND_LOCK_FILE = LOGS_DIR / "sending.lock"    # exclusive: one broadcast at a time
+RUN_PROGRESS_FILE = LOGS_DIR / "run-progress.json"  # in-flight run, for crash resume
 CONFIG_FILE = PROJECT_DIR / "config.toml"          # per-user (holds the number); gitignored
 CONFIG_EXAMPLE_FILE = PROJECT_DIR / "config.example.toml"  # tracked template
 GROUPS_FILE = PROJECT_DIR / "groups.txt"
@@ -48,7 +50,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.9.7"
+APP_VERSION = "1.9.8"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -158,6 +160,16 @@ class RunSummary:
     failed: int
     skipped: int = 0  # admin-only groups not attempted
     uncertain: int = 0  # sends that timed out and may have delivered
+
+
+@dataclass
+class InterruptedRun:
+    """A broadcast that didn't finish (the app was killed/crashed mid-run). Used to
+    offer a resume that skips groups already sent, instead of re-sending everything."""
+    fingerprint: str                     # of the message+attachments at the time
+    total: int                           # groups in the original run
+    done: int                            # already sent/uncertain/skipped — won't redo
+    remaining: list[tuple[str, str]]     # still to send (unattempted + clean failures)
 
 
 _GROUPS_HEADER = (
@@ -983,6 +995,10 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
             if n:
                 on_log(f"{n} selected group(s) are admin-only — you can't post there; skipping them.")
 
+        # Record the run so a crash mid-broadcast doesn't lose track of what was
+        # already sent (cleared in the finally on a normal return — see below).
+        begin_run_progress(groups, message_fingerprint(message, attachments))
+
         # Keep one signal-cli process alive for the whole run: no per-group JVM
         # startup, warm encryption sessions. Clears a stale-lock orphan and retries
         # once; falls back to one-shot sends only if it still can't start.
@@ -1025,6 +1041,7 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
                                                    reason="may have sent (timed out)"))
                 else:
                     results.append(GroupSendResult(gid, name, ok=(status == "sent")))
+                record_group_progress(gid, status)  # persisted now, so a crash here is recoverable
                 on_progress(i, total, name, status, secs)
                 if i < total and not should_stop():
                     # Adaptive pacing: the gap is a MINIMUM interval between sends, and the
@@ -1037,6 +1054,11 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
         finally:
             if daemon is not None:
                 daemon.close()
+        # Reached only on a normal return (completed or stopped) — NOT if the loop
+        # raised, in which case the caller has no results and we keep the marker so a
+        # resume is still possible. A surviving file therefore means the run was
+        # killed or aborted by an error before finishing.
+        clear_run_progress()
     return results
 
 
@@ -1078,6 +1100,68 @@ def read_run_summary() -> RunSummary | None:
                           uncertain=int(d.get("uncertain", 0)))
     except (ValueError, KeyError):
         return None
+
+
+# --------------------------------------------------------------------------- #
+# Crash-safe run progress: persisted per group so a kill/crash mid-broadcast
+# doesn't lose track of what was already sent (which would re-send on the next
+# run). Cleared when broadcast() returns normally — so a surviving file means the
+# process died mid-run. group ids only (needed to resume); never message text.
+# --------------------------------------------------------------------------- #
+def message_fingerprint(message: str, attachments: list[str]) -> str:
+    """A short, content-derived id so a resume can tell it's the same payload. Not
+    the text itself — just a hash, so it's safe to keep in logs/."""
+    h = hashlib.sha256()
+    h.update(message.encode("utf-8", "replace"))
+    for a in attachments:
+        h.update(b"\0")
+        h.update(a.encode("utf-8", "replace"))
+    return h.hexdigest()[:16]
+
+
+def begin_run_progress(groups: list[tuple[str, str]], fingerprint: str) -> None:
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    data = {"at": datetime.now().isoformat(timespec="seconds"), "fp": fingerprint,
+            "groups": [[g, n] for g, n in groups], "done": {}}
+    RUN_PROGRESS_FILE.write_text(json.dumps(data), encoding="utf-8")
+
+
+def record_group_progress(group_id: str, status: str) -> None:
+    """Mark one group's outcome ("sent"/"failed"/"uncertain"/"skipped"). Rewritten
+    after every group so a crash leaves an accurate record. Best-effort."""
+    try:
+        data = json.loads(RUN_PROGRESS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    data.setdefault("done", {})[group_id] = status
+    try:
+        RUN_PROGRESS_FILE.write_text(json.dumps(data), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def clear_run_progress() -> None:
+    RUN_PROGRESS_FILE.unlink(missing_ok=True)
+
+
+def read_interrupted_run() -> InterruptedRun | None:
+    """If a previous broadcast was interrupted (process died mid-run), describe what's
+    left to send. Only groups that were never attempted or were a CLEAN failure are
+    resumable — sent/uncertain/skipped are excluded so a resume can't duplicate a
+    message that already went out. Returns None if nothing is pending."""
+    if not RUN_PROGRESS_FILE.exists():
+        return None
+    try:
+        data = json.loads(RUN_PROGRESS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    groups = [(str(g), str(n)) for g, n in data.get("groups", [])]
+    done = data.get("done", {})
+    remaining = [(g, n) for g, n in groups if done.get(g) in (None, "failed")]
+    if not groups or not remaining:
+        return None
+    return InterruptedRun(fingerprint=str(data.get("fp", "")), total=len(groups),
+                          done=len(groups) - len(remaining), remaining=remaining)
 
 
 def append_activity(line: str) -> None:
