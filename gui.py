@@ -95,9 +95,14 @@ class App(tk.Tk):
         self.container = ttk.Frame(self, padding=16)
         self.container.pack(fill="both", expand=True)
 
-        # Closing the window (red button / Cmd-Q / Quit) routes through _quit so an
-        # armed "wipe on close" actually fires.
+        # Closing the window routes through _quit so an armed "wipe on close" fires.
+        # The red close button triggers WM_DELETE_WINDOW; on macOS, Cmd-Q and the
+        # Dock/Apple-menu Quit bypass that and need the tk::mac::Quit hook instead.
         self.protocol("WM_DELETE_WINDOW", self._quit)
+        try:
+            self.createcommand("tk::mac::Quit", self._quit)
+        except tk.TclError:
+            pass
 
         if os.environ.get("SB_SKIP_LINK") or engine.is_linked():
             self.show_main()
