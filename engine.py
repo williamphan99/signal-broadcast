@@ -315,13 +315,26 @@ def signal_cli_bin() -> str:
     raise BroadcastError("signal-cli is not installed. Run Setup first.")
 
 
+# Homebrew ships signal-cli as a GraalVM native image whose default thread stack
+# is too small for some groups (large membership or long history), so it crashes
+# mid-send with "java.lang.StackOverflowError" and exits non-zero — one group
+# silently fails. This GraalVM runtime option enlarges the stack and must precede
+# the subcommand. It's a no-op (ignored) on a JVM-based signal-cli build.
+SIGNAL_CLI_RUNTIME_OPTS = ["-XX:StackSize=16m"]
+
+
+def _cli(binary: str, *args: str) -> list[str]:
+    """Build a signal-cli argv with the stack-size fix applied up front."""
+    return [binary, *SIGNAL_CLI_RUNTIME_OPTS, *args]
+
+
 def detect_account() -> str | None:
     """Return the linked number signal-cli knows about, or None."""
     try:
         binary = signal_cli_bin()
     except BroadcastError:
         return None
-    proc = subprocess.run([binary, "--config", str(DATA_DIR), "-o", "json", "listAccounts"],
+    proc = subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-o", "json", "listAccounts"),
                           capture_output=True, text=True, errors="replace")
     if proc.returncode != 0:
         return None
@@ -344,7 +357,7 @@ def is_linked() -> bool:
 def _request_sync(binary: str, account: str) -> None:
     """Best-effort nudge: ask the phone (primary) to (re)send contacts + groups.
     Ignored on failure — the phone usually pushes a sync on linking anyway."""
-    subprocess.run([binary, "--config", str(DATA_DIR), "-a", account, "sendSyncRequest"],
+    subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-a", account, "sendSyncRequest"),
                    capture_output=True, text=True, errors="replace")
 
 
@@ -359,8 +372,8 @@ def sync_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
     deadline = time.monotonic() + SYNC_MAX_S
     last, stable = -1, 0
     while time.monotonic() < deadline and stable < SYNC_STABLE_ROUNDS:
-        subprocess.run([binary, "--config", str(DATA_DIR), "-a", account,
-                        "receive", "--timeout", str(SYNC_BURST_S)],
+        subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-a", account,
+                            "receive", "--timeout", str(SYNC_BURST_S)),
                        capture_output=True, text=True, errors="replace")
         try:
             count = pull_groups(account)
@@ -379,7 +392,7 @@ def pull_groups(account: str) -> int:
     preserving any groups you previously excluded. Returns the count written."""
     binary = signal_cli_bin()
     try:
-        proc = subprocess.run([binary, "--config", str(DATA_DIR), "-o", "json", "-a", account, "listGroups"],
+        proc = subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-o", "json", "-a", account, "listGroups"),
                               capture_output=True, text=True, errors="replace", timeout=LISTGROUPS_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         raise BroadcastError("Timed out fetching groups. Check the connection and try again.")
@@ -405,8 +418,8 @@ def pull_groups(account: str) -> int:
 def _send_one(binary: str, account: str, group_id: str,
               message: str, attachments: list[str]) -> tuple[bool, bool, str]:
     """Send to one group. Returns (ok, throttled, stderr)."""
-    cmd = [binary, "-a", account, "--config", str(DATA_DIR),
-           "send", "-g", group_id, "-m", message]
+    cmd = _cli(binary, "-a", account, "--config", str(DATA_DIR),
+               "send", "-g", group_id, "-m", message)
     if attachments:
         cmd += ["-a", *attachments]
     try:
