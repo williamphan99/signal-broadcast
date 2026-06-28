@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import os
 import queue
-import shutil
 import subprocess
 import tempfile
 import threading
@@ -195,14 +194,13 @@ class App(tk.Tk):
     def _link_worker(self) -> None:
         png = None
         try:
-            binary = engine.signal_cli_bin()
-            qrencode = shutil.which("qrencode")
-            if not qrencode:
-                raise engine.BroadcastError("qrencode is not installed. Run Setup first.")
+            qrencode = engine.qrencode_bin()
             engine.DATA_DIR.mkdir(parents=True, exist_ok=True)
+            cmd, env = engine.signal_cli_command(
+                "--config", str(engine.DATA_DIR), "link", "-n", "broadcast-laptop")
             proc = subprocess.Popen(
-                [binary, "--config", str(engine.DATA_DIR), "link", "-n", "broadcast-laptop"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                errors="replace", env=env)
 
             uri = ""
             assert proc.stdout is not None

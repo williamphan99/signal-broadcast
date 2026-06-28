@@ -41,7 +41,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 
 
 def app_version() -> str:
@@ -397,6 +397,19 @@ def signal_cli_bin() -> str:
     raise BroadcastError("signal-cli is not installed. Run Setup first.")
 
 
+def qrencode_bin() -> str:
+    """Locate qrencode the same way as signal-cli: PATH first, then Homebrew's bin.
+    The Dock app and launchd run with a minimal PATH that excludes Homebrew, so a
+    bare which() would wrongly report it missing even when it's installed."""
+    found = shutil.which("qrencode")
+    if found:
+        return found
+    for p in ("/opt/homebrew/bin/qrencode", "/usr/local/bin/qrencode"):
+        if Path(p).exists():
+            return p
+    raise BroadcastError("qrencode is not installed. Run Setup first.")
+
+
 def _is_jvm_build(binary: str) -> bool:
     jvm = _jvm_signal_cli()
     return jvm is not None and str(jvm) == binary
@@ -434,6 +447,15 @@ def _cli(binary: str, *args: str) -> list[str]:
     if _is_jvm_build(binary):
         return [binary, *args]
     return [binary, *SIGNAL_CLI_RUNTIME_OPTS, *args]
+
+
+def signal_cli_command(*args: str) -> tuple[list[str], dict | None]:
+    """Resolve the (argv, env) for a one-off signal-cli call: picks the bundled JVM
+    build over the native one, applies the stack-size fix, and supplies the Java env
+    for the JVM build. Use this for any signal-cli launch outside the send loop (e.g.
+    linking in the UI) so every call site is treated identically."""
+    binary = signal_cli_bin()
+    return _cli(binary, *args), _signal_env(binary)
 
 
 def detect_account() -> str | None:
