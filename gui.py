@@ -88,6 +88,7 @@ class App(tk.Tk):
         self.failed_results: list[engine.GroupSendResult] = []
         self._qr_img: tk.PhotoImage | None = None
         self._screen = ""
+        self._awaiting_power = False  # True only while showing the "Plug in" prompt
 
         self.container = ttk.Frame(self, padding=16)
         self.container.pack(fill="both", expand=True)
@@ -139,8 +140,10 @@ class App(tk.Tk):
         self._screen = "link"
         self._clear()
         if engine.watcher_enabled() and not engine.on_ac_power():
+            self._awaiting_power = True
             self._show_plug_in_prompt()
             return
+        self._awaiting_power = False
         ttk.Label(self.container, text="Link this computer to Signal",
                   font=("", 18, "bold")).pack(anchor="w")
         ttk.Label(self.container, wraplength=620, justify="left", text=(
@@ -162,6 +165,10 @@ class App(tk.Tk):
         ttk.Button(btns, text="Quit", command=self.destroy).pack(side="left", padx=4)
         # No auto-start: linking only begins when the button is clicked, so a wipe
         # leaves nothing behind (signal-cli creates files the moment 'link' runs).
+        ttk.Label(self.container, wraplength=620, justify="left", foreground=PALETTE["muted"],
+                  text=("Settings like pacing and schedule times live in config.toml — "
+                        "open it in any text editor to change them.")
+        ).pack(anchor="w", pady=(16, 0))
 
     def _start_link(self) -> None:
         self.link_retry.configure(state="disabled")
@@ -222,14 +229,28 @@ class App(tk.Tk):
             "Station mode is on, so this Mac only runs while it's plugged into power. "
             "Connect the charger to link your phone.")
         ).pack(anchor="w", pady=(6, 14))
-        ttk.Button(self.container, text="Quit", command=self.destroy).pack(anchor="w")
+        btns = ttk.Frame(self.container)
+        btns.pack(anchor="w")
+        ttk.Button(btns, text="Quit", command=self.destroy).pack(side="left")
+        ttk.Button(btns, text="Disarm station mode",
+                   command=self._disarm_from_prompt).pack(side="left", padx=6)
+        ttk.Label(self.container, wraplength=620, justify="left", foreground=PALETTE["muted"], text=(
+            "No charger handy? Disarming turns off station mode so you can link on "
+            "battery. Nothing is stored on this Mac right now.")
+        ).pack(anchor="w", pady=(10, 0))
         self.after(1500, self._maybe_resume_link)
 
+    def _disarm_from_prompt(self) -> None:
+        """Escape hatch: nothing is linked here, so disarming on battery exposes no
+        data and avoids a no-charger lockout. Drops straight to the QR screen."""
+        engine.disable_watcher()
+        self.show_link()
+
     def _maybe_resume_link(self) -> None:
-        if self._screen != "link":
+        if self._screen != "link" or not self._awaiting_power:
             return
         if engine.on_ac_power() or not engine.watcher_enabled():
-            self.show_link()                  # power's back — re-enter and show the QR
+            self.show_link()                  # power's back (or disarmed) — show the QR
         else:
             self.after(1500, self._maybe_resume_link)
 
