@@ -1177,7 +1177,7 @@ class App(tk.Tk):
             elif status == "sent":
                 self._log(f"[{pos}/{total}] sent in {secs:.1f}s", "ok")
             elif status == "uncertain":
-                self._log(f"[{pos}/{total}] timed out after {secs:.0f}s — MAY have sent", "error")
+                self._log(f"[{pos}/{total}] unconfirmed after {secs:.0f}s — MAY have sent", "error")
             else:
                 self._log(f"[{pos}/{total}] failed after {secs:.1f}s", "error")
         elif kind == "send_done":
@@ -1219,8 +1219,8 @@ class App(tk.Tk):
         if skipped:
             self._log(f"Skipped {len(skipped)} admin-only group(s) you can't post in.", "muted")
         if uncertain:
-            self._log(f"⚠ {len(uncertain)} group(s) timed out and MAY already have sent — NOT "
-                      "resent, to avoid duplicates. Check Signal before resending.", "error")
+            self._log(f"⚠ {len(uncertain)} group(s) couldn't be confirmed and MAY already have "
+                      "sent — NOT resent, to avoid duplicates. Check Signal before resending.", "error")
         if stopped:
             self._log(f"Stopped. Sent {sent}; {len(self.failed_results)} not sent.", "muted")
         else:

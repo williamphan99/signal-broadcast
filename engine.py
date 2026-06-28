@@ -51,7 +51,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.12.1"
+APP_VERSION = "1.12.2"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -1050,7 +1050,9 @@ ADMIN_ONLY_PATTERN = re.compile(
 _ERROR_CATEGORIES = [
     (ADMIN_ONLY_PATTERN, "admin-only group (you can't post here)"),
     (re.compile(r"timed?\s*out|timeout|connection|unreachable|unknownhost|refused|"
-                r"no route to host|noroutetohost|ssl|certificate|\bcdn\b|\bdns\b", re.I),
+                r"no route to host|noroutetohost|ssl|certificate|\bcdn\b|\bdns\b|"
+                r"socket|io\s*exception|broken pipe|reset by peer|end of stream|"
+                r"failed to get response", re.I),
      "network or connection problem"),
     (re.compile(r"attachment|upload|file too large|too large", re.I), "attachment or upload problem"),
     (re.compile(r"untrusted identity|unregistered|not registered|invalid number", re.I),
@@ -1081,11 +1083,22 @@ CLIENT_TIMEOUT_PATTERN = re.compile(r"timed out after \d+\s*s", re.I)
 # failed" treatment as a client-side timeout — re-sending could duplicate the message.
 DAEMON_UNCERTAIN_PATTERN = re.compile(r"may have dispatched", re.I)
 
+# signal-cli reported the send FAILED because the request went out but no response came
+# back ("Failed to get response for request" / "no response received"). The server may
+# already have accepted the message before the socket dropped — so, exactly like a
+# timeout, it MAY have been delivered. We trust this over signal-cli's "failed" verdict
+# because the failure was in getting the *reply*, not in sending. Don't retry, don't
+# resend (either could duplicate); flag it for a manual check instead.
+SENT_NO_REPLY_PATTERN = re.compile(r"failed to get response|no response (?:received|for)", re.I)
+
 
 def _is_uncertain_send(err: str) -> bool:
-    """True if a send error means the message may already have gone out (timeout or a
-    post-write daemon failure). Such a group must never be retried or resent."""
-    return bool(CLIENT_TIMEOUT_PATTERN.search(err) or DAEMON_UNCERTAIN_PATTERN.search(err))
+    """True if a send error means the message may already have gone out — a client
+    timeout, a post-write daemon failure, or a request that was sent but never got a
+    response. Such a group must never be retried or resent (it could duplicate)."""
+    return bool(CLIENT_TIMEOUT_PATTERN.search(err)
+                or DAEMON_UNCERTAIN_PATTERN.search(err)
+                or SENT_NO_REPLY_PATTERN.search(err))
 
 
 def _deliver_to_group(send_one: SendFn, group_id: str,
@@ -1108,7 +1121,7 @@ def _deliver_to_group(send_one: SendFn, group_id: str,
             append_debug(f"group {group_id} (throttled={throttled}): {err}")
         if _is_uncertain_send(err):
             # We lost contact before signal-cli confirmed — it may have delivered.
-            on_log("Send timed out — it may have gone through; not retrying, to avoid a duplicate.")
+            on_log("Send unconfirmed — it may have gone through; not retrying, to avoid a duplicate.")
             return "uncertain", "timed out — may have sent"
         if throttled:
             throttle_attempt += 1

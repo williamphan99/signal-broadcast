@@ -81,6 +81,33 @@ class SendPathTests(unittest.TestCase):
         self.assertFalse(res[0].uncertain)
         self.assertGreater(FakeDaemon.calls["g1"], 1, "a clean error should be retried")
 
+    def test_socket_no_response_is_uncertain_not_retried(self):
+        # signal-cli reports the send FAILED with "Failed to get response for request" —
+        # the request went out but no reply came, so the server MAY already have the
+        # message. Must be uncertain: never retried, never resent (could duplicate).
+        FakeDaemon.plan = {"g1": [(False, False,
+            "failed to send message: java.net.SocketException: Failed to get response for request")]}
+        res = self._run([("g1", "G1")])
+        self.assertEqual(FakeDaemon.calls["g1"], 1, "a no-response send must NOT be retried")
+        self.assertTrue(res[0].uncertain)
+        self.assertFalse(res[0].ok)
+        failed = [r for r in res if not r.ok and not r.skipped and not r.uncertain]
+        self.assertEqual(failed, [], "kept out of failures — resending could duplicate")
+
+    def test_preconnect_errors_stay_clean_failures_not_uncertain(self):
+        # A connection that never opened (nothing left the machine) is NOT uncertain:
+        # safe to retry and resend. Guards against over-broadening the uncertain rule.
+        for err in ("java.net.ConnectException: Connection refused",
+                    "java.net.UnknownHostException: chat.signal.org",
+                    "no route to host"):
+            self.assertFalse(engine._is_uncertain_send(err), err)
+
+    def test_classify_error_categorises_socket_and_io(self):
+        for err in ("java.net.SocketException: Failed to get response for request",
+                    "java.io.IOException: broken pipe",
+                    "connection reset by peer"):
+            self.assertEqual(engine.classify_error(err), "network or connection problem", err)
+
     def test_uncertain_excluded_from_failures(self):
         FakeDaemon.plan = {"g1": [(False, False, "daemon timed out after 120s")]}
         res = self._run([("g1", "G1")])
