@@ -84,6 +84,7 @@ class Config:
     cooldown_hours: float
     max_retries: int
     send_times: list[str]
+    debug: bool = False  # write raw signal-cli errors to logs/debug-*.txt
 
 
 @dataclass
@@ -141,6 +142,7 @@ def load_config() -> Config:
         cooldown_hours=float(raw.get("cooldown_hours", 0)),
         max_retries=int(raw.get("max_retries", 4)),
         send_times=[str(t) for t in raw.get("send_times", [])],
+        debug=bool(raw.get("debug", False)),
     )
 
 
@@ -457,7 +459,7 @@ def classify_error(stderr: str) -> str:
 
 def _deliver_to_group(binary: str, account: str, group_id: str,
                       message: str, attachments: list[str], max_retries: int,
-                      on_log: LogFn, should_stop: StopFn) -> bool:
+                      on_log: LogFn, should_stop: StopFn, debug: bool = False) -> bool:
     """Try one group with retries. Throttled sends back off exponentially; other
     failures get a couple of quick retries. Returns True on success. Log lines carry
     no group name, id, or raw signal-cli output — only counts, retry timing, and a
@@ -468,6 +470,8 @@ def _deliver_to_group(binary: str, account: str, group_id: str,
         ok, throttled, err = _send_one(binary, account, group_id, message, attachments)
         if ok:
             return True
+        if debug and err:
+            append_debug(f"group {group_id} (throttled={throttled}): {err}")
         if throttled:
             throttle_attempt += 1
             if throttle_attempt > max_retries:
@@ -511,7 +515,8 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
             on_log("Stopped.")
             break
         ok = _deliver_to_group(binary, config.account, gid, message,
-                               attachments, config.max_retries, on_log, should_stop)
+                               attachments, config.max_retries, on_log, should_stop,
+                               config.debug)
         results.append(GroupSendResult(gid, name, ok))
         on_progress(i, total, name, ok)
         if i < total and not should_stop():
@@ -561,6 +566,17 @@ def append_activity(line: str) -> None:
     categories), never group names/ids, numbers, message text, or raw output."""
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     out = LOGS_DIR / f"activity-{datetime.now():%Y-%m-%d}.txt"
+    with out.open("a", encoding="utf-8") as fh:
+        fh.write(f"{datetime.now():%H:%M:%S}  {line}\n")
+
+
+def append_debug(line: str) -> None:
+    """Append raw signal-cli output to a debug log for troubleshooting — only when
+    config.toml has debug = true. Unlike the activity log this CAN contain group ids
+    or numbers, which is why it's opt-in; it lives in logs/, so unlink and a
+    station-mode unplug still erase it."""
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    out = LOGS_DIR / f"debug-{datetime.now():%Y-%m-%d}.txt"
     with out.open("a", encoding="utf-8") as fh:
         fh.write(f"{datetime.now():%H:%M:%S}  {line}\n")
 

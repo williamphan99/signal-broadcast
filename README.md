@@ -208,6 +208,19 @@ signal-cli --config ./signal-cli-data -a "$NUM" send -m "test" -a /full/path/to/
 cd ~/signal-broadcast && python3 broadcast.py --limit 2 --dry-run
 ```
 
+**Capture the *raw* signal-cli error.** The Activity log only shows a safe category.
+To see the actual underlying error, turn on debug — it writes signal-cli's raw output
+(which can include group ids) to `logs/debug-*.txt`. Add this line to `config.toml`:
+```bash
+echo 'debug = true' >> ~/signal-broadcast/config.toml
+```
+Quit and reopen the app (or re-run the CLI), reproduce the failure, then read it:
+```bash
+cat ~/signal-broadcast/logs/debug-$(date +%F).txt
+```
+Set it back to `false` (or delete the line) when you're done — like all logs, it's
+erased on **Unlink** and on a station-mode unplug.
+
 ### Diagnostic cheat sheet
 
 Run these from the project folder. Set `NUM` to your number once (with country code),

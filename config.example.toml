@@ -7,3 +7,4 @@ jitter_seconds     = 6                # random +/- on the pause so sends aren't 
 cooldown_hours     = 1                # minimum gap between runs; guards against accidental double-sends
 max_retries        = 4                # per-group retry attempts when throttled
 send_times         = ["12:00", "16:00"]  # local times the scheduler fires; edit freely
+debug              = false                # set true to write raw signal-cli errors to logs/debug-*.txt
