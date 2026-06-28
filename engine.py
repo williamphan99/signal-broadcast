@@ -51,7 +51,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.11.0"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -233,8 +233,8 @@ def load_config() -> Config:
         raise BroadcastError('Signal number not set yet (config.toml: account = "+61...").')
     return Config(
         account=account,
-        base_delay_seconds=_config_num(raw, "base_delay_seconds", 12, float),
-        jitter_seconds=_config_num(raw, "jitter_seconds", 5, float),
+        base_delay_seconds=_config_num(raw, "base_delay_seconds", 10, float),
+        jitter_seconds=_config_num(raw, "jitter_seconds", 3, float),
         cooldown_hours=_config_num(raw, "cooldown_hours", 0, float),
         max_retries=_config_num(raw, "max_retries", 4, int),
         send_times=[str(t) for t in raw.get("send_times", [])],
@@ -1089,46 +1089,47 @@ def _is_uncertain_send(err: str) -> bool:
 
 def _deliver_to_group(send_one: SendFn, group_id: str,
                       message: str, attachments: list[str], max_retries: int,
-                      on_log: LogFn, should_stop: StopFn, debug: bool = False) -> str:
+                      on_log: LogFn, should_stop: StopFn, debug: bool = False) -> tuple[str, str]:
     """Try one group with retries via ``send_one`` (one-shot or daemon — same shape).
-    Returns "sent", "failed", or "uncertain". "uncertain" is a client-side timeout:
-    we don't know whether it delivered, so we neither retry nor call it failed.
-    Throttled sends back off exponentially; other clean errors get a couple of quick
-    retries. Log lines carry no group name, id, or raw signal-cli output — only
-    counts, retry timing, and a sanitised error category."""
+    Returns (status, reason): status is "sent", "failed", or "uncertain"; reason is a
+    short, PII-safe category for non-sent outcomes ("" when sent) used for the run's
+    failure breakdown. "uncertain" is a client-side timeout: we don't know whether it
+    delivered, so we neither retry nor call it failed. Throttled sends back off
+    exponentially; other clean errors get a couple of quick retries. Log lines carry no
+    group name, id, or raw signal-cli output — only counts, retry timing, and a category."""
     throttle_attempt = 0
     quick_attempt = 0
     while not should_stop():
         ok, throttled, err = send_one(group_id, message, attachments)
         if ok:
-            return "sent"
+            return "sent", ""
         if debug and err:
             append_debug(f"group {group_id} (throttled={throttled}): {err}")
         if _is_uncertain_send(err):
             # We lost contact before signal-cli confirmed — it may have delivered.
             on_log("Send timed out — it may have gone through; not retrying, to avoid a duplicate.")
-            return "uncertain"
+            return "uncertain", "timed out — may have sent"
         if throttled:
             throttle_attempt += 1
             if throttle_attempt > max_retries:
                 on_log(f"Gave up after {max_retries} throttled retries")
-                return "failed"
+                return "failed", "rate limited"
             wait = _throttle_wait(throttle_attempt, err)  # err parsed for retry-after, never logged
             on_log(f"Throttled — backing off {wait:.0f}s (retry {throttle_attempt}/{max_retries})")
             _interruptible_sleep(wait, should_stop)
         elif ADMIN_ONLY_PATTERN.search(err):
             # Non-admin in an announcement group — retrying can never succeed.
             on_log("Send failed — admin-only group (you can't post here).")
-            return "failed"
+            return "failed", "admin-only group (you can't post here)"
         else:
             quick_attempt += 1
             reason = classify_error(err)
             if quick_attempt > NON_THROTTLE_RETRIES:
                 on_log(f"Send failed — {reason}.")
-                return "failed"
+                return "failed", reason
             on_log(f"Send error ({reason}) — retrying in {NON_THROTTLE_WAIT_S:.0f}s")
             _interruptible_sleep(NON_THROTTLE_WAIT_S, should_stop)
-    return "failed"
+    return "failed", "stopped before sending"
 
 
 def _pace_delay(base: float, jitter: float) -> float:
@@ -1286,14 +1287,16 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
         # always run strictly sequentially.
         K = config.concurrent_sends if daemon is not None else 1
 
-        def record(gid: str, name: str, status: str) -> None:
+        def record(gid: str, name: str, status: str, reason: str = "") -> None:
             """Append one finished group's result. 'uncertain' (a timed-out send that
-            may have delivered) is kept out of failures so it's never auto-resent."""
+            may have delivered) is kept out of failures so it's never auto-resent. The
+            PII-safe ``reason`` rides along on non-sent results for the run breakdown."""
             if status == "uncertain":
                 results.append(GroupSendResult(gid, name, ok=False, uncertain=True,
-                                               reason="may have sent (timed out)"))
+                                               reason=reason or "may have sent (timed out)"))
             else:
-                results.append(GroupSendResult(gid, name, ok=(status == "sent")))
+                results.append(GroupSendResult(gid, name, ok=(status == "sent"),
+                                               reason="" if status == "sent" else reason))
 
         def run_parallel() -> None:
             """Up to K whole-group sends in flight at once on the one account. New sends
@@ -1346,12 +1349,12 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
                     with prog_lock:
                         record_group_progress(gid, "attempting")
                     t0 = time.monotonic()
-                    status = _deliver_to_group(send_fn, gid, message, attachments,
-                                               config.max_retries, on_log, should_stop,
-                                               config.debug)
+                    status, reason = _deliver_to_group(send_fn, gid, message, attachments,
+                                                       config.max_retries, on_log, should_stop,
+                                                       config.debug)
                     secs = time.monotonic() - t0
                     with prog_lock:
-                        record(gid, name, status)
+                        record(gid, name, status, reason)
                         record_group_progress(gid, status)  # persisted now — crash-recoverable
                     advance(name, status, secs)
 
@@ -1383,10 +1386,10 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
                     # already have gone out. Overwritten with the real status below.
                     record_group_progress(gid, "attempting")
                     t0 = time.monotonic()
-                    status = _deliver_to_group(send_one, gid, message, attachments,
-                                               config.max_retries, on_log, should_stop, config.debug)
+                    status, reason = _deliver_to_group(send_one, gid, message, attachments,
+                                                       config.max_retries, on_log, should_stop, config.debug)
                     secs = time.monotonic() - t0  # wall time for this group (includes any retries)
-                    record(gid, name, status)
+                    record(gid, name, status, reason)
                     record_group_progress(gid, status)  # persisted now, so a crash here is recoverable
                     on_progress(i, total, name, status, secs)
                     if i < total and not should_stop():
@@ -1408,15 +1411,17 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
     return results
 
 
-def write_failures(failures: list[GroupSendResult]) -> Path | None:
-    """Persist failed groups so they can be resent. Returns the file path."""
-    if not failures:
-        return None
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    out = LOGS_DIR / f"failures-{datetime.now():%Y-%m-%d}.txt"
-    # group_id only — it's needed to resend; names are never written to disk.
-    out.write_text("".join(f"{r.group_id}\n" for r in failures), encoding="utf-8")
-    return out
+def failure_breakdown(results: list[GroupSendResult]) -> str:
+    """A short, PII-safe summary of why sends failed this run, e.g.
+    "2 network or connection problem, 1 rate limited" — counts by category only, no
+    group names or ids. "" when nothing failed. Used in the activity log so a big run's
+    failures are diagnosable without the old (useless, gibberish) failures-*.txt file."""
+    counts: dict[str, int] = {}
+    for r in results:
+        if not r.ok and not r.skipped and not r.uncertain:
+            counts[r.reason or "unknown error"] = counts.get(r.reason or "unknown error", 0) + 1
+    return ", ".join(f"{n} {cat}" for cat, n in
+                     sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
 def write_run_summary(results: list[GroupSendResult]) -> None:

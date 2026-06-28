@@ -28,7 +28,7 @@ def configure_logging() -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Broadcast a Signal message to many groups, slowly.")
     p.add_argument("--groups", default=str(engine.GROUPS_FILE),
-                   help="group list file. Point at a failures-*.txt to resend just those.")
+                   help="group list file (one <base64-id><TAB><name> per line)")
     p.add_argument("--message", default=str(engine.MESSAGE_FILE), help="message text file")
     p.add_argument("--attachments", default=str(engine.ATTACHMENTS_FILE), help="image-paths file")
     p.add_argument("--delay", type=float, default=None, help="override seconds between sends")
@@ -139,12 +139,11 @@ def run(args: argparse.Namespace) -> int:
     log.info("Done. Sent %d, failed %d, uncertain %d, skipped %d.",
              sent, len(failed), len(uncertain), len(skipped))
     if uncertain:
-        log.warning("%d group(s) timed out and MAY have sent — left off the resend "
-                    "list to avoid duplicates; check Signal before resending.", len(uncertain))
-    out = engine.write_failures(failed)
-    if out:
-        log.warning("Resend the %d failed with: python3 broadcast.py --groups %s",
-                    len(failed), out)
+        log.warning("%d group(s) timed out and MAY have sent — not resent, to avoid "
+                    "duplicates; check Signal before resending.", len(uncertain))
+    breakdown = engine.failure_breakdown(results)
+    if breakdown:
+        log.warning("Failures by cause: %s.", breakdown)  # categories only — PII-safe
     return 1 if (failed or uncertain) else 0
 
 

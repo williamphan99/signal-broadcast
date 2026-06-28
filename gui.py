@@ -714,55 +714,12 @@ class App(tk.Tk):
         engine.disable_schedule()
         self._refresh_schedule_status()
 
-    # --------------------------------------------------------------- station mode
-    # Send-speed presets: (base_delay_seconds, jitter_seconds). The pause is a MINIMUM
-    # interval and a send's own duration counts toward it (see broadcast()'s adaptive
-    # pacing), so a big group that takes longer than the pause to fan out is followed by
-    # the next one immediately — large groups already run at full speed whatever this is
-    # set to. The engine's 10s hard floor still applies, so no preset ever bursts below
-    # 10s between two quick sends. "Large groups" is simply the tightest safe pace; it
-    # only trims the gap between your smaller, quicker groups.
-    SPEED_PRESETS = {
-        "large": ("Large groups — fastest safe pace", 10, 3),
-        "balanced": ("Balanced — recommended", 16, 6),  # matches the shipped default
-        "slow": ("Slower — safest", 24, 6),
-    }
-
     def _build_security_tab(self, tab) -> None:
-        # ---- Send speed -----------------------------------------------------
-        ttk.Label(tab, text="Send speed", font=("", 12, "bold")).pack(anchor="w")
-        ttk.Label(tab, wraplength=600, justify="left", foreground=PALETTE["muted"], text=(
-            "How long to pause between groups. Slower is safer against Signal's rate "
-            "limit; faster finishes sooner. Applies to manual and scheduled sends.")
-        ).pack(anchor="w", pady=(2, 6))
-        try:
-            cfg = engine.load_config()
-            current = (cfg.base_delay_seconds, cfg.jitter_seconds)
-        except engine.BroadcastError:
-            current = (15, 5)
-        self.speed_var = tk.StringVar(value="")
-        for key, (label, base, jit) in self.SPEED_PRESETS.items():
-            if (base, jit) == current:
-                self.speed_var.set(key)
-            ttk.Radiobutton(tab, text=f"{label}   (~{base}s ± {jit}s between groups)",
-                            value=key, variable=self.speed_var,
-                            command=self._apply_speed).pack(anchor="w")
-        self.speed_note = ttk.Label(tab, text="", foreground=PALETTE["muted"])
-        self.speed_note.pack(anchor="w", pady=(2, 0))
-        if not self.speed_var.get():
-            self.speed_note.configure(
-                text=f"Custom: ~{current[0]:g}s ± {current[1]:g}s (set in config.toml).")
-        ttk.Label(tab, wraplength=600, justify="left", foreground=PALETTE["muted"], text=(
-            "The pause is a minimum: a group that takes longer than the pause to send "
-            "(your large groups, often 45–90s each) is followed by the next one with no "
-            "extra wait, so large groups already send as fast as Signal allows — this "
-            "setting can't speed those up. It only changes the gap between your smaller, "
-            "quicker groups. “Large groups” uses the tightest gap; the 10-second floor is "
-            "always kept, so a run never bursts fast enough to risk a ban.")
-        ).pack(anchor="w", pady=(6, 0))
-
-        ttk.Separator(tab).pack(fill="x", pady=12)
-
+        # Send pace is fixed to the tightest safe value (base_delay_seconds /
+        # jitter_seconds in config.toml, defaulting to ~10s ± 3s) and has no UI: a
+        # big group's own send time already exceeds the gap, so the pace only affects
+        # small groups and isn't worth a control. The engine's 10s hard floor still
+        # applies, so a run can never burst fast enough to risk a ban.
         # ---- Parallel sending (experimental) --------------------------------
         ttk.Label(tab, text="Parallel sending (experimental)",
                   font=("", 12, "bold")).pack(anchor="w")
@@ -852,13 +809,6 @@ class App(tk.Tk):
             "Settings → Privacy & Security.")
         ).pack(anchor="w")
         self._refresh_station_status()
-
-    def _apply_speed(self) -> None:
-        key = self.speed_var.get()
-        label, base, jit = self.SPEED_PRESETS[key]
-        engine.set_config_value("base_delay_seconds", base)
-        engine.set_config_value("jitter_seconds", jit)
-        self.speed_note.configure(text=f"Saved: {label} (~{base}s ± {jit}s).")
 
     def _apply_concurrency(self) -> None:
         n = self.conc_var.get()
@@ -1275,11 +1225,15 @@ class App(tk.Tk):
             tail += f", skipped {len(skipped)}" if skipped else ""
             self._log(f"Done. Sent {sent}, failed {len(failed)}{tail}.",
                       "error" if (failed or uncertain) else "ok")
+        breakdown = engine.failure_breakdown(results)
+        if breakdown:
+            # Counts by cause only — no group names/ids — so it's safe in the activity log
+            # and tells you WHY a big run lost groups (network, rate limit, attachment…).
+            self._log(f"Failures by cause: {breakdown}.", "error")
         if self.failed_results:
-            out = engine.write_failures(self.failed_results)
-            label = "Unsent + failed" if stopped else "Failed"
-            verb = "finish." if stopped else "retry them."
-            self._log(f"{label} groups saved to {out}. Use “Resend failed” to {verb}", "muted")
+            verb = "finish the run." if stopped else "retry them."
+            n = len(self.failed_results)
+            self._log(f"{n} group(s) not sent — use “Resend failed” to {verb}", "muted")
             self.resend_btn.configure(state="normal")
         self._refresh_status()
         if hasattr(self, "last_send_label"):

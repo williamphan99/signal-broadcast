@@ -81,11 +81,30 @@ class SendPathTests(unittest.TestCase):
         self.assertFalse(res[0].uncertain)
         self.assertGreater(FakeDaemon.calls["g1"], 1, "a clean error should be retried")
 
-    def test_uncertain_excluded_from_failures_file(self):
+    def test_uncertain_excluded_from_failures(self):
         FakeDaemon.plan = {"g1": [(False, False, "daemon timed out after 120s")]}
         res = self._run([("g1", "G1")])
         failed = [r for r in res if not r.ok and not r.skipped and not r.uncertain]
         self.assertEqual(failed, [], "uncertain groups must not be treated as failed")
+        self.assertEqual(engine.failure_breakdown(res), "", "uncertain isn't a failure cause")
+
+    def test_failure_breakdown_categorises_real_failures(self):
+        # A failed send carries a PII-safe reason category that the breakdown counts.
+        FakeDaemon.plan = {
+            "g1": [(False, False, "no route to host")] * 5,          # network
+            "g2": [(False, False, "connection refused")] * 5,        # network
+            "g3": [(False, False, "attachment upload failed")] * 5,  # attachment
+            "g4": [(True, False, "")],                               # sent — not counted
+        }
+        res = self._run([("g1", "SecretGroupName"), ("g2", "AnotherName"),
+                         ("g3", "ThirdName"), ("g4", "FourthName")])
+        bd = engine.failure_breakdown(res)
+        self.assertIn("2 network or connection problem", bd)
+        self.assertIn("1 attachment or upload problem", bd)
+        # no group names or ids leak into the breakdown — only counts + categories
+        for token in ("g1", "g2", "g3", "g4", "SecretGroupName", "AnotherName",
+                      "ThirdName", "FourthName"):
+            self.assertNotIn(token, bd)
 
     def test_send_lock_blocks_a_second_sender(self):
         with engine.send_lock():
@@ -317,17 +336,13 @@ class PacingTests(unittest.TestCase):
             gap = max(0.0, engine._pace_delay(10, 3) - 0.0)
             self.assertGreaterEqual(gap, engine.MIN_DELAY_S)
 
-    def test_ui_presets_respect_the_floor(self):
-        # Tie the Security-tab presets to the safety guarantee: no preset may be wired
-        # to pace below the engine floor. Skips if Tk isn't importable (headless CI).
-        try:
-            import gui
-        except Exception as exc:  # noqa: BLE001 — tkinter missing → skip, don't fail
-            self.skipTest(f"gui import unavailable: {exc}")
-        self.assertIn("large", gui.App.SPEED_PRESETS, "the Large-groups preset must exist")
-        for key, (_label, base, _jit) in gui.App.SPEED_PRESETS.items():
-            self.assertGreaterEqual(base, engine.MIN_DELAY_S,
-                                    f"preset {key!r} base {base}s is below the {engine.MIN_DELAY_S}s floor")
+    def test_shipped_config_pace_respects_the_floor(self):
+        # The send-speed UI is gone; pace ships in config.example.toml. Tie that default
+        # to the safety guarantee: it must never be wired below the engine's hard floor.
+        import tomllib
+        raw = tomllib.loads(Path(engine.CONFIG_EXAMPLE_FILE).read_text(encoding="utf-8"))
+        self.assertGreaterEqual(float(raw["base_delay_seconds"]), engine.MIN_DELAY_S,
+                                "shipped base_delay is below the hard floor")
 
 
 class AttachmentWipeTests(unittest.TestCase):
@@ -418,9 +433,11 @@ class ConcurrentSendTests(unittest.TestCase):
         g1 = next(r for r in res if r.group_id == "g1")
         self.assertTrue(g1.uncertain)
         self.assertFalse(g1.ok)
-        # uncertain stays out of the resend file (resending could duplicate it)
-        self.assertEqual(engine.write_failures([r for r in res if not r.ok and not r.uncertain
-                                                and not r.skipped]), None)
+        # uncertain is excluded from the "failed" set (resending could duplicate it),
+        # so it never shows up in the failure breakdown either.
+        failed = [r for r in res if not r.ok and not r.uncertain and not r.skipped]
+        self.assertEqual(failed, [])
+        self.assertEqual(engine.failure_breakdown(res), "")
 
     def test_admin_only_group_skipped_in_parallel(self):
         engine.unsendable_groups = lambda account: {"g2"}
