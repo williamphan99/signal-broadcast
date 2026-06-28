@@ -12,11 +12,13 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import queue
 import random
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from dataclasses import dataclass
@@ -41,7 +43,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -613,6 +615,109 @@ def _send_one(binary: str, account: str, group_id: str,
     return False, bool(THROTTLE_PATTERN.search(stderr)), stderr
 
 
+# Result tuple shared by the one-shot _send_one and the daemon's send: (ok, throttled, err).
+SendFn = Callable[[str, str, list[str]], "tuple[bool, bool, str]"]
+
+
+class SignalCliDaemon:
+    """One long-lived `signal-cli jsonRpc` process for a whole broadcast. Avoids the
+    ~1-2s JVM startup per group and keeps encryption sessions warm in memory, so
+    sends (especially to big groups) speed up after the first. Speaks JSON-RPC 2.0
+    over stdin/stdout, one JSON object per line; unsolicited notifications (incoming
+    messages/receipts) are ignored. Start it AFTER any other signal-cli call for the
+    account — it holds the account lock for its lifetime."""
+
+    def __init__(self, account: str, start_timeout: float = 30.0) -> None:
+        binary = signal_cli_bin()
+        cmd = _cli(binary, "-a", account, "--config", str(DATA_DIR), "jsonRpc")
+        self._proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, bufsize=1, errors="replace", env=_signal_env(binary))
+        self._lock = threading.Lock()
+        self._next_id = 0
+        self._pending: dict[int, queue.Queue] = {}
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+        # Confirm the process is up and answering before we rely on it; if not, the
+        # caller falls back to one-shot sends instead of hanging on every group.
+        self._request("version", {}, timeout=start_timeout)
+
+    def _read_loop(self) -> None:
+        out = self._proc.stdout
+        if out is None:
+            return
+        for line in out:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            mid = msg.get("id")
+            if mid is None:
+                continue  # notification (incoming message/receipt) — not our response
+            with self._lock:
+                box = self._pending.pop(mid, None)
+            if box is not None:
+                box.put(msg)
+
+    def is_running(self) -> bool:
+        return self._proc.poll() is None
+
+    def _request(self, method: str, params: dict, timeout: float) -> dict:
+        with self._lock:
+            if self._proc.poll() is not None:
+                raise BroadcastError("signal-cli daemon is not running")
+            self._next_id += 1
+            mid = self._next_id
+            box: queue.Queue = queue.Queue(maxsize=1)
+            self._pending[mid] = box
+        try:
+            assert self._proc.stdin is not None
+            self._proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": method,
+                                               "params": params, "id": mid}) + "\n")
+            self._proc.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            with self._lock:
+                self._pending.pop(mid, None)
+            raise BroadcastError(f"daemon write failed: {exc}")
+        try:
+            return box.get(timeout=timeout)
+        except queue.Empty:
+            with self._lock:
+                self._pending.pop(mid, None)
+            raise BroadcastError(f"daemon timed out after {timeout:.0f}s")
+
+    def send(self, group_id: str, message: str, attachments: list[str]) -> tuple[bool, bool, str]:
+        """Send to one group via the running process. Same (ok, throttled, err) shape
+        as the one-shot _send_one, so the retry/throttle logic is unchanged."""
+        params: dict = {"groupId": group_id, "message": message}
+        if attachments:
+            params["attachment"] = list(attachments)
+        try:
+            resp = self._request("send", params, timeout=SEND_TIMEOUT_S)
+        except BroadcastError as exc:
+            return False, False, str(exc)
+        err = resp.get("error")
+        if err:
+            text = str(err.get("message", "")).strip() or "send failed"
+            return False, bool(THROTTLE_PATTERN.search(text)), text
+        return True, False, ""
+
+    def close(self) -> None:
+        try:
+            if self._proc.stdin:
+                self._proc.stdin.close()
+        except OSError:
+            pass
+        self._proc.terminate()
+        try:
+            self._proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+
+
 def _throttle_wait(attempt: int, stderr: str) -> float:
     """Exponential backoff, but honour an explicit retry-after if larger.
     ``attempt`` is 1-based (1 = first retry)."""
@@ -657,17 +762,18 @@ def classify_error(stderr: str) -> str:
     return "unknown error"
 
 
-def _deliver_to_group(binary: str, account: str, group_id: str,
+def _deliver_to_group(send_one: SendFn, group_id: str,
                       message: str, attachments: list[str], max_retries: int,
                       on_log: LogFn, should_stop: StopFn, debug: bool = False) -> bool:
-    """Try one group with retries. Throttled sends back off exponentially; other
-    failures get a couple of quick retries. Returns True on success. Log lines carry
-    no group name, id, or raw signal-cli output — only counts, retry timing, and a
-    sanitised error category, since the raw text can contain a group id or number."""
+    """Try one group with retries via ``send_one`` (one-shot or daemon — same shape).
+    Throttled sends back off exponentially; other failures get a couple of quick
+    retries. Returns True on success. Log lines carry no group name, id, or raw
+    signal-cli output — only counts, retry timing, and a sanitised error category,
+    since the raw text can contain a group id or number."""
     throttle_attempt = 0
     quick_attempt = 0
     while not should_stop():
-        ok, throttled, err = _send_one(binary, account, group_id, message, attachments)
+        ok, throttled, err = send_one(group_id, message, attachments)
         if ok:
             return True
         if debug and err:
@@ -714,37 +820,64 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
 
     # Admin-only (announcement) groups you can't post in: skip them up front rather
     # than burning a doomed send + retries on each. Best-effort; empty on any error.
+    # NOTE: run this BEFORE starting the daemon — both want the account lock.
     blocked = unsendable_groups(config.account)
     if blocked:
         n = sum(1 for gid, _ in groups if gid in blocked)
         if n:
             on_log(f"{n} selected group(s) are admin-only — you can't post there; skipping them.")
 
-    on_log(f"Broadcasting to {total} groups | {len(attachments)} attachment(s) | "
-           f"~{delay:.0f}s minimum between sends")
-    for i, (gid, name) in enumerate(groups, start=1):
-        if should_stop():
-            on_log("Stopped.")
-            break
-        if gid in blocked:
-            results.append(GroupSendResult(gid, name, ok=False, skipped=True, reason="admin-only"))
-            on_progress(i, total, name, None, 0.0)  # None = skipped, not a failure
-            continue  # no send, no pacing delay — nothing left the machine
-        t0 = time.monotonic()
-        ok = _deliver_to_group(binary, config.account, gid, message,
-                               attachments, config.max_retries, on_log, should_stop,
-                               config.debug)
-        secs = time.monotonic() - t0  # wall time for this group (includes any retries)
-        results.append(GroupSendResult(gid, name, ok))
-        on_progress(i, total, name, ok, secs)
-        if i < total and not should_stop():
-            # Adaptive pacing: the gap is a MINIMUM interval between sends, and the
-            # time the send already took counts toward it. A send that took longer
-            # than the target has already spaced itself out, so the next one goes
-            # immediately; a fast send waits out only the remainder.
-            wait = max(0.0, _pace_delay(delay, config.jitter_seconds) - secs)
-            if wait > 0:
-                _interruptible_sleep(wait, should_stop)
+    # Keep one signal-cli process alive for the whole run: no per-group JVM startup,
+    # and warm encryption sessions. Falls back to one-shot sends if it can't start.
+    daemon: SignalCliDaemon | None = None
+    try:
+        daemon = SignalCliDaemon(config.account)
+    except (BroadcastError, OSError) as exc:
+        on_log(f"Running signal-cli per send (daemon unavailable: {exc}).")
+
+    def send_one(gid: str, msg: str, atts: list[str]) -> tuple[bool, bool, str]:
+        nonlocal daemon
+        if daemon is not None:
+            res = daemon.send(gid, msg, atts)
+            if not res[0] and not daemon.is_running():
+                # Daemon died mid-run — drop to one-shot for the rest.
+                on_log("signal-cli daemon stopped; falling back to per-send.")
+                try:
+                    daemon.close()
+                finally:
+                    daemon = None
+                return _send_one(binary, config.account, gid, msg, atts)
+            return res
+        return _send_one(binary, config.account, gid, msg, atts)
+
+    try:
+        on_log(f"Broadcasting to {total} groups | {len(attachments)} attachment(s) | "
+               f"~{delay:.0f}s minimum between sends")
+        for i, (gid, name) in enumerate(groups, start=1):
+            if should_stop():
+                on_log("Stopped.")
+                break
+            if gid in blocked:
+                results.append(GroupSendResult(gid, name, ok=False, skipped=True, reason="admin-only"))
+                on_progress(i, total, name, None, 0.0)  # None = skipped, not a failure
+                continue  # no send, no pacing delay — nothing left the machine
+            t0 = time.monotonic()
+            ok = _deliver_to_group(send_one, gid, message, attachments,
+                                   config.max_retries, on_log, should_stop, config.debug)
+            secs = time.monotonic() - t0  # wall time for this group (includes any retries)
+            results.append(GroupSendResult(gid, name, ok))
+            on_progress(i, total, name, ok, secs)
+            if i < total and not should_stop():
+                # Adaptive pacing: the gap is a MINIMUM interval between sends, and the
+                # time the send already took counts toward it. A send that took longer
+                # than the target has already spaced itself out, so the next one goes
+                # immediately; a fast send waits out only the remainder.
+                wait = max(0.0, _pace_delay(delay, config.jitter_seconds) - secs)
+                if wait > 0:
+                    _interruptible_sleep(wait, should_stop)
+    finally:
+        if daemon is not None:
+            daemon.close()
     return results
 
 
