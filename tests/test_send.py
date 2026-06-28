@@ -9,6 +9,7 @@ These cover the bugs that bit us in the field:
 """
 import json
 import sys
+import threading
 import unittest
 from pathlib import Path
 
@@ -22,6 +23,7 @@ class FakeDaemon:
     per group id; records call counts so we can assert "no retry"."""
     plan: dict = {}            # gid -> list of (ok, throttled, err) to return in order
     calls: dict = {}           # gid -> attempt count
+    _lock = threading.Lock()   # calls[] is bumped from K worker threads in parallel mode
 
     def __init__(self, account, start_timeout=30.0):
         pass
@@ -30,9 +32,11 @@ class FakeDaemon:
         return True
 
     def send(self, gid, msg, atts):
-        FakeDaemon.calls[gid] = FakeDaemon.calls.get(gid, 0) + 1
+        with FakeDaemon._lock:
+            FakeDaemon.calls[gid] = FakeDaemon.calls.get(gid, 0) + 1
+            n = FakeDaemon.calls[gid]
         seq = FakeDaemon.plan.get(gid, [(True, False, "")])
-        return seq[min(FakeDaemon.calls[gid] - 1, len(seq) - 1)]
+        return seq[min(n - 1, len(seq) - 1)]
 
     def close(self):
         pass
@@ -353,6 +357,102 @@ class AttachmentWipeTests(unittest.TestCase):
 
     def test_no_attachments_file_is_a_noop(self):
         engine._delete_listed_attachments(self.tmp / "nope.txt")  # must not raise
+
+
+class ConcurrentSendTests(unittest.TestCase):
+    """Parallel sending (concurrent_sends > 1). The whole point of these is the one
+    invariant that must never break under concurrency: every group is sent EXACTLY
+    once — never twice (which would be spammy) and never zero times. A timed-out send
+    must still be 'uncertain' and never retried, just like the sequential path."""
+
+    def setUp(self):
+        FakeDaemon.plan = {}
+        FakeDaemon.calls = {}
+        self._orig = (engine.signal_cli_bin, engine.unsendable_groups,
+                      engine.SignalCliDaemon, engine._send_one,
+                      engine.MIN_DELAY_S, engine.NON_THROTTLE_WAIT_S)
+        engine.signal_cli_bin = lambda: "/usr/bin/true"
+        engine.unsendable_groups = lambda account: set()
+        engine.SignalCliDaemon = FakeDaemon
+        engine._send_one = lambda *a: (True, False, "")
+        engine.MIN_DELAY_S = 0.0
+        engine.NON_THROTTLE_WAIT_S = 0.0
+
+    def tearDown(self):
+        (engine.signal_cli_bin, engine.unsendable_groups, engine.SignalCliDaemon,
+         engine._send_one, engine.MIN_DELAY_S, engine.NON_THROTTLE_WAIT_S) = self._orig
+        engine.clear_run_progress()
+
+    def _run(self, groups, K, **kw):
+        cfg = engine.Config(account="+test", base_delay_seconds=0.0, jitter_seconds=0.0,
+                            cooldown_hours=0, max_retries=4, send_times=[],
+                            concurrent_sends=K)
+        return engine.broadcast(config=cfg, groups=groups, message="m",
+                                attachments=[], **kw)
+
+    def test_each_group_sent_exactly_once_under_load(self):
+        groups = [(f"g{i:03d}", f"n{i}") for i in range(50)]
+        for K in (2, 3, 5):
+            FakeDaemon.calls = {}
+            res = self._run(groups, K=K)
+            self.assertEqual(len(res), len(groups), f"K={K}: one result per group")
+            self.assertTrue(all(r.ok for r in res), f"K={K}: all should succeed")
+            self.assertEqual(sorted(r.group_id for r in res),
+                             sorted(g for g, _ in groups), f"K={K}: every group present once")
+            self.assertTrue(all(c == 1 for c in FakeDaemon.calls.values()),
+                            f"K={K}: no group sent more than once")
+            self.assertEqual(len(FakeDaemon.calls), len(groups),
+                             f"K={K}: no group skipped")
+
+    def test_duplicate_group_still_sent_once_in_parallel(self):
+        # The dedup guard must hold under concurrency too — a list with a repeat sends once.
+        res = self._run([("g1", "a"), ("g1", "a"), ("g2", "b")], K=3)
+        self.assertEqual(FakeDaemon.calls.get("g1"), 1, "a duplicate must still send once")
+        self.assertEqual(FakeDaemon.calls.get("g2"), 1)
+        self.assertEqual(len(res), 2, "deduped to two groups")
+
+    def test_timeout_is_uncertain_and_not_retried_in_parallel(self):
+        FakeDaemon.plan = {"g1": [(False, False, "daemon timed out after 300s")]}
+        res = self._run([("g1", "a"), ("g2", "b")], K=2)
+        self.assertEqual(FakeDaemon.calls["g1"], 1, "a timeout must NOT be retried")
+        g1 = next(r for r in res if r.group_id == "g1")
+        self.assertTrue(g1.uncertain)
+        self.assertFalse(g1.ok)
+        # uncertain stays out of the resend file (resending could duplicate it)
+        self.assertEqual(engine.write_failures([r for r in res if not r.ok and not r.uncertain
+                                                and not r.skipped]), None)
+
+    def test_admin_only_group_skipped_in_parallel(self):
+        engine.unsendable_groups = lambda account: {"g2"}
+        res = self._run([("g1", "a"), ("g2", "b"), ("g3", "c")], K=2)
+        self.assertNotIn("g2", FakeDaemon.calls, "an admin-only group must never be sent")
+        g2 = next(r for r in res if r.group_id == "g2")
+        self.assertTrue(g2.skipped)
+        self.assertEqual({r.group_id for r in res}, {"g1", "g2", "g3"})
+
+    def test_progress_fires_once_per_group_in_parallel(self):
+        groups = [(f"g{i}", f"n{i}") for i in range(20)]
+        seen = []
+        lock = threading.Lock()
+
+        def on_prog(done, total, name, status, secs):
+            with lock:
+                seen.append((done, total))
+        self._run(groups, K=3, on_progress=on_prog)
+        self.assertEqual(len(seen), len(groups), "one progress callback per group")
+        self.assertEqual(sorted(d for d, _ in seen), list(range(1, len(groups) + 1)),
+                         "the done-counter advances 1..N with no gaps or repeats")
+        self.assertTrue(all(t == len(groups) for _, t in seen), "total stays N")
+
+    def test_falls_back_to_sequential_without_a_daemon(self):
+        # No daemon (start returns None) must NOT run parallel one-shots — they would
+        # deadlock on the account lock. K is forced to 1 and the per-send path is used.
+        engine.SignalCliDaemon = lambda *a, **k: (_ for _ in ()).throw(engine.BroadcastError("no daemon"))
+        seen = []
+        engine._send_one = lambda b, acc, gid, m, a: (seen.append(gid) or (True, False, ""))
+        res = self._run([("g1", "a"), ("g2", "b")], K=2)
+        self.assertEqual(sorted(seen), ["g1", "g2"], "per-send used for every group")
+        self.assertTrue(all(r.ok for r in res))
 
 
 if __name__ == "__main__":

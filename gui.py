@@ -763,6 +763,32 @@ class App(tk.Tk):
 
         ttk.Separator(tab).pack(fill="x", pady=12)
 
+        # ---- Parallel sending (experimental) --------------------------------
+        ttk.Label(tab, text="Parallel sending (experimental)",
+                  font=("", 12, "bold")).pack(anchor="w")
+        try:
+            conc_now = engine.load_config().concurrent_sends
+        except engine.BroadcastError:
+            conc_now = 1
+        self.conc_var = tk.IntVar(value=conc_now if conc_now in (1, 2, 3) else 1)
+        for n, label in ((1, "Off — one group at a time (recommended)"),
+                         (2, "2 groups at once"),
+                         (3, "3 groups at once")):
+            ttk.Radiobutton(tab, text=label, value=n, variable=self.conc_var,
+                            command=self._apply_concurrency).pack(anchor="w")
+        self.conc_note = ttk.Label(tab, text="", foreground=PALETTE["muted"])
+        self.conc_note.pack(anchor="w", pady=(2, 0))
+        ttk.Label(tab, wraplength=600, justify="left", foreground=PALETTE["muted"], text=(
+            "Lets more than one group send at the same time. It can only finish a run "
+            "sooner if Signal actually overlaps the sends — it often won't, and then you "
+            "get no speed-up at all. It also starts new sends more often, which RAISES the "
+            "risk of hitting Signal's rate limit (a temporary block on your number). Each "
+            "group is still sent exactly once. Leave this Off unless you're deliberately "
+            "testing it on throwaway groups.")
+        ).pack(anchor="w", pady=(2, 0))
+
+        ttk.Separator(tab).pack(fill="x", pady=12)
+
         # ---- Logging --------------------------------------------------------
         ttk.Label(tab, text="Logging", font=("", 12, "bold")).pack(anchor="w")
         try:
@@ -833,6 +859,15 @@ class App(tk.Tk):
         engine.set_config_value("base_delay_seconds", base)
         engine.set_config_value("jitter_seconds", jit)
         self.speed_note.configure(text=f"Saved: {label} (~{base}s ± {jit}s).")
+
+    def _apply_concurrency(self) -> None:
+        n = self.conc_var.get()
+        engine.set_config_value("concurrent_sends", n)
+        if n <= 1:
+            self.conc_note.configure(text="Saved: off — one group at a time (safest).")
+        else:
+            self.conc_note.configure(
+                text=f"Saved: up to {n} at once (experimental — test on throwaway groups first).")
 
     def _toggle_debug(self) -> None:
         engine.set_config_value("debug", self.debug_var.get())

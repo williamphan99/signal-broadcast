@@ -51,7 +51,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.9.11"
+APP_VERSION = "1.10.0"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -120,6 +120,13 @@ SYNC_MAX_S = 60                  # overall cap — large accounts (100+ groups) 
 SYNC_STABLE_ROUNDS = 2           # stop once the group count holds steady this many rounds
 LISTGROUPS_TIMEOUT_S = 30        # listGroups is mostly local; guard against a network hang
 MIN_DELAY_S = 10.0               # hard floor: never send faster than this, whatever the config
+# Experimental parallel sending: how many whole-group sends may be in flight at once
+# on the single account. 1 = the safe, shipped behaviour (strictly one at a time).
+# >1 launches new sends every base_delay but lets their fan-out overlap — it can
+# finish a run sooner ONLY if signal-cli actually overlaps sends (its account lock may
+# serialise them anyway), and it raises the rate of NEW sends, so ban risk is higher.
+# Opt-in via config.toml / Security tab; capped here so no config can over-parallelise.
+MAX_CONCURRENT_SENDS = 5
 
 
 class BroadcastError(Exception):
@@ -143,6 +150,7 @@ class Config:
     send_times: list[str]
     debug: bool = False  # write raw signal-cli errors to logs/debug-*.txt
     wipe_on_close: bool = False  # erase all data when the app is quit (armed in Security)
+    concurrent_sends: int = 1  # sends in flight at once (1 = safe default; >1 experimental)
 
 
 @dataclass
@@ -232,6 +240,10 @@ def load_config() -> Config:
         send_times=[str(t) for t in raw.get("send_times", [])],
         debug=bool(raw.get("debug", False)),
         wipe_on_close=bool(raw.get("wipe_on_close", False)),
+        # Clamp to [1, MAX]: a hand-edited config can't push parallelism past the cap,
+        # and a bad/zero value falls back to the safe one-at-a-time default.
+        concurrent_sends=max(1, min(MAX_CONCURRENT_SENDS,
+                                    _config_num(raw, "concurrent_sends", 1, int))),
     )
 
 
@@ -824,6 +836,12 @@ class SignalCliDaemon:
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1, errors="replace", env=_signal_env(binary))
         self._lock = threading.Lock()
+        # Serialises stdin writes only. Kept separate from _lock (which guards the
+        # pending/timed-out/late maps) so a write can't block the reader thread's
+        # _route. With parallel sending (concurrent_sends > 1) two send() calls can
+        # _dispatch at once; without this their JSON lines could interleave on stdin
+        # and corrupt the request stream.
+        self._write_lock = threading.Lock()
         self._next_id = 0
         self._pending: dict[int, queue.Queue] = {}
         # A send that times out on our side may still complete: signal-cli answers
@@ -908,11 +926,13 @@ class SignalCliDaemon:
             mid = self._next_id
             box: queue.Queue = queue.Queue(maxsize=1)
             self._pending[mid] = box
+        line = json.dumps({"jsonrpc": "2.0", "method": method,
+                           "params": params, "id": mid}) + "\n"
         try:
             assert self._proc.stdin is not None
-            self._proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": method,
-                                               "params": params, "id": mid}) + "\n")
-            self._proc.stdin.flush()
+            with self._write_lock:  # one whole request line at a time — no interleaving
+                self._proc.stdin.write(line)
+                self._proc.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
             with self._lock:
                 self._pending.pop(mid, None)
@@ -1260,44 +1280,123 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
                 return _send_one(binary, config.account, gid, msg, atts)
             return res
 
-        try:
-            on_log(f"Broadcasting to {total} groups | {len(attachments)} attachment(s) | "
-                   f"~{delay:.0f}s minimum between sends")
-            for i, (gid, name) in enumerate(groups, start=1):
-                if should_stop():
-                    on_log("Stopped.")
-                    break
+        # Parallelism: one at a time (1) unless the user opted in AND the daemon is up.
+        # The per-send fallback can't be parallelised — concurrent one-shot processes
+        # would each grab signal-cli's account lock and stall — so without a daemon we
+        # always run strictly sequentially.
+        K = config.concurrent_sends if daemon is not None else 1
+
+        def record(gid: str, name: str, status: str) -> None:
+            """Append one finished group's result. 'uncertain' (a timed-out send that
+            may have delivered) is kept out of failures so it's never auto-resent."""
+            if status == "uncertain":
+                results.append(GroupSendResult(gid, name, ok=False, uncertain=True,
+                                               reason="may have sent (timed out)"))
+            else:
+                results.append(GroupSendResult(gid, name, ok=(status == "sent")))
+
+        def run_parallel() -> None:
+            """Up to K whole-group sends in flight at once on the one account. New sends
+            launch no faster than the pacing gap (so the RATE of new sends matches the
+            sequential path), but their fan-out may overlap. Exactly-once holds — each
+            group is pulled from the queue by exactly one worker. Always via the daemon
+            (parallel one-shots would deadlock on the account lock). If the daemon dies,
+            the remaining sends fail cleanly (the request never left us) — resendable,
+            not duplicated."""
+            assert daemon is not None                   # K >= 2 only when the daemon is up
+            send_fn = daemon.send
+            work: queue.Queue = queue.Queue()
+            for item in groups:
+                if item[0] not in blocked:
+                    work.put(item)
+            prog_lock = threading.Lock()                # guards results, progress file, counter
+            launch_lock = threading.Lock()              # paces the launch of NEW sends
+            next_launch = [0.0]
+            done = [0]
+
+            def advance(name: str, status: str, secs: float) -> None:
+                with prog_lock:
+                    done[0] += 1
+                    d = done[0]
+                on_progress(d, total, name, status, secs)
+
+            # Blocked (admin-only) groups: counted done up front — no send, no pacing.
+            for gid, name in groups:
                 if gid in blocked:
-                    results.append(GroupSendResult(gid, name, ok=False, skipped=True, reason="admin-only"))
-                    on_progress(i, total, name, "skipped", 0.0)  # not a failure — never attempted
-                    continue  # no send, no pacing delay — nothing left the machine
-                # Mark the group "attempting" BEFORE the send leaves the machine. If the
-                # process is killed (station-mode unplug, force-quit) in the window between
-                # a successful send and recording it, the marker stays "attempting" and a
-                # resume treats it as uncertain — never auto-resending a message that may
-                # already have gone out. Overwritten with the real status below.
-                record_group_progress(gid, "attempting")
-                t0 = time.monotonic()
-                status = _deliver_to_group(send_one, gid, message, attachments,
-                                           config.max_retries, on_log, should_stop, config.debug)
-                secs = time.monotonic() - t0  # wall time for this group (includes any retries)
-                if status == "uncertain":
-                    # Timed out — the message may have gone out. NOT a clean failure, so it
-                    # is kept out of "Resend failed" (resending could duplicate it).
-                    results.append(GroupSendResult(gid, name, ok=False, uncertain=True,
-                                                   reason="may have sent (timed out)"))
-                else:
-                    results.append(GroupSendResult(gid, name, ok=(status == "sent")))
-                record_group_progress(gid, status)  # persisted now, so a crash here is recoverable
-                on_progress(i, total, name, status, secs)
-                if i < total and not should_stop():
-                    # Adaptive pacing: the gap is a MINIMUM interval between sends, and the
-                    # time the send already took counts toward it. A send that took longer
-                    # than the target has already spaced itself out, so the next one goes
-                    # immediately; a fast send waits out only the remainder.
-                    wait = max(0.0, _pace_delay(delay, config.jitter_seconds) - secs)
+                    results.append(GroupSendResult(gid, name, ok=False, skipped=True,
+                                                   reason="admin-only"))
+                    advance(name, "skipped", 0.0)
+
+            def worker() -> None:
+                while not should_stop():
+                    try:
+                        gid, name = work.get_nowait()
+                    except queue.Empty:
+                        return
+                    # Reserve a paced launch slot, then release the lock BEFORE sleeping
+                    # so other workers aren't blocked while this one waits out its gap.
+                    with launch_lock:
+                        start_at = max(time.monotonic(), next_launch[0])
+                        next_launch[0] = start_at + _pace_delay(delay, config.jitter_seconds)
+                    wait = start_at - time.monotonic()
                     if wait > 0:
                         _interruptible_sleep(wait, should_stop)
+                    if should_stop():
+                        return
+                    with prog_lock:
+                        record_group_progress(gid, "attempting")
+                    t0 = time.monotonic()
+                    status = _deliver_to_group(send_fn, gid, message, attachments,
+                                               config.max_retries, on_log, should_stop,
+                                               config.debug)
+                    secs = time.monotonic() - t0
+                    with prog_lock:
+                        record(gid, name, status)
+                        record_group_progress(gid, status)  # persisted now — crash-recoverable
+                    advance(name, status, secs)
+
+            workers = [threading.Thread(target=worker, daemon=True) for _ in range(K)]
+            for w in workers:
+                w.start()
+            for w in workers:
+                w.join()
+
+        try:
+            on_log(f"Broadcasting to {total} groups | {len(attachments)} attachment(s) | "
+                   f"~{delay:.0f}s minimum between sends"
+                   + (f" | up to {K} at once (experimental)" if K >= 2 else ""))
+            if K >= 2:
+                run_parallel()
+            else:
+                for i, (gid, name) in enumerate(groups, start=1):
+                    if should_stop():
+                        on_log("Stopped.")
+                        break
+                    if gid in blocked:
+                        results.append(GroupSendResult(gid, name, ok=False, skipped=True, reason="admin-only"))
+                        on_progress(i, total, name, "skipped", 0.0)  # not a failure — never attempted
+                        continue  # no send, no pacing delay — nothing left the machine
+                    # Mark the group "attempting" BEFORE the send leaves the machine. If the
+                    # process is killed (station-mode unplug, force-quit) in the window between
+                    # a successful send and recording it, the marker stays "attempting" and a
+                    # resume treats it as uncertain — never auto-resending a message that may
+                    # already have gone out. Overwritten with the real status below.
+                    record_group_progress(gid, "attempting")
+                    t0 = time.monotonic()
+                    status = _deliver_to_group(send_one, gid, message, attachments,
+                                               config.max_retries, on_log, should_stop, config.debug)
+                    secs = time.monotonic() - t0  # wall time for this group (includes any retries)
+                    record(gid, name, status)
+                    record_group_progress(gid, status)  # persisted now, so a crash here is recoverable
+                    on_progress(i, total, name, status, secs)
+                    if i < total and not should_stop():
+                        # Adaptive pacing: the gap is a MINIMUM interval between sends, and the
+                        # time the send already took counts toward it. A send that took longer
+                        # than the target has already spaced itself out, so the next one goes
+                        # immediately; a fast send waits out only the remainder.
+                        wait = max(0.0, _pace_delay(delay, config.jitter_seconds) - secs)
+                        if wait > 0:
+                            _interruptible_sleep(wait, should_stop)
         finally:
             if daemon is not None:
                 daemon.close()

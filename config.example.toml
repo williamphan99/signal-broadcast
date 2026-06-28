@@ -9,3 +9,4 @@ max_retries        = 4                # per-group retry attempts when throttled
 send_times         = ["12:00", "16:00"]  # local times the scheduler fires; edit freely
 debug              = false                # set true to write raw signal-cli errors to logs/debug-*.txt
 wipe_on_close      = false                # set true to ERASE all data every time the app is quit (armed in Security)
+concurrent_sends   = 1                    # EXPERIMENTAL: groups to send at once (1 = safe default; >1 may not be faster and raises rate-limit risk; max 5; set in Security)
