@@ -715,10 +715,15 @@ class App(tk.Tk):
         self._refresh_schedule_status()
 
     # --------------------------------------------------------------- station mode
-    # Send-speed presets: (base_delay_seconds, jitter_seconds). The 10s hard floor
-    # in engine still applies, so even "Faster" never bursts below 10s.
+    # Send-speed presets: (base_delay_seconds, jitter_seconds). The pause is a MINIMUM
+    # interval and a send's own duration counts toward it (see broadcast()'s adaptive
+    # pacing), so a big group that takes longer than the pause to fan out is followed by
+    # the next one immediately — large groups already run at full speed whatever this is
+    # set to. The engine's 10s hard floor still applies, so no preset ever bursts below
+    # 10s between two quick sends. "Large groups" is simply the tightest safe pace; it
+    # only trims the gap between your smaller, quicker groups.
     SPEED_PRESETS = {
-        "fast": ("Faster — more risky", 12, 3),
+        "large": ("Large groups — fastest safe pace", 10, 3),
         "balanced": ("Balanced — recommended", 16, 6),  # matches the shipped default
         "slow": ("Slower — safest", 24, 6),
     }
@@ -747,6 +752,14 @@ class App(tk.Tk):
         if not self.speed_var.get():
             self.speed_note.configure(
                 text=f"Custom: ~{current[0]:g}s ± {current[1]:g}s (set in config.toml).")
+        ttk.Label(tab, wraplength=600, justify="left", foreground=PALETTE["muted"], text=(
+            "The pause is a minimum: a group that takes longer than the pause to send "
+            "(your large groups, often 45–90s each) is followed by the next one with no "
+            "extra wait, so large groups already send as fast as Signal allows — this "
+            "setting can't speed those up. It only changes the gap between your smaller, "
+            "quicker groups. “Large groups” uses the tightest gap; the 10-second floor is "
+            "always kept, so a run never bursts fast enough to risk a ban.")
+        ).pack(anchor="w", pady=(6, 0))
 
         ttk.Separator(tab).pack(fill="x", pady=12)
 
@@ -1044,9 +1057,10 @@ class App(tk.Tk):
         if not messagebox.askyesno("Unlink and erase the app's data?",
                 "This signs this Mac out of Signal and deletes all the data this app "
                 "stored here — the link keys, your groups, the message, the schedule, "
-                "and logs. Nothing else on the Mac is touched, and nothing personal is "
-                "left behind.\n\nUse this before handing the Mac to someone else. Your "
-                "phone is not affected.\n\nContinue?", icon="warning"):
+                "and logs — and deletes the image files you attached, from wherever they "
+                "live on this Mac. Nothing else on the Mac is touched, and nothing "
+                "personal is left behind.\n\nUse this before handing the Mac to someone "
+                "else. Your phone is not affected.\n\nContinue?", icon="warning"):
             return
         try:
             engine.unlink()

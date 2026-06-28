@@ -2,7 +2,7 @@
 # run; your real settings live there, gitignored. Edit these values, not the code.
 
 account            = "+61XXXXXXXXX"  # your Signal number, linked as a secondary device
-base_delay_seconds = 16               # avg pause between groups; raise to go slower / safer
+base_delay_seconds = 16               # minimum pause between groups (a slow send counts toward it, so big groups get no extra wait); raise to go slower / safer; never below 10s
 jitter_seconds     = 6                # random +/- on the pause so sends aren't metronomic (never drops below 10s)
 cooldown_hours     = 1                # minimum gap between runs; guards against accidental double-sends
 max_retries        = 4                # per-group retry attempts when throttled

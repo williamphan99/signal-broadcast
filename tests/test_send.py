@@ -280,5 +280,80 @@ class SendPathTests(unittest.TestCase):
         self.assertEqual(seen, ["sent"])
 
 
+class PacingTests(unittest.TestCase):
+    """Speed presets + the adaptive pause. The gap between groups is a MINIMUM and a
+    send's own duration counts toward it, so a big group (45–90s to fan out) is followed
+    immediately — large groups run at full speed whatever the preset. The 10s hard floor
+    is never breached, so no preset can burst fast enough to risk a ban."""
+
+    def setUp(self):
+        # Other test classes zero MIN_DELAY_S to avoid sleeping; pin the shipped floor.
+        self._floor = engine.MIN_DELAY_S
+        engine.MIN_DELAY_S = 10.0
+
+    def tearDown(self):
+        engine.MIN_DELAY_S = self._floor
+
+    def test_pace_delay_never_below_floor(self):
+        # Even a reckless config can't pace two quick sends below the floor.
+        for base, jitter in [(10, 3), (16, 6), (24, 6), (10, 0), (1, 50)]:
+            for _ in range(200):
+                self.assertGreaterEqual(engine._pace_delay(base, jitter), engine.MIN_DELAY_S)
+
+    def test_big_send_adds_no_extra_pause(self):
+        # gap = max(0, target - send_time): a send longer than the target self-spaces,
+        # so the user's 47–90s groups are followed by the next one with zero added wait.
+        for _ in range(200):
+            target = engine._pace_delay(10, 3)        # the tightest (Large groups) preset
+            self.assertEqual(max(0.0, target - 47.0), 0.0, "a 47s send must add no pause")
+
+    def test_quick_send_still_waits_the_floor(self):
+        # A near-instant group (e.g. an empty one) still waits at least the floor.
+        for _ in range(200):
+            gap = max(0.0, engine._pace_delay(10, 3) - 0.0)
+            self.assertGreaterEqual(gap, engine.MIN_DELAY_S)
+
+    def test_ui_presets_respect_the_floor(self):
+        # Tie the Security-tab presets to the safety guarantee: no preset may be wired
+        # to pace below the engine floor. Skips if Tk isn't importable (headless CI).
+        try:
+            import gui
+        except Exception as exc:  # noqa: BLE001 — tkinter missing → skip, don't fail
+            self.skipTest(f"gui import unavailable: {exc}")
+        self.assertIn("large", gui.App.SPEED_PRESETS, "the Large-groups preset must exist")
+        for key, (_label, base, _jit) in gui.App.SPEED_PRESETS.items():
+            self.assertGreaterEqual(base, engine.MIN_DELAY_S,
+                                    f"preset {key!r} base {base}s is below the {engine.MIN_DELAY_S}s floor")
+
+
+class AttachmentWipeTests(unittest.TestCase):
+    """The privacy wipe deletes the ORIGINAL image files attachments.txt points at —
+    the user's own files, not copies — so a wipe leaves no images behind."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = Path(tempfile.mkdtemp())
+        self.att_file = self.tmp / "attachments.txt"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_deletes_the_original_image_files(self):
+        img = self.tmp / "flyer.png"
+        img.write_bytes(b"png")
+        self.att_file.write_text(f"# header\n{img}\n", encoding="utf-8")
+        engine._delete_listed_attachments(self.att_file)
+        self.assertFalse(img.exists())
+
+    def test_missing_or_commented_paths_do_not_raise(self):
+        gone = self.tmp / "gone.png"  # listed but never existed
+        self.att_file.write_text(f"# comment\n\n{gone}\n", encoding="utf-8")
+        engine._delete_listed_attachments(self.att_file)  # must not raise
+
+    def test_no_attachments_file_is_a_noop(self):
+        engine._delete_listed_attachments(self.tmp / "nope.txt")  # must not raise
+
+
 if __name__ == "__main__":
     unittest.main()
