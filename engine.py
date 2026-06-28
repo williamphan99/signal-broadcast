@@ -365,7 +365,9 @@ def sync_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
         except BroadcastError:
             continue  # transient fetch error — try another burst
         on_log(f"Syncing your groups from your phone… ({count} so far)")
-        stable = stable + 1 if count == last else 0
+        # Only settle on a non-zero count; while we still have nothing, keep
+        # draining until the cap, since the phone's first sync can be slow.
+        stable = stable + 1 if (count == last and count > 0) else 0
         last = count
     return max(last, 0)
 
