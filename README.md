@@ -185,9 +185,11 @@ error text, so it looks like random characters — that's normal.)
 **Images fail but text sends fine.** Attachments are uploaded to Signal's CDN
 (`cdn.signal.org`) — a different server than text uses — so a VPN, firewall, or
 antivirus that blocks or inspects that host breaks image sends while text still works.
-Check the CDN is reachable (any HTTP code = OK; a timeout or SSL error = blocked):
+Check the CDN is reachable with `-k` — Signal serves its own pinned certificate
+(issuer "Signal Messenger LLC") that generic tools can't verify, so a cert/SSL error
+is **normal and not a block**; only a timeout or `000` means blocked:
 ```bash
-curl -sS -m 8 -o /dev/null -w "%{http_code}\n" https://cdn.signal.org/
+curl -sk -m 8 -o /dev/null -w "%{http_code}\n" https://cdn.signal.org/
 ```
 If it fails: turn the **VPN off** (or split-tunnel `*.signal.org`) and disable any
 antivirus "HTTPS/SSL scanning". JPEG/PNG are the most reliable formats; HEIC (the
@@ -229,9 +231,10 @@ signal-cli --config ./signal-cli-data -a "$NUM" sendSyncRequest
 signal-cli --config ./signal-cli-data -a "$NUM" receive --timeout 20 >/dev/null
 signal-cli --config ./signal-cli-data -a "$NUM" -o json listGroups | python3 -c 'import sys,json; print(len(json.load(sys.stdin)), "groups")'
 
-# Can it reach Signal's servers? (any HTTP code = OK; timeout or SSL error = blocked by VPN/firewall/AV)
+# Can it reach Signal's servers? -k skips cert checks — Signal pins its own CA, so a
+# cert/SSL error is normal and NOT a block; only a timeout / 000 means blocked.
 #   chat = text, storage = groups, cdn/cdn2 = attachments
-for h in chat storage cdn cdn2; do curl -sS -m 8 -o /dev/null -w "$h: %{http_code}\n" "https://$h.signal.org/" || echo "$h: FAILED"; done
+for h in chat storage cdn cdn2; do curl -sk -m 8 -o /dev/null -w "$h: %{http_code}\n" "https://$h.signal.org/"; done
 
 # Send a test to yourself — text only, then with an image (shows the real error)
 signal-cli --config ./signal-cli-data -a "$NUM" send -m "test" "$NUM"
@@ -252,11 +255,13 @@ which signal-cli qrencode python3
 What the results mean:
 - **0 groups from `listGroups`** → the phone's sync didn't reach this Mac; check the
   `storage.signal.org` line below and keep the phone unlocked + online while syncing.
-- **`storage`/`cdn` time out or SSL-error** → a **VPN, firewall, or antivirus** is
-  blocking Signal's non-chat servers — that breaks group sync *and* image sends while
-  text still works. Turn the VPN off (or split-tunnel `*.signal.org`) / disable HTTPS
-  scanning, then re-sync with **Update list from phone**.
-- **a send-to-yourself error mentioning SSL / connection / upload** → same network cause.
+- **`storage`/`cdn` time out (`000`)** → a **VPN, firewall, or antivirus** is blocking
+  Signal's non-chat servers — that breaks group sync *and* image sends while text still
+  works. Turn the VPN off (or split-tunnel `*.signal.org`) / disable HTTPS scanning,
+  then re-sync with **Update list from phone**. (A cert/SSL error is **not** a block —
+  Signal uses its own pinned CA, which `-k` skips checking.)
+- **a send-to-yourself error mentioning timed-out / connection / upload** → same network
+  cause (a bare SSL/certificate complaint on its own is expected, not a fault).
 
 ---
 
