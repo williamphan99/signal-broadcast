@@ -43,7 +43,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.9.4"
+APP_VERSION = "1.9.5"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -640,7 +640,13 @@ class SignalCliDaemon:
 
     def __init__(self, account: str, start_timeout: float = 30.0) -> None:
         binary = signal_cli_bin()
-        cmd = _cli(binary, "-a", account, "--config", str(DATA_DIR), "jsonRpc")
+        # --receive-mode manual: do NOT open the receive connection at startup. On a
+        # slow or blocked network (e.g. behind a VPN) that startup connection stalls,
+        # so the version probe below times out and we drop to the slower per-send
+        # path. We only ever send, never receive, so we don't need it; signal-cli
+        # still connects on demand for each send.
+        cmd = _cli(binary, "-a", account, "--config", str(DATA_DIR),
+                   "jsonRpc", "--receive-mode", "manual")
         self._proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, bufsize=1, errors="replace", env=_signal_env(binary))
@@ -755,7 +761,8 @@ ADMIN_ONLY_PATTERN = re.compile(
 _ERROR_CATEGORIES = [
     (ADMIN_ONLY_PATTERN, "admin-only group (you can't post here)"),
     (re.compile(r"timed?\s*out|timeout|connection|unreachable|unknownhost|refused|"
-                r"ssl|certificate|\bcdn\b|\bdns\b", re.I), "network or connection problem"),
+                r"no route to host|noroutetohost|ssl|certificate|\bcdn\b|\bdns\b", re.I),
+     "network or connection problem"),
     (re.compile(r"attachment|upload|file too large|too large", re.I), "attachment or upload problem"),
     (re.compile(r"untrusted identity|unregistered|not registered|invalid number", re.I),
      "recipient or identity problem"),
