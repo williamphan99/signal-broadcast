@@ -452,14 +452,33 @@ class ConcurrentSendTests(unittest.TestCase):
         seen = []
         lock = threading.Lock()
 
-        def on_prog(done, total, name, status, secs):
+        def on_prog(pos, total, name, status, secs):
             with lock:
-                seen.append((done, total))
+                seen.append((pos, total))
         self._run(groups, K=3, on_progress=on_prog)
         self.assertEqual(len(seen), len(groups), "one progress callback per group")
-        self.assertEqual(sorted(d for d, _ in seen), list(range(1, len(groups) + 1)),
-                         "the done-counter advances 1..N with no gaps or repeats")
+        self.assertEqual(sorted(p for p, _ in seen), list(range(1, len(groups) + 1)),
+                         "every group reports a unique stable position 1..N")
         self.assertTrue(all(t == len(groups) for _, t in seen), "total stays N")
+
+    def test_parallel_groups_keep_their_stable_position(self):
+        # The progress position is the group's place in the run order — NOT completion
+        # order — so admin-only skips stay in place instead of bunching at the start,
+        # and every line maps back to a specific group.
+        engine.unsendable_groups = lambda account: {"g2", "g4"}
+        groups = [("g1", "n1"), ("g2", "n2"), ("g3", "n3"), ("g4", "n4"), ("g5", "n5")]
+        seen = {}
+        lock = threading.Lock()
+
+        def on_prog(pos, total, name, status, secs):
+            with lock:
+                seen[name] = (pos, status)
+        self._run(groups, K=2, on_progress=on_prog)
+        self.assertEqual(seen["n1"][0], 1)
+        self.assertEqual(seen["n2"], (2, "skipped"), "a skip keeps its position, not pos 1")
+        self.assertEqual(seen["n3"][0], 3)
+        self.assertEqual(seen["n4"], (4, "skipped"))
+        self.assertEqual(seen["n5"][0], 5)
 
     def test_falls_back_to_sequential_without_a_daemon(self):
         # No daemon (start returns None) must NOT run parallel one-shots — they would

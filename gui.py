@@ -988,6 +988,8 @@ class App(tk.Tk):
         self.stop_btn.configure(state="normal", text="Stop")
         self.progress.configure(maximum=max(1, len(groups)), value=0)
         self.counter.configure(text=f"0 / {len(groups)}")
+        self._done_count = 0  # completions so far; drives the bar (progress arrives out
+        #                       of order under parallel sending, so we can't use position)
         threading.Thread(target=self._send_worker,
                          args=(cfg, groups, message, attachments), daemon=True).start()
 
@@ -1162,17 +1164,21 @@ class App(tk.Tk):
                 tag = "muted"
             self._log(m, tag)
         elif kind == "progress":
-            done, total, _name, status, secs = payload
-            self.progress.configure(value=done)
-            self.counter.configure(text=f"{done} / {total}")
+            pos, total, _name, status, secs = payload  # pos = group's stable position in the run
+            # The bar tracks COMPLETIONS (monotonic); the log label uses the stable
+            # position so each line maps to a specific group even when sends finish
+            # out of order under parallel sending.
+            self._done_count = getattr(self, "_done_count", 0) + 1
+            self.progress.configure(value=self._done_count)
+            self.counter.configure(text=f"{self._done_count} / {total}")
             if status == "skipped":
-                self._log(f"[{done}/{total}] skipped — admin-only", "muted")
+                self._log(f"[{pos}/{total}] skipped — admin-only", "muted")
             elif status == "sent":
-                self._log(f"[{done}/{total}] sent in {secs:.1f}s", "ok")
+                self._log(f"[{pos}/{total}] sent in {secs:.1f}s", "ok")
             elif status == "uncertain":
-                self._log(f"[{done}/{total}] timed out after {secs:.0f}s — MAY have sent", "error")
+                self._log(f"[{pos}/{total}] timed out after {secs:.0f}s — MAY have sent", "error")
             else:
-                self._log(f"[{done}/{total}] failed after {secs:.1f}s", "error")
+                self._log(f"[{pos}/{total}] failed after {secs:.1f}s", "error")
         elif kind == "send_done":
             self._finish_send(payload)
         elif kind == "refresh_status":

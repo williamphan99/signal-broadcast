@@ -51,7 +51,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.12.0"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -103,11 +103,12 @@ THROTTLE_BACKOFF_BASE_S = 30.0   # first throttle wait; doubles each retry
 THROTTLE_BACKOFF_CAP_S = 300.0   # never wait longer than 5 min between retries
 NON_THROTTLE_RETRIES = 2         # quick retries for transient (non-rate) errors
 NON_THROTTLE_WAIT_S = 5.0
-SEND_TIMEOUT_S = 300             # per-send ceiling. Big groups legitimately take
-                                 # 90-120s+ to fan out to every member; 120s cut
-                                 # those off and wrongly marked them "uncertain". 5
-                                 # min leaves headroom (incl. signal-cli's own throttle
-                                 # retries) while still bounding a genuinely stuck send.
+SEND_TIMEOUT_S = 600             # per-send ceiling (10 min). Very large groups can take
+                                 # several minutes to fan out to every member, and 300s
+                                 # was still cutting some off and wrongly marking them
+                                 # "uncertain". 10 min leaves ample headroom (incl.
+                                 # signal-cli's own throttle retries) while still bounding
+                                 # a genuinely stuck send so a run can't hang forever.
 CONFIRM_GRACE_S = 60             # after a send times out, how long to keep listening
                                  # for signal-cli's late reply before declaring the
                                  # daemon stuck. Confirms a slow-but-fine send instead
@@ -1308,34 +1309,37 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
             not duplicated."""
             assert daemon is not None                   # K >= 2 only when the daemon is up
             send_fn = daemon.send
-            work: queue.Queue = queue.Queue()
-            for item in groups:
-                if item[0] not in blocked:
-                    work.put(item)
-            prog_lock = threading.Lock()                # guards results, progress file, counter
+            prog_lock = threading.Lock()                # guards results + the progress file
             launch_lock = threading.Lock()              # paces the launch of NEW sends
             next_launch = [0.0]
-            done = [0]
 
-            def advance(name: str, status: str, secs: float) -> None:
-                with prog_lock:
-                    done[0] += 1
-                    d = done[0]
-                on_progress(d, total, name, status, secs)
+            def advance(pos: int, name: str, status: str, secs: float) -> None:
+                # pos = the group's STABLE 1-based position in the run, so each log line
+                # maps to a specific group by order even though sends finish out of order
+                # under concurrency. (The progress BAR is driven by the front-end's own
+                # completion counter, which stays monotonic.)
+                on_progress(pos, total, name, status, secs)
 
-            # Blocked (admin-only) groups: counted done up front — no send, no pacing.
-            for gid, name in groups:
-                if gid in blocked:
-                    results.append(GroupSendResult(gid, name, ok=False, skipped=True,
-                                                   reason="admin-only"))
-                    advance(name, "skipped", 0.0)
+            # Every group — sendable AND blocked — goes on the queue in list order,
+            # tagged with its stable position, so admin-only groups surface at their
+            # natural place in the timeline instead of all bunched at the start.
+            work: queue.Queue = queue.Queue()
+            for pos, (gid, name) in enumerate(groups, start=1):
+                work.put((pos, gid, name))
 
             def worker() -> None:
                 while not should_stop():
                     try:
-                        gid, name = work.get_nowait()
+                        pos, gid, name = work.get_nowait()
                     except queue.Empty:
                         return
+                    if gid in blocked:
+                        # Admin-only: no send, no pacing — record in place and move on.
+                        with prog_lock:
+                            results.append(GroupSendResult(gid, name, ok=False,
+                                                           skipped=True, reason="admin-only"))
+                        advance(pos, name, "skipped", 0.0)
+                        continue
                     # Reserve a paced launch slot, then release the lock BEFORE sleeping
                     # so other workers aren't blocked while this one waits out its gap.
                     with launch_lock:
@@ -1356,7 +1360,7 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
                     with prog_lock:
                         record(gid, name, status, reason)
                         record_group_progress(gid, status)  # persisted now — crash-recoverable
-                    advance(name, status, secs)
+                    advance(pos, name, status, secs)
 
             workers = [threading.Thread(target=worker, daemon=True) for _ in range(K)]
             for w in workers:
@@ -1471,9 +1475,14 @@ def message_fingerprint(message: str, attachments: list[str]) -> str:
 
 
 def begin_run_progress(groups: list[tuple[str, str]], fingerprint: str) -> None:
+    # PII-safe on disk: store opaque group ids only — NO group names and NO message
+    # text (just the fingerprint hash). The ids are unavoidable: after a crash + app
+    # restart they're the only record of which groups the run covered, so resume needs
+    # them to finish the exact same groups (guessing by position could resend to the
+    # wrong one). Cleared on a normal finish, so a surviving file means the run died.
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     data = {"at": datetime.now().isoformat(timespec="seconds"), "fp": fingerprint,
-            "groups": [[g, n] for g, n in groups], "done": {}}
+            "groups": [g for g, _ in groups], "done": {}}
     RUN_PROGRESS_FILE.write_text(json.dumps(data), encoding="utf-8")
 
 
@@ -1523,15 +1532,17 @@ def read_interrupted_run() -> InterruptedRun | None:
         data = json.loads(RUN_PROGRESS_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    groups = [(str(g), str(n)) for g, n in data.get("groups", [])]
+    # "groups" is a flat list of opaque ids (no names on disk); names aren't needed to
+    # resume — the resend is keyed by id, and the UI shows counts, not names.
+    gids = [str(g) for g in data.get("groups", [])]
     done = data.get("done", {})
-    remaining = [(g, n) for g, n in groups if done.get(g) in (None, "failed")]
+    remaining = [(g, "") for g in gids if done.get(g) in (None, "failed")]
     # "attempting" = killed mid-send; "uncertain" = timed out. Both may have delivered.
-    uncertain = [(g, n) for g, n in groups if done.get(g) in ("attempting", "uncertain")]
-    if not groups or (not remaining and not uncertain):
+    uncertain = [(g, "") for g in gids if done.get(g) in ("attempting", "uncertain")]
+    if not gids or (not remaining and not uncertain):
         return None
-    return InterruptedRun(fingerprint=str(data.get("fp", "")), total=len(groups),
-                          done=len(groups) - len(remaining), remaining=remaining,
+    return InterruptedRun(fingerprint=str(data.get("fp", "")), total=len(gids),
+                          done=len(gids) - len(remaining), remaining=remaining,
                           uncertain=uncertain)
 
 
