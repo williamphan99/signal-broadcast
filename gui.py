@@ -89,6 +89,7 @@ class App(tk.Tk):
         self._qr_img: tk.PhotoImage | None = None
         self._screen = ""
         self._awaiting_power = False  # True only while showing the "Plug in" prompt
+        self._refreshing = False      # guard: one "Update list from phone" at a time
 
         self.container = ttk.Frame(self, padding=16)
         self.container.pack(fill="both", expand=True)
@@ -466,7 +467,12 @@ class App(tk.Tk):
         bottom = ttk.Frame(tab)
         bottom.pack(fill="x")
         ttk.Button(bottom, text="Save selection", command=self._save_groups).pack(side="left")
-        ttk.Button(bottom, text="Update list from phone", command=self._refresh_groups).pack(side="right")
+        self.refresh_btn = ttk.Button(bottom, text="Update list from phone", command=self._refresh_groups)
+        self.refresh_btn.pack(side="right")
+        self.groups_sync_label = ttk.Label(tab, text="", foreground=PALETTE["muted"])
+        self.groups_sync_label.pack(anchor="w", pady=(6, 0))
+        # Animated only while a refresh runs (see _refresh_groups / _finish_refresh).
+        self.groups_progress = ttk.Progressbar(tab, mode="indeterminate", length=280)
         self._populate_groups()
 
     def _populate_groups(self) -> None:
@@ -713,15 +719,35 @@ class App(tk.Tk):
 
     # ----------------------------------------------------------- misc actions
     def _refresh_groups(self) -> None:
+        if self._refreshing:                 # one sync at a time — re-clicks are ignored
+            return
+        self._refreshing = True
+        self.refresh_btn.configure(state="disabled")
+        self.groups_progress.pack(anchor="w", pady=(4, 0))
+        self.groups_progress.start()
+        self.groups_sync_label.configure(text="Syncing…", foreground=PALETTE["muted"])
+
         def work():
             try:
                 number = engine.detect_account() or engine.load_config().account
-                count = engine.sync_groups(number, on_log=lambda m: self.events.put(("log", m)))
-                self.events.put(("log", f"Refreshed: {count} groups."))
+                count = engine.sync_groups(number, on_log=lambda m: self.events.put(("refresh_status", m)))
+                self.events.put(("refresh_done", count))
             except engine.BroadcastError as exc:
-                self.events.put(("log", f"Error: {exc}"))
-            self.events.put(("status_refresh", None))
+                self.events.put(("refresh_done", f"Error: {exc}"))
         threading.Thread(target=work, daemon=True).start()
+
+    def _finish_refresh(self, result) -> None:
+        self._refreshing = False
+        self.refresh_btn.configure(state="normal")
+        self.groups_progress.stop()
+        self.groups_progress.pack_forget()
+        if isinstance(result, int):
+            self.groups_sync_label.configure(text=f"Updated — {result} groups.",
+                                             foreground=PALETTE["muted"])
+            self._populate_groups()
+            self._refresh_status()
+        else:
+            self.groups_sync_label.configure(text=result, foreground=PALETTE["error"])
 
     def _unlink(self) -> None:
         if not messagebox.askyesno("Unlink and erase the app's data?",
@@ -784,10 +810,11 @@ class App(tk.Tk):
                       "ok" if ok else "error")
         elif kind == "send_done":
             self._finish_send(payload)
-        elif kind == "status_refresh":
-            self._refresh_status()
-            if hasattr(self, "groups_inner"):
-                self._populate_groups()
+        elif kind == "refresh_status":
+            if hasattr(self, "groups_sync_label"):
+                self.groups_sync_label.configure(text=payload)
+        elif kind == "refresh_done":
+            self._finish_refresh(payload)
 
     def _finish_send(self, results: list[engine.GroupSendResult]) -> None:
         self.stop_btn.configure(state="disabled")
