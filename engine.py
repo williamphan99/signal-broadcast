@@ -320,7 +320,7 @@ def detect_account() -> str | None:
     except BroadcastError:
         return None
     proc = subprocess.run([binary, "--config", str(DATA_DIR), "-o", "json", "listAccounts"],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, errors="replace")
     if proc.returncode != 0:
         return None
     try:
@@ -343,7 +343,7 @@ def _request_sync(binary: str, account: str) -> None:
     """Best-effort nudge: ask the phone (primary) to (re)send contacts + groups.
     Ignored on failure — the phone usually pushes a sync on linking anyway."""
     subprocess.run([binary, "--config", str(DATA_DIR), "-a", account, "sendSyncRequest"],
-                   capture_output=True, text=True)
+                   capture_output=True, text=True, errors="replace")
 
 
 def sync_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
@@ -359,7 +359,7 @@ def sync_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
     while time.monotonic() < deadline and stable < SYNC_STABLE_ROUNDS:
         subprocess.run([binary, "--config", str(DATA_DIR), "-a", account,
                         "receive", "--timeout", str(SYNC_BURST_S)],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, errors="replace")
         try:
             count = pull_groups(account)
         except BroadcastError:
@@ -378,7 +378,7 @@ def pull_groups(account: str) -> int:
     binary = signal_cli_bin()
     try:
         proc = subprocess.run([binary, "--config", str(DATA_DIR), "-o", "json", "-a", account, "listGroups"],
-                              capture_output=True, text=True, timeout=LISTGROUPS_TIMEOUT_S)
+                              capture_output=True, text=True, errors="replace", timeout=LISTGROUPS_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         raise BroadcastError("Timed out fetching groups. Check the connection and try again.")
     if proc.returncode != 0:
@@ -408,7 +408,9 @@ def _send_one(binary: str, account: str, group_id: str,
     if attachments:
         cmd += ["-a", *attachments]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=SEND_TIMEOUT_S)
+        # errors="replace": signal-cli can emit non-UTF-8 bytes (names, locale text)
+        proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                              timeout=SEND_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         return False, False, f"timed out after {SEND_TIMEOUT_S}s"
     if proc.returncode == 0:

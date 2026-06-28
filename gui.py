@@ -197,7 +197,7 @@ class App(tk.Tk):
             engine.DATA_DIR.mkdir(parents=True, exist_ok=True)
             proc = subprocess.Popen(
                 [binary, "--config", str(engine.DATA_DIR), "link", "-n", "broadcast-laptop"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
 
             uri = ""
             assert proc.stdout is not None
