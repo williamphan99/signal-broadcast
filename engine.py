@@ -41,7 +41,24 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.4.0"
+
+
+def git_pull() -> tuple[bool, str]:
+    """Update the app in place: a fast-forward-only `git pull` in the project folder.
+    Returns (changed, message) — changed is False when already up to date or on any
+    error, so the caller only restarts when there's actually new code. Never raises."""
+    try:
+        proc = subprocess.run(["git", "-C", str(PROJECT_DIR), "pull", "--ff-only"],
+                              capture_output=True, text=True, errors="replace", timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"Couldn't run git: {exc}"
+    out = (proc.stdout + proc.stderr).strip()
+    if proc.returncode != 0:
+        return False, out or "git pull failed."
+    if "Already up to date" in out:
+        return False, "You're already on the latest version."
+    return True, out or "Updated."
 
 
 def app_version() -> str:

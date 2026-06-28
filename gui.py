@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import queue
 import subprocess
+import sys
 import tempfile
 import threading
 import tkinter as tk
@@ -280,6 +281,8 @@ class App(tk.Tk):
         self.power_label = ttk.Label(header, text="", font=("", 11))
         self.power_label.pack(side="left", padx=(12, 0))
         ttk.Button(header, text="Unlink…", command=self._unlink).pack(side="right")
+        self.update_btn = ttk.Button(header, text="Update", command=self._check_update)
+        self.update_btn.pack(side="right", padx=(0, 8))
         ttk.Label(header, text=f"v{engine.app_version()}", font=("", 10),
                   foreground=PALETTE["muted"]).pack(side="right", padx=(0, 12))
 
@@ -887,6 +890,34 @@ class App(tk.Tk):
                             "Linked Devices and delete it there.")
         self.show_link()
 
+    def _check_update(self) -> None:
+        """Update the app: git pull in the project folder, then relaunch if there was
+        anything new. Runs the pull off the UI thread so the window stays responsive."""
+        self.update_btn.configure(state="disabled", text="Updating…")
+
+        def work():
+            self.events.put(("update_done", engine.git_pull()))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_update(self, result: tuple[bool, str]) -> None:
+        changed, message = result
+        self.update_btn.configure(state="normal", text="Update")
+        if not changed:
+            messagebox.showinfo("Update", message)
+            return
+        if messagebox.askyesno("Update installed",
+                f"{message}\n\nRestart now to use the new version?"):
+            self._restart()
+
+    def _restart(self) -> None:
+        """Relaunch the app on the freshly-pulled code, replacing this process."""
+        gui_path = str(Path(__file__).resolve())
+        try:
+            os.execv(sys.executable, [sys.executable, gui_path])
+        except OSError as exc:
+            messagebox.showerror("Couldn't restart",
+                f"Update downloaded — please close and reopen the app.\n\n{exc}")
+
     def _quit(self) -> None:
         """Close the app. If 'wipe on close' is armed (Security tab), erase all data
         first — with one confirmation, since it's destructive and re-links next time."""
@@ -955,6 +986,8 @@ class App(tk.Tk):
                 self.groups_sync_label.configure(text=payload)
         elif kind == "refresh_done":
             self._finish_refresh(payload)
+        elif kind == "update_done":
+            self._finish_update(payload)
 
     def _finish_send(self, results: list[engine.GroupSendResult]) -> None:
         self.stop_btn.configure(state="disabled", text="Stop")
