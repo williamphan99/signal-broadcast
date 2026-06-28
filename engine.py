@@ -51,7 +51,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.9.10"
+APP_VERSION = "1.9.11"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -108,6 +108,11 @@ SEND_TIMEOUT_S = 300             # per-send ceiling. Big groups legitimately tak
                                  # those off and wrongly marked them "uncertain". 5
                                  # min leaves headroom (incl. signal-cli's own throttle
                                  # retries) while still bounding a genuinely stuck send.
+CONFIRM_GRACE_S = 60             # after a send times out, how long to keep listening
+                                 # for signal-cli's late reply before declaring the
+                                 # daemon stuck. Confirms a slow-but-fine send instead
+                                 # of leaving it "uncertain"; no new send starts during
+                                 # this wait, so only one send is ever in flight.
 # First-sync after linking. A big account's groups don't all arrive in one
 # receive, so we drain in short bursts until the count stops growing (or the cap).
 SYNC_BURST_S = 5                 # one receive burst while draining the phone's sync
@@ -822,12 +827,11 @@ class SignalCliDaemon:
         self._next_id = 0
         self._pending: dict[int, queue.Queue] = {}
         # A send that times out on our side may still complete: signal-cli answers
-        # late. Instead of discarding that answer, we keep listening — _timed_out are
-        # request ids we gave up waiting on, _late captures their eventual response,
-        # and _timeout_groups maps a timed-out group to its request id for reconciling.
+        # late. Instead of discarding that answer we keep listening — _timed_out holds
+        # request ids we gave up waiting on, and _late captures their eventual reply so
+        # send() can confirm the real outcome (see _wait_late).
         self._timed_out: set[int] = set()
         self._late: dict[int, dict] = {}
-        self._timeout_groups: dict[str, int] = {}
         self._stderr: collections.deque[str] = collections.deque(maxlen=50)
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
@@ -870,18 +874,33 @@ class SignalCliDaemon:
                 msg = json.loads(line)
             except ValueError:
                 continue
-            mid = msg.get("id")
-            if mid is None:
-                continue  # notification (incoming message/receipt) — not our response
-            with self._lock:
-                box = self._pending.pop(mid, None)
-            if box is not None:
-                box.put(msg)
+            self._route(msg)
+
+    def _route(self, msg: dict) -> None:
+        """Deliver one parsed JSON-RPC message to its waiter. A reply whose id we'd
+        stopped waiting on (a timed-out send) is kept in _late so send() can still
+        confirm it; ids with no waiter (notifications) are ignored."""
+        mid = msg.get("id")
+        if mid is None:
+            return  # notification (incoming message/receipt) — not our response
+        with self._lock:
+            if mid in self._timed_out:
+                # A send we'd given up waiting on just completed — keep its answer so
+                # send() can turn "uncertain" into a real sent/failed verdict.
+                self._late[mid] = msg
+                self._timed_out.discard(mid)
+                self._pending.pop(mid, None)
+                return
+            box = self._pending.pop(mid, None)
+        if box is not None:
+            box.put(msg)
 
     def is_running(self) -> bool:
         return self._proc.poll() is None
 
-    def _request(self, method: str, params: dict, timeout: float) -> dict:
+    def _dispatch(self, method: str, params: dict) -> tuple[int, queue.Queue]:
+        """Write a request and return (id, response-box) without waiting. Holding the
+        box reference (rather than re-looking it up) avoids a race with _read_loop."""
         with self._lock:
             if self._proc.poll() is not None:
                 raise BroadcastError("signal-cli daemon is not running")
@@ -902,28 +921,74 @@ class SignalCliDaemon:
             # dispatched. Mark it uncertain (don't retry, don't resend), unlike the
             # pre-write "not running" check above which proves nothing left us.
             raise BroadcastError(f"daemon send may have dispatched (write failed): {exc}")
+        return mid, box
+
+    def _await(self, mid: int, box: queue.Queue, timeout: float, keep_listening: bool) -> dict:
+        """Wait for request ``mid``'s response. On timeout, if ``keep_listening`` we
+        leave it registered so _read_loop captures a late reply (for await_late);
+        otherwise we drop it (the startup probe, where a late answer is useless)."""
         try:
             return box.get(timeout=timeout)
         except queue.Empty:
             with self._lock:
-                self._pending.pop(mid, None)
+                if keep_listening:
+                    self._timed_out.add(mid)
+                else:
+                    self._pending.pop(mid, None)
             raise BroadcastError(f"daemon timed out after {timeout:.0f}s")
 
+    def _request(self, method: str, params: dict, timeout: float) -> dict:
+        """Dispatch + wait, giving up cleanly on timeout (no late capture)."""
+        mid, box = self._dispatch(method, params)
+        return self._await(mid, box, timeout, keep_listening=False)
+
     def send(self, group_id: str, message: str, attachments: list[str]) -> tuple[bool, bool, str]:
-        """Send to one group via the running process. Same (ok, throttled, err) shape
-        as the one-shot _send_one, so the retry/throttle logic is unchanged."""
+        """Send to one group. Same (ok, throttled, err) shape as the one-shot _send_one.
+        If the send times out, signal-cli is probably still finishing it — wait a
+        bounded grace (CONFIRM_GRACE_S) for its late reply and return the REAL verdict
+        rather than guessing 'uncertain'. No new request is issued during that wait, so
+        only one send is ever in flight on the account; only a send that never answers
+        at all stays uncertain."""
         params: dict = {"groupId": group_id, "message": message}
         if attachments:
             params["attachment"] = list(attachments)
         try:
-            resp = self._request("send", params, timeout=SEND_TIMEOUT_S)
+            mid, box = self._dispatch("send", params)
         except BroadcastError as exc:
             return False, False, str(exc)
+        try:
+            resp = self._await(mid, box, SEND_TIMEOUT_S, keep_listening=True)
+        except BroadcastError as exc:
+            if not CLIENT_TIMEOUT_PATTERN.search(str(exc)):
+                return False, False, str(exc)  # e.g. a broken write — nothing to confirm
+            late = self._wait_late(mid, CONFIRM_GRACE_S)
+            if late is not None:
+                return self._parse_send_response(late)
+            return False, False, str(exc)      # never confirmed — genuinely uncertain
+        return self._parse_send_response(resp)
+
+    @staticmethod
+    def _parse_send_response(resp: dict) -> tuple[bool, bool, str]:
         err = resp.get("error")
         if err:
             text = str(err.get("message", "")).strip() or "send failed"
             return False, bool(THROTTLE_PATTERN.search(text)), text
         return True, False, ""
+
+    def _wait_late(self, mid: int, grace: float) -> "dict | None":
+        """After request ``mid`` timed out, wait up to ``grace`` seconds for signal-cli's
+        late reply (captured into _late by _route). Returns the reply, or None if it
+        never arrives (the daemon is genuinely stuck)."""
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            with self._lock:
+                resp = self._late.pop(mid, None)
+            if resp is not None:
+                return resp
+            time.sleep(0.2)
+        with self._lock:
+            self._timed_out.discard(mid)   # stop listening; a later reply is ignored
+        return None
 
     def close(self) -> None:
         try:
@@ -1176,11 +1241,11 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
                 return res
             uncertain = _is_uncertain_send(err)
             # Retire the daemon — and switch the rest of the run to one-shot — when:
-            #  * the send is UNCERTAIN (timed out, or the write broke after the request
-            #    line went out). The daemon may STILL be processing the request we gave
-            #    up on, so reusing it for the next group would run two sends at once on
-            #    one account — the contention these fixes exist to prevent. Retire it and
-            #    do NOT re-send this group (the caller marks it "uncertain").
+            #  * the send is UNCERTAIN (timed out even after waiting for a late reply
+            #    inside daemon.send(), or the write broke). The daemon may STILL be
+            #    processing the request we gave up on, so reusing it would run two sends
+            #    at once on one account — the contention these fixes exist to prevent.
+            #    Retire it and do NOT re-send this group (the caller marks it uncertain).
             #  * the daemon has DIED. It can't send anything more; if the request
             #    provably never left us, re-sending this one group one-shot is safe.
             if uncertain or not daemon.is_running():
