@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Station-mode watcher: if the Mac is unplugged while linked, erase everything.
+"""Station-mode watcher: if the Mac is unplugged while linked, erase the app's data.
 
 Runs as a background launchd agent (see engine.enable_watcher). It polls the power
 source; once the Mac has been on battery for DEBOUNCE_POLLS consecutive checks it

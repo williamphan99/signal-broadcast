@@ -43,7 +43,7 @@ LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
 INSTALLED_PLIST = LAUNCH_AGENTS_DIR / f"{SCHEDULE_LABEL}.plist"
 LOCAL_PLIST = PROJECT_DIR / f"{SCHEDULE_LABEL}.plist"
 
-# Station-mode watcher: wipes everything if the Mac is unplugged (see watcher.py).
+# Station-mode watcher: wipes the app's data if the Mac is unplugged (see watcher.py).
 WATCHER_LABEL = "com.user.signal-broadcast.watcher"
 WATCHER_PLIST = LAUNCH_AGENTS_DIR / f"{WATCHER_LABEL}.plist"
 
@@ -57,7 +57,12 @@ THROTTLE_BACKOFF_CAP_S = 300.0   # never wait longer than 5 min between retries
 NON_THROTTLE_RETRIES = 2         # quick retries for transient (non-rate) errors
 NON_THROTTLE_WAIT_S = 5.0
 SEND_TIMEOUT_S = 120             # generous: JVM start + network per send
-RECEIVE_SYNC_S = 12              # one-off sync after linking, to populate groups
+# First-sync after linking. A big account's groups don't all arrive in one
+# receive, so we drain in short bursts until the count stops growing (or the cap).
+SYNC_BURST_S = 5                 # one receive burst while draining the phone's sync
+SYNC_MAX_S = 60                  # overall cap — large accounts (100+ groups) take longer
+SYNC_STABLE_ROUNDS = 2           # stop once the group count holds steady this many rounds
+LISTGROUPS_TIMEOUT_S = 30        # listGroups is mostly local; guard against a network hang
 MIN_DELAY_S = 10.0               # hard floor: never send faster than this, whatever the config
 
 
@@ -334,21 +339,46 @@ def is_linked() -> bool:
     return data.exists() and any(data.iterdir())
 
 
-def sync_receive(account: str, on_log: LogFn = lambda *_: None) -> None:
-    """One bounded receive so a freshly linked device populates its group list."""
-    binary = signal_cli_bin()
-    on_log("Syncing with your phone…")
-    subprocess.run([binary, "--config", str(DATA_DIR), "-a", account,
-                    "receive", "--timeout", str(RECEIVE_SYNC_S)],
+def _request_sync(binary: str, account: str) -> None:
+    """Best-effort nudge: ask the phone (primary) to (re)send contacts + groups.
+    Ignored on failure — the phone usually pushes a sync on linking anyway."""
+    subprocess.run([binary, "--config", str(DATA_DIR), "-a", account, "sendSyncRequest"],
                    capture_output=True, text=True)
+
+
+def sync_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
+    """Drain the phone's contacts/groups sync and (over)write groups.txt. A large
+    account's groups arrive over several seconds, so nudge the phone then receive
+    in short bursts until the count stops growing (or SYNC_MAX_S). Reports a running
+    count so the wait is visibly progressing. Returns the final group count."""
+    binary = signal_cli_bin()
+    _request_sync(binary, account)
+    on_log("Syncing your groups from your phone…")
+    deadline = time.monotonic() + SYNC_MAX_S
+    last, stable = -1, 0
+    while time.monotonic() < deadline and stable < SYNC_STABLE_ROUNDS:
+        subprocess.run([binary, "--config", str(DATA_DIR), "-a", account,
+                        "receive", "--timeout", str(SYNC_BURST_S)],
+                       capture_output=True, text=True)
+        try:
+            count = pull_groups(account)
+        except BroadcastError:
+            continue  # transient fetch error — try another burst
+        on_log(f"Syncing your groups from your phone… ({count} so far)")
+        stable = stable + 1 if count == last else 0
+        last = count
+    return max(last, 0)
 
 
 def pull_groups(account: str) -> int:
     """Fetch the groups this number belongs to and (over)write groups.txt,
     preserving any groups you previously excluded. Returns the count written."""
     binary = signal_cli_bin()
-    proc = subprocess.run([binary, "--config", str(DATA_DIR), "-o", "json", "-a", account, "listGroups"],
-                          capture_output=True, text=True)
+    try:
+        proc = subprocess.run([binary, "--config", str(DATA_DIR), "-o", "json", "-a", account, "listGroups"],
+                              capture_output=True, text=True, timeout=LISTGROUPS_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise BroadcastError("Timed out fetching groups. Check the connection and try again.")
     if proc.returncode != 0:
         raise BroadcastError("Could not fetch groups:\n" + (proc.stderr or proc.stdout))
     groups = json.loads(proc.stdout or "[]")
@@ -584,7 +614,7 @@ def disable_schedule() -> None:
 # --------------------------------------------------------------------------- #
 def build_watcher_plist(python_exe: str) -> dict:
     """launchd job that keeps watcher.py running whenever you're logged in,
-    restarting it if it ever exits. The watcher wipes everything on unplug."""
+    restarting it if it ever exits. The watcher wipes the app's data on unplug."""
     return {
         "Label": WATCHER_LABEL,
         "ProgramArguments": [python_exe, str(PROJECT_DIR / "watcher.py")],

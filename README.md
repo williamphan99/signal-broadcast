@@ -59,13 +59,14 @@ Click **Signal Broadcast** on the Dock. The window opens on the **Send** tab.
 
 That's the whole loop: open, type, **Send**.
 
-### Wiping the Mac clean
+### Erasing the app's data
 
 The **Unlink…** button (top-right) signs this Mac out of Signal and erases
-*everything* stored locally — the link keys, signal-cli's cached groups/contacts,
-the group list, the message, the schedule, and any logs. Nothing personal is left
-behind. Use it before handing back a borrowed or shared Mac. Your phone isn't
-affected; to also drop this device from your account, remove it under
+everything *this app* stored locally — the link keys, signal-cli's cached
+groups/contacts, the group list, the message, the schedule, and any logs. It
+doesn't touch anything else on the Mac, and nothing personal is left behind. Use
+it before handing back a borrowed or shared Mac. Your phone isn't affected; to also
+drop this device from your account, remove it under
 **Signal → Settings → Linked Devices** on the phone.
 
 ### Station mode (wipe if unplugged)

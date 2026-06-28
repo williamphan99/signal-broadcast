@@ -12,8 +12,7 @@ import sys
 import engine
 try:
     account = engine.detect_account() or engine.load_config().account
-    engine.sync_receive(account, on_log=lambda m: print(m, file=sys.stderr))
-    count = engine.pull_groups(account)
+    count = engine.sync_groups(account, on_log=lambda m: print(m, file=sys.stderr))
 except engine.BroadcastError as exc:
     sys.exit(str(exc))
 print(f"Wrote groups.txt with {count} groups.", file=sys.stderr)

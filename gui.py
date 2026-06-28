@@ -157,6 +157,9 @@ class App(tk.Tk):
         self.qr_label.pack(pady=10)
         self.link_status = ttk.Label(self.container, text="", foreground=PALETTE["muted"])
         self.link_status.pack(pady=(4, 12))
+        # Animated only while linking — a moving bar says "working, not frozen"
+        # through the fixed ~12s phone sync. Packed on start (see _start_link).
+        self.link_progress = ttk.Progressbar(self.container, mode="indeterminate", length=280)
 
         btns = ttk.Frame(self.container)
         btns.pack()
@@ -173,7 +176,14 @@ class App(tk.Tk):
     def _start_link(self) -> None:
         self.link_retry.configure(state="disabled")
         self.link_status.configure(text="Starting…", foreground=PALETTE["muted"])
+        self.link_progress.pack(after=self.link_status, pady=(0, 10))
+        self.link_progress.start()
         threading.Thread(target=self._link_worker, daemon=True).start()
+
+    def _stop_link_progress(self) -> None:
+        if self.link_progress.winfo_exists():
+            self.link_progress.stop()
+            self.link_progress.pack_forget()
 
     def _link_worker(self) -> None:
         png = None
@@ -210,8 +220,7 @@ class App(tk.Tk):
             number = engine.detect_account()
             if number:
                 engine.save_account(number)
-                engine.sync_receive(number, on_log=lambda m: self.events.put(("link_status", m)))
-                count = engine.pull_groups(number)
+                count = engine.sync_groups(number, on_log=lambda m: self.events.put(("link_status", m)))
                 self.events.put(("link_status", f"Ready — found {count} groups."))
             self.events.put(("linked_done", None))
         except Exception as exc:
@@ -554,9 +563,10 @@ class App(tk.Tk):
         self.station_status.pack(anchor="w", pady=(4, 10))
         ttk.Label(tab, wraplength=600, justify="left", foreground=PALETTE["muted"], text=(
             "For a Mac that stays plugged in at one spot. When armed, unplugging the "
-            "power automatically ERASES everything on this Mac after a 10-second grace "
-            "— the link, groups, message, schedule, and logs. Plug back in within "
-            "those 10 seconds to cancel. After a wipe you scan the QR to link again.")
+            "power automatically ERASES all of this app's data after a 10-second grace "
+            "— the Signal link, your groups, the message, the schedule, and logs. It "
+            "does not touch anything else on the Mac. Plug back in within those 10 "
+            "seconds to cancel. After a wipe you scan the QR to link again.")
         ).pack(anchor="w", pady=(0, 12))
 
         btns = ttk.Frame(tab)
@@ -578,8 +588,10 @@ class App(tk.Tk):
                                    "Plug into power before arming station mode.")
             return
         if not messagebox.askyesno("Arm station mode?",
-                "From now on, unplugging this Mac will ERASE everything on it after a "
-                "10-second grace, and you'll have to link again.\n\nArm it now?",
+                "From now on, unplugging this Mac will ERASE all of this app's data "
+                "(the Signal link, groups, message, schedule, and logs) after a "
+                "10-second grace, and you'll have to link again. Nothing else on the "
+                "Mac is touched.\n\nArm it now?",
                 icon="warning"):
             return
         try:
@@ -595,7 +607,7 @@ class App(tk.Tk):
 
     def _refresh_station_status(self) -> None:
         if engine.watcher_enabled():
-            self.station_status.configure(text="● Armed — unplugging wipes this Mac",
+            self.station_status.configure(text="● Armed — unplugging erases the app's data",
                                           foreground=PALETTE["error"])
         else:
             self.station_status.configure(text="○ Off", foreground=PALETTE["muted"])
@@ -704,8 +716,7 @@ class App(tk.Tk):
         def work():
             try:
                 number = engine.detect_account() or engine.load_config().account
-                engine.sync_receive(number, on_log=lambda m: self.events.put(("log", m)))
-                count = engine.pull_groups(number)
+                count = engine.sync_groups(number, on_log=lambda m: self.events.put(("log", m)))
                 self.events.put(("log", f"Refreshed: {count} groups."))
             except engine.BroadcastError as exc:
                 self.events.put(("log", f"Error: {exc}"))
@@ -713,11 +724,12 @@ class App(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def _unlink(self) -> None:
-        if not messagebox.askyesno("Unlink and erase everything?",
-                "This signs this Mac out of Signal and deletes everything stored here — "
-                "the group list, the message, the schedule, and the link keys. Nothing "
-                "personal is left behind.\n\nUse this before handing the Mac to someone "
-                "else. Your phone is not affected.\n\nContinue?", icon="warning"):
+        if not messagebox.askyesno("Unlink and erase the app's data?",
+                "This signs this Mac out of Signal and deletes all the data this app "
+                "stored here — the link keys, your groups, the message, the schedule, "
+                "and logs. Nothing else on the Mac is touched, and nothing personal is "
+                "left behind.\n\nUse this before handing the Mac to someone else. Your "
+                "phone is not affected.\n\nContinue?", icon="warning"):
             return
         try:
             engine.unlink()
@@ -747,9 +759,11 @@ class App(tk.Tk):
         elif kind == "link_status":
             self.link_status.configure(text=payload)
         elif kind == "link_error":
+            self._stop_link_progress()
             self.link_status.configure(text=payload, foreground=PALETTE["error"])
             self.link_retry.configure(state="normal", text="Try again")
         elif kind == "linked_done":
+            self._stop_link_progress()
             self.show_main()
         elif kind == "log":
             m = payload
