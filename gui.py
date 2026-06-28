@@ -889,7 +889,7 @@ class App(tk.Tk):
             results = engine.broadcast(
                 config=cfg, groups=groups, message=message, attachments=attachments,
                 on_log=lambda m: self.events.put(("log", m)),
-                on_progress=lambda d, t, n, ok: self.events.put(("progress", (d, t, n, ok))),
+                on_progress=lambda d, t, n, ok, secs: self.events.put(("progress", (d, t, n, ok, secs))),
                 should_stop=self.stop_event.is_set)
             if not self.stop_event.is_set():  # a stopped run is incomplete — don't arm the cooldown
                 engine.stamp_run()
@@ -1034,14 +1034,15 @@ class App(tk.Tk):
                 tag = "muted"
             self._log(m, tag)
         elif kind == "progress":
-            done, total, _name, ok = payload
+            done, total, _name, ok, secs = payload
             self.progress.configure(value=done)
             self.counter.configure(text=f"{done} / {total}")
             if ok is None:
                 self._log(f"[{done}/{total}] skipped — admin-only", "muted")
+            elif ok:
+                self._log(f"[{done}/{total}] sent in {secs:.1f}s", "ok")
             else:
-                self._log(f"[{done}/{total}] sent" if ok else f"[{done}/{total}] failed",
-                          "ok" if ok else "error")
+                self._log(f"[{done}/{total}] failed after {secs:.1f}s", "error")
         elif kind == "send_done":
             self._finish_send(payload)
         elif kind == "refresh_status":

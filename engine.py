@@ -41,7 +41,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.7.0"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -109,7 +109,7 @@ class BroadcastError(Exception):
 
 # Callback aliases. Defaults are no-ops so callers can pass only what they need.
 LogFn = Callable[[str], None]
-ProgressFn = Callable[[int, int, str, "bool | None"], None]  # done, total, name, ok
+ProgressFn = Callable[[int, int, str, "bool | None", float], None]  # done, total, name, ok, seconds
 StopFn = Callable[[], bool]
 
 
@@ -728,13 +728,15 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
             break
         if gid in blocked:
             results.append(GroupSendResult(gid, name, ok=False, skipped=True, reason="admin-only"))
-            on_progress(i, total, name, None)  # None = skipped, not a failure
+            on_progress(i, total, name, None, 0.0)  # None = skipped, not a failure
             continue  # no send, no pacing delay — nothing left the machine
+        t0 = time.monotonic()
         ok = _deliver_to_group(binary, config.account, gid, message,
                                attachments, config.max_retries, on_log, should_stop,
                                config.debug)
+        secs = time.monotonic() - t0  # wall time for this group (includes any retries)
         results.append(GroupSendResult(gid, name, ok))
-        on_progress(i, total, name, ok)
+        on_progress(i, total, name, ok, secs)
         if i < total and not should_stop():
             _interruptible_sleep(_pace_delay(delay, config.jitter_seconds), should_stop)
     return results
