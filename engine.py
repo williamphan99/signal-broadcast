@@ -37,6 +37,26 @@ GROUPS_FILE = PROJECT_DIR / "groups.txt"
 MESSAGE_FILE = PROJECT_DIR / "message.txt"
 ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 
+# Bumped by hand on a meaningful change, so the UI can show which build is running
+# (e.g. to confirm a machine actually pulled the latest code). app_version() appends
+# the short git commit when available, so every push is distinguishable even if this
+# number isn't bumped.
+APP_VERSION = "1.1.0"
+
+
+def app_version() -> str:
+    """Human-readable build tag: the version plus the short git commit if we can
+    read one. Falls back to just the version (e.g. on a copy with no .git)."""
+    try:
+        proc = subprocess.run(["git", "-C", str(PROJECT_DIR), "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, timeout=3)
+        commit = proc.stdout.strip()
+        if proc.returncode == 0 and commit:
+            return f"{APP_VERSION} ({commit})"
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return APP_VERSION
+
 # launchd schedule (the daily auto-send job)
 SCHEDULE_LABEL = "com.user.signal-broadcast"
 LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"

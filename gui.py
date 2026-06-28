@@ -78,7 +78,7 @@ class AccentButton(tk.Label):
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Signal Broadcast")
+        self.title(f"Signal Broadcast — v{engine.app_version()}")
         self.geometry("700x780")
         self.minsize(600, 660)
 
@@ -277,6 +277,8 @@ class App(tk.Tk):
         self.power_label = ttk.Label(header, text="", font=("", 11))
         self.power_label.pack(side="left", padx=(12, 0))
         ttk.Button(header, text="Unlink…", command=self._unlink).pack(side="right")
+        ttk.Label(header, text=f"v{engine.app_version()}", font=("", 10),
+                  foreground=PALETTE["muted"]).pack(side="right", padx=(0, 12))
 
         nb = ttk.Notebook(self.container)
         nb.pack(fill="both", expand=True, pady=(12, 0))
