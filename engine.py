@@ -429,13 +429,35 @@ def _interruptible_sleep(seconds: float, should_stop: StopFn) -> None:
         time.sleep(min(0.25, deadline - time.monotonic()))
 
 
+# Map signal-cli's error text to a short, PII-safe reason. We never log the raw
+# text (it can contain a group id or recipient number) — only the category here.
+_ERROR_CATEGORIES = [
+    (re.compile(r"timed?\s*out|timeout|connection|unreachable|unknownhost|refused|"
+                r"ssl|certificate|\bcdn\b|\bdns\b", re.I), "network or connection problem"),
+    (re.compile(r"attachment|upload|file too large|too large", re.I), "attachment or upload problem"),
+    (re.compile(r"untrusted identity|unregistered|not registered|invalid number", re.I),
+     "recipient or identity problem"),
+    (re.compile(r"\b401\b|\b403\b|unauthor|forbidden", re.I), "authorisation problem"),
+]
+
+
+def classify_error(stderr: str) -> str:
+    """A short, PII-safe reason for a send failure — never the raw text."""
+    if THROTTLE_PATTERN.search(stderr):
+        return "rate limited"
+    for pattern, label in _ERROR_CATEGORIES:
+        if pattern.search(stderr):
+            return label
+    return "unknown error"
+
+
 def _deliver_to_group(binary: str, account: str, group_id: str,
                       message: str, attachments: list[str], max_retries: int,
                       on_log: LogFn, should_stop: StopFn) -> bool:
     """Try one group with retries. Throttled sends back off exponentially; other
     failures get a couple of quick retries. Returns True on success. Log lines carry
-    no group name, id, or raw signal-cli output — only counts and retry timing, since
-    signal-cli error text can contain the group id or a recipient number."""
+    no group name, id, or raw signal-cli output — only counts, retry timing, and a
+    sanitised error category, since the raw text can contain a group id or number."""
     throttle_attempt = 0
     quick_attempt = 0
     while not should_stop():
@@ -452,10 +474,11 @@ def _deliver_to_group(binary: str, account: str, group_id: str,
             _interruptible_sleep(wait, should_stop)
         else:
             quick_attempt += 1
+            reason = classify_error(err)
             if quick_attempt > NON_THROTTLE_RETRIES:
-                on_log("Send failed after retries.")
+                on_log(f"Send failed — {reason}.")
                 return False
-            on_log(f"Send error — retrying in {NON_THROTTLE_WAIT_S:.0f}s")
+            on_log(f"Send error ({reason}) — retrying in {NON_THROTTLE_WAIT_S:.0f}s")
             _interruptible_sleep(NON_THROTTLE_WAIT_S, should_stop)
     return False
 
@@ -525,6 +548,17 @@ def read_run_summary() -> RunSummary | None:
                           sent=int(d["sent"]), failed=int(d["failed"]))
     except (ValueError, KeyError):
         return None
+
+
+def append_activity(line: str) -> None:
+    """Append a PII-safe activity line to today's plain-text log so a send can be
+    reviewed after the window is closed. Lives in logs/, so it's erased on unlink —
+    including a station-mode unplug. Callers pass only safe text (counts, error
+    categories), never group names/ids, numbers, message text, or raw output."""
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    out = LOGS_DIR / f"activity-{datetime.now():%Y-%m-%d}.txt"
+    with out.open("a", encoding="utf-8") as fh:
+        fh.write(f"{datetime.now():%H:%M:%S}  {line}\n")
 
 
 # --------------------------------------------------------------------------- #

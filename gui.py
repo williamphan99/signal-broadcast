@@ -117,6 +117,7 @@ class App(tk.Tk):
         self.log_box.insert("end", msg + "\n", tag)
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
+        engine.append_activity(msg)  # PII-safe; also persisted to logs/activity-*.txt
 
     def _scrollable(self, parent) -> ttk.Frame:
         """A vertically scrollable frame (Canvas + inner ttk.Frame). Returns the
@@ -320,7 +321,7 @@ class App(tk.Tk):
         send_row.pack(fill="x", pady=(14, 2))
         self.send_btn = AccentButton(send_row, text="Send", command=self._on_send)
         self.send_btn.pack(side="left")
-        self.stop_btn = ttk.Button(send_row, text="Stop", command=self.stop_event.set, state="disabled")
+        self.stop_btn = ttk.Button(send_row, text="Stop", command=self._on_stop, state="disabled")
         self.stop_btn.pack(side="left", padx=(10, 6))
         self.resend_btn = ttk.Button(send_row, text="Resend failed", command=self._on_resend, state="disabled")
         self.resend_btn.pack(side="left", padx=6)
@@ -690,13 +691,21 @@ class App(tk.Tk):
         groups = [(r.group_id, r.name) for r in self.failed_results]
         self._begin_send(cfg, groups, message, attachments)
 
+    def _on_stop(self) -> None:
+        """A stop can only take effect between groups (after the in-flight send
+        returns), so acknowledge the click immediately: disable the button and say
+        we're stopping. Prevents confused re-clicks during the brief wait."""
+        self.stop_event.set()
+        self.stop_btn.configure(state="disabled", text="Stopping…")
+        self._log("Stopping — finishing the current group first…", "muted")
+
     def _begin_send(self, cfg, groups, message, attachments) -> None:
         self.stop_event.clear()
         self.failed_results = []
         self._sending_groups = list(groups)  # so a stop can resume the un-sent tail
         self.send_btn.set_enabled(False)
         self.resend_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
+        self.stop_btn.configure(state="normal", text="Stop")
         self.progress.configure(maximum=max(1, len(groups)), value=0)
         self.counter.configure(text=f"0 / {len(groups)}")
         threading.Thread(target=self._send_worker,
@@ -817,7 +826,7 @@ class App(tk.Tk):
             self._finish_refresh(payload)
 
     def _finish_send(self, results: list[engine.GroupSendResult]) -> None:
-        self.stop_btn.configure(state="disabled")
+        self.stop_btn.configure(state="disabled", text="Stop")
         self.send_btn.set_enabled(True)
         stopped = self.stop_event.is_set()
         failed = [r for r in results if not r.ok]
