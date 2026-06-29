@@ -51,7 +51,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.13.0"
+APP_VERSION = "1.14.0"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -121,8 +121,8 @@ SYNC_MAX_S = 60                  # overall cap — large accounts (100+ groups) 
 SYNC_STABLE_ROUNDS = 2           # stop once the group count holds steady this many rounds
 LISTGROUPS_TIMEOUT_S = 30        # listGroups is mostly local; guard against a network hang
 MIN_DELAY_S = 10.0               # hard floor: never send faster than this, whatever the config
-# Experimental parallel sending: how many whole-group sends may be in flight at once
-# on the single account. 1 = the safe, shipped behaviour (strictly one at a time).
+# Parallel sending: how many whole-group sends may be in flight at once on the single
+# account. 1 = the safe default (strictly one at a time).
 # >1 launches new sends every base_delay but lets their fan-out overlap — it can
 # finish a run sooner ONLY if signal-cli actually overlaps sends (its account lock may
 # serialise them anyway), and it raises the rate of NEW sends, so ban risk is higher.
@@ -151,7 +151,7 @@ class Config:
     send_times: list[str]
     debug: bool = False  # write raw signal-cli errors to logs/debug-*.txt
     wipe_on_close: bool = False  # erase all data when the app is quit (armed in Security)
-    concurrent_sends: int = 1  # sends in flight at once (1 = safe default; >1 experimental)
+    concurrent_sends: int = 1  # whole-group sends in flight at once (1 = safe default; up to 5)
 
 
 @dataclass
@@ -1384,7 +1384,7 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
         try:
             on_log(f"Broadcasting to {total} groups | {len(attachments)} attachment(s) | "
                    f"~{delay:.0f}s minimum between sends"
-                   + (f" | up to {K} at once (experimental)" if K >= 2 else ""))
+                   + (f" | up to {K} at once" if K >= 2 else ""))
             if K >= 2:
                 run_parallel()
             else:

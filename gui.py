@@ -124,13 +124,13 @@ class App(tk.Tk):
                        highlightbackground="#888", padx=8, pady=6, **kw)
 
     def _log(self, msg: str, tag: str = "", disk_msg: str | None = None) -> None:
-        # Prefix the live line with a clock time so the gaps between sends are
-        # visible at a glance. The on-disk log adds its own timestamp, so we pass
-        # the bare message to append_activity (no double stamp there).
-        # No group names or message text are ever passed here — not to the live view
-        # and not to disk (only counts, positions, and error categories). disk_msg
-        # stays as a safety valve: if a line ever must name a group on screen, pass a
-        # counts-only rephrase so the on-disk activity log still leaks nothing.
+        # Prefix the live line with a clock time so the gaps between sends are visible
+        # at a glance. The on-disk log adds its own timestamp, so we pass the bare
+        # message to append_activity (no double stamp). Group NAMES do appear here (so
+        # each line says which group) — they already live on disk in groups.txt, and
+        # arming wipe-on-close or station mode erases everything, logs included, on
+        # close/unplug. Message TEXT is still never logged. disk_msg stays as a safety
+        # valve to write a different (e.g. counts-only) version to disk if ever needed.
         stamp = datetime.now().strftime("%H:%M:%S")
         self.log_box.configure(state="normal")
         self.log_box.insert("end", f"{stamp}  ", "muted")
@@ -727,9 +727,8 @@ class App(tk.Tk):
         # big group's own send time already exceeds the gap, so the pace only affects
         # small groups and isn't worth a control. The engine's 10s hard floor still
         # applies, so a run can never burst fast enough to risk a ban.
-        # ---- Parallel sending (experimental) --------------------------------
-        ttk.Label(tab, text="Parallel sending (experimental)",
-                  font=("", 12, "bold")).pack(anchor="w")
+        # ---- Parallel sending ----------------------------------------------
+        ttk.Label(tab, text="Parallel sending", font=("", 12, "bold")).pack(anchor="w")
         try:
             conc_now = engine.load_config().concurrent_sends
         except engine.BroadcastError:
@@ -743,12 +742,11 @@ class App(tk.Tk):
         self.conc_note = ttk.Label(tab, text="", foreground=PALETTE["muted"])
         self.conc_note.pack(anchor="w", pady=(2, 0))
         ttk.Label(tab, wraplength=600, justify="left", foreground=PALETTE["muted"], text=(
-            "Lets more than one group send at the same time. It can only finish a run "
-            "sooner if Signal actually overlaps the sends — it often won't, and then you "
-            "get no speed-up at all. It also starts new sends more often, which RAISES the "
-            "risk of hitting Signal's rate limit (a temporary block on your number). Each "
-            "group is still sent exactly once. Leave this Off unless you're deliberately "
-            "testing it on throwaway groups.")
+            "Lets more than one group send at the same time. It finishes a run sooner only "
+            "if Signal actually overlaps the sends, and it starts new sends more often, "
+            "which raises the risk of hitting Signal's rate limit (a temporary block on "
+            "your number). Each group is still sent exactly once. Raise it gradually and "
+            "watch the activity log for “Throttled” — back off if you see it.")
         ).pack(anchor="w", pady=(2, 0))
 
         ttk.Separator(tab).pack(fill="x", pady=12)
@@ -824,7 +822,7 @@ class App(tk.Tk):
             self.conc_note.configure(text="Saved: off — one group at a time (safest).")
         else:
             self.conc_note.configure(
-                text=f"Saved: up to {n} at once (experimental — test on throwaway groups first).")
+                text=f"Saved: up to {n} groups at once (more at once = higher rate-limit risk).")
 
     def _toggle_debug(self) -> None:
         engine.set_config_value("debug", self.debug_var.get())
@@ -1173,22 +1171,23 @@ class App(tk.Tk):
                 tag = "muted"
             self._log(m, tag)
         elif kind == "progress":
-            pos, total, _name, status, secs = payload  # pos = group's stable position in the run
+            pos, total, name, status, secs = payload  # pos = group's stable position in the run
             # The bar tracks COMPLETIONS (monotonic); the log label uses the stable
             # position so each line maps to a specific group even when sends finish
-            # out of order under parallel sending.
+            # out of order under parallel sending. The group NAME is shown too (see
+            # _log): the names already live in groups.txt, and a wipe erases logs too.
             self._done_count = getattr(self, "_done_count", 0) + 1
             self._last_progress_at = time.monotonic()  # reset the heartbeat: a group just finished
             self.progress.configure(value=self._done_count)
             self.counter.configure(text=f"{self._done_count} / {total}")
             if status == "skipped":
-                self._log(f"[{pos}/{total}] skipped — admin-only", "muted")
+                self._log(f"[{pos}/{total}] {name} — skipped (admin-only)", "muted")
             elif status == "sent":
-                self._log(f"[{pos}/{total}] sent in {secs:.1f}s", "ok")
+                self._log(f"[{pos}/{total}] {name} — sent in {secs:.1f}s", "ok")
             elif status == "uncertain":
-                self._log(f"[{pos}/{total}] unconfirmed after {secs:.0f}s — MAY have sent", "error")
+                self._log(f"[{pos}/{total}] {name} — unconfirmed after {secs:.0f}s, MAY have sent", "error")
             else:
-                self._log(f"[{pos}/{total}] failed after {secs:.1f}s", "error")
+                self._log(f"[{pos}/{total}] {name} — failed after {secs:.1f}s", "error")
         elif kind == "send_done":
             self._finish_send(payload)
         elif kind == "refresh_status":
