@@ -108,6 +108,20 @@ class SendPathTests(unittest.TestCase):
                     "connection reset by peer"):
             self.assertEqual(engine.classify_error(err), "network or connection problem", err)
 
+    def test_on_group_start_fires_once_per_sent_group_not_for_skips(self):
+        # The live in-flight view is driven by on_group_start. It must fire exactly once
+        # per group that actually sends, with the right position+name, and NOT for an
+        # admin-only group (which never leaves the machine).
+        engine.unsendable_groups = lambda account: {"g2"}
+        started = []
+        engine.broadcast(
+            config=engine.Config(account="+t", base_delay_seconds=0.0, jitter_seconds=0.0,
+                                 cooldown_hours=0, max_retries=4, send_times=[]),
+            groups=[("g1", "Alpha"), ("g2", "Beta"), ("g3", "Gamma")], message="m",
+            attachments=[], on_group_start=lambda pos, name: started.append((pos, name)))
+        self.assertEqual(started, [(1, "Alpha"), (3, "Gamma")],
+                         "start fires once per sent group, with position, never for a skip")
+
     def test_uncertain_excluded_from_failures(self):
         FakeDaemon.plan = {"g1": [(False, False, "daemon timed out after 120s")]}
         res = self._run([("g1", "G1")])
@@ -506,6 +520,16 @@ class ConcurrentSendTests(unittest.TestCase):
         self.assertEqual(seen["n3"][0], 3)
         self.assertEqual(seen["n4"], (4, "skipped"))
         self.assertEqual(seen["n5"][0], 5)
+
+    def test_on_group_start_fires_for_every_sent_group_in_parallel(self):
+        # The live in-flight view needs a start event for each group that sends, exactly
+        # once, even under concurrency (completion order is nondeterministic).
+        engine.unsendable_groups = lambda account: {"g3"}  # admin-only — should not start
+        groups = [(f"g{i}", f"n{i}") for i in range(1, 7)]
+        started = []  # list.append is atomic under the GIL — safe from K worker threads
+        self._run(groups, K=3, on_group_start=lambda pos, name: started.append(name))
+        self.assertEqual(sorted(started), ["n1", "n2", "n4", "n5", "n6"],
+                         "every sent group starts once; the admin-only one never does")
 
     def test_falls_back_to_sequential_without_a_daemon(self):
         # No daemon (start returns None) must NOT run parallel one-shots — they would

@@ -51,7 +51,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.14.2"
+APP_VERSION = "1.15.0"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -141,6 +141,10 @@ LogFn = Callable[[str], None]
 # status is one of: "sent" | "failed" | "skipped" | "uncertain" (timed out — may have sent)
 ProgressFn = Callable[[int, int, str, str, float], None]  # done, total, name, status, seconds
 StopFn = Callable[[], bool]
+# Fired when a group's send is dispatched (after pacing, before it completes), so a
+# front-end can show what's in flight right now — essential with concurrent_sends > 1,
+# where several groups send at once. Args: (position, group name).
+StartFn = Callable[[int, str], None]
 
 
 @dataclass
@@ -1213,6 +1217,7 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
               attachments: list[str], base_delay: float | None = None,
               on_log: LogFn = lambda *_: None,
               on_progress: ProgressFn = lambda *_: None,
+              on_group_start: StartFn = lambda *_: None,
               should_stop: StopFn = lambda: False) -> list[GroupSendResult]:
     """Send ``message`` (+ attachments) to every group, slowly. Returns a result
     per attempted group. Honours ``should_stop`` between and during sends."""
@@ -1367,6 +1372,7 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
                         return
                     with prog_lock:
                         record_group_progress(gid, "attempting")
+                    on_group_start(pos, name)  # now in flight — show it in the live view
                     t0 = time.monotonic()
                     status, reason = _deliver_to_group(send_fn, gid, message, attachments,
                                                        config.max_retries, on_log, should_stop,
@@ -1404,6 +1410,7 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
                     # resume treats it as uncertain — never auto-resending a message that may
                     # already have gone out. Overwritten with the real status below.
                     record_group_progress(gid, "attempting")
+                    on_group_start(i, name)  # now in flight — show it in the live view
                     t0 = time.monotonic()
                     status, reason = _deliver_to_group(send_one, gid, message, attachments,
                                                        config.max_retries, on_log, should_stop, config.debug)

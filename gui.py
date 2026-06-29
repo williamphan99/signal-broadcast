@@ -379,11 +379,14 @@ class App(tk.Tk):
         self.progress.pack(fill="x", pady=(6, 2))
         self.counter = ttk.Label(tab, text="", foreground=PALETTE["muted"])
         self.counter.pack(anchor="w")
-        # Live "still working" line: the bar only moves when a group finishes, and a big
-        # group can take minutes, so without this a slow send looks frozen. Ticks every
-        # second while sending (see _tick_heartbeat) and clears when the run ends.
-        self.heartbeat = ttk.Label(tab, text="", foreground=PALETTE["muted"])
-        self.heartbeat.pack(anchor="w")
+        # Live in-flight line: which group(s) are sending right now, each with its own
+        # elapsed time. Vital with parallel sending (several at once) and it doubles as a
+        # heartbeat — a big group can take minutes, so a ticking timer here (plus the
+        # bouncing loader) is how a slow-but-healthy send reads as alive, not frozen.
+        # Wraps instead of widening the window when 2-3 groups are listed.
+        self.heartbeat = ttk.Label(tab, text="", foreground=PALETTE["muted"],
+                                   wraplength=600, justify="left")
+        self.heartbeat.pack(anchor="w", fill="x")
 
         activity_row = ttk.Frame(tab)
         activity_row.pack(fill="x", pady=(12, 2))
@@ -998,7 +1001,7 @@ class App(tk.Tk):
         self.progress.start(15)  # animate the back-and-forth loader for the whole run
         self.counter.configure(text=f"0 / {len(groups)}")
         self._done_count = 0  # completions so far; shown in the "X / N" counter
-        self._last_progress_at = time.monotonic()  # for the "still working" heartbeat
+        self._inflight = {}   # pos -> (name, start_monotonic): groups sending right now
         self._tick_heartbeat()
         threading.Thread(target=self._send_worker,
                          args=(cfg, groups, message, attachments), daemon=True).start()
@@ -1009,6 +1012,7 @@ class App(tk.Tk):
                 config=cfg, groups=groups, message=message, attachments=attachments,
                 on_log=lambda m: self.events.put(("log", m)),
                 on_progress=lambda d, t, n, status, secs: self.events.put(("progress", (d, t, n, status, secs))),
+                on_group_start=lambda pos, name: self.events.put(("group_start", (pos, name))),
                 should_stop=self.stop_event.is_set)
             if not self.stop_event.is_set():  # a stopped run is incomplete — don't arm the cooldown
                 engine.stamp_run()
@@ -1173,6 +1177,9 @@ class App(tk.Tk):
             else:
                 tag = "muted"
             self._log(m, tag)
+        elif kind == "group_start":
+            pos, name = payload  # a group's send just went in flight
+            self._inflight[pos] = (name, time.monotonic())
         elif kind == "progress":
             pos, total, name, status, secs = payload  # pos = group's stable position in the run
             # The loader just bounces (it's a liveness cue, not completion); the "X / N"
@@ -1181,7 +1188,7 @@ class App(tk.Tk):
             # under parallel sending. The group NAME is shown too (see _log): the names
             # already live in groups.txt, and a wipe erases logs too.
             self._done_count = getattr(self, "_done_count", 0) + 1
-            self._last_progress_at = time.monotonic()  # reset the heartbeat: a group just finished
+            self._inflight.pop(pos, None)  # this one finished — drop it from the live view
             self.counter.configure(text=f"{self._done_count} / {total}")
             if status == "skipped":
                 self._log(f"[{pos}/{total}] {name} — skipped (admin-only)", "muted")
@@ -1206,17 +1213,27 @@ class App(tk.Tk):
                 self._render_groups()
 
     def _tick_heartbeat(self) -> None:
-        """Refresh the seconds shown next to the bouncing loader every second. The
-        loader's motion says 'alive'; this number says how long the current group has
-        been going (resets when a group finishes) — together they tell a slow-but-
-        healthy big-group send from a frozen app."""
+        """Refresh the in-flight view every second: every group sending right now, each
+        with its own elapsed time. With parallel sending this shows all of them at once,
+        so K>1 reads clearly; with one at a time it's just the current group. The ticking
+        time + the bouncing loader together tell a slow-but-healthy send from a frozen
+        app. self._inflight is keyed by position and maintained from group_start/progress
+        events on the main thread, so no locking is needed here."""
         if not getattr(self, "_sending", False):
             self.heartbeat.configure(text="")
             return
-        waiting = time.monotonic() - getattr(self, "_last_progress_at", time.monotonic())
-        text = f"Working — {self._fmt_secs(waiting)} on the current group"
-        if waiting > 90:  # reassure that a long single send is expected, not a hang
-            text += "  ·  a large group can take several minutes (it reports by 15 min)"
+        now = time.monotonic()
+        inflight = sorted(getattr(self, "_inflight", {}).values(), key=lambda v: v[1])  # oldest first
+        if not inflight:
+            text = "Working…"  # a brief pacing gap between launches, or wrapping up
+        elif len(inflight) == 1:
+            name, start = inflight[0]
+            text = f"Sending {name} — {self._fmt_secs(now - start)}"
+        else:
+            listed = ", ".join(f"{name} {self._fmt_secs(now - start)}" for name, start in inflight)
+            text = f"Sending {len(inflight)} at once — {listed}"
+        if inflight and (now - inflight[0][1]) > 90:  # the oldest has been going a while
+            text += "  ·  a large group can take several minutes (reports by 15 min)"
         self.heartbeat.configure(text=text)
         self._heartbeat_job = self.after(1000, self._tick_heartbeat)
 
@@ -1227,6 +1244,7 @@ class App(tk.Tk):
 
     def _finish_send(self, results: list[engine.GroupSendResult]) -> None:
         self._sending = False  # release the in-progress guard set in _begin_send
+        self._inflight = {}    # nothing in flight once the run ends
         self.progress.stop()   # halt the back-and-forth loader
         job = getattr(self, "_heartbeat_job", None)
         if job:
