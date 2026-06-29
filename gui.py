@@ -371,7 +371,11 @@ class App(tk.Tk):
         self.resume_btn = ttk.Button(self.resume_bar, text="Resume", command=self._on_resume_interrupted)
         self.resume_btn.pack(side="right", padx=6)
 
-        self.progress = ttk.Progressbar(tab, mode="determinate")
+        # Indeterminate (back-and-forth) loader: it bounces continuously while a send is
+        # running — far more reassuring than a determinate bar that sits still for the
+        # minutes a big group takes. Overall progress is the "X / N" counter below it,
+        # and the heartbeat line gives the elapsed seconds on the current group.
+        self.progress = ttk.Progressbar(tab, mode="indeterminate")
         self.progress.pack(fill="x", pady=(6, 2))
         self.counter = ttk.Label(tab, text="", foreground=PALETTE["muted"])
         self.counter.pack(anchor="w")
@@ -991,10 +995,9 @@ class App(tk.Tk):
         if hasattr(self, "resume_bar"):
             self.resume_bar.pack_forget()  # a new run supersedes any interrupted one
         self.stop_btn.configure(state="normal", text="Stop")
-        self.progress.configure(maximum=max(1, len(groups)), value=0)
+        self.progress.start(15)  # animate the back-and-forth loader for the whole run
         self.counter.configure(text=f"0 / {len(groups)}")
-        self._done_count = 0  # completions so far; drives the bar (progress arrives out
-        #                       of order under parallel sending, so we can't use position)
+        self._done_count = 0  # completions so far; shown in the "X / N" counter
         self._last_progress_at = time.monotonic()  # for the "still working" heartbeat
         self._tick_heartbeat()
         threading.Thread(target=self._send_worker,
@@ -1172,13 +1175,13 @@ class App(tk.Tk):
             self._log(m, tag)
         elif kind == "progress":
             pos, total, name, status, secs = payload  # pos = group's stable position in the run
-            # The bar tracks COMPLETIONS (monotonic); the log label uses the stable
-            # position so each line maps to a specific group even when sends finish
-            # out of order under parallel sending. The group NAME is shown too (see
-            # _log): the names already live in groups.txt, and a wipe erases logs too.
+            # The loader just bounces (it's a liveness cue, not completion); the "X / N"
+            # counter carries the real progress. The log label uses the stable position
+            # so each line maps to a specific group even when sends finish out of order
+            # under parallel sending. The group NAME is shown too (see _log): the names
+            # already live in groups.txt, and a wipe erases logs too.
             self._done_count = getattr(self, "_done_count", 0) + 1
             self._last_progress_at = time.monotonic()  # reset the heartbeat: a group just finished
-            self.progress.configure(value=self._done_count)
             self.counter.configure(text=f"{self._done_count} / {total}")
             if status == "skipped":
                 self._log(f"[{pos}/{total}] {name} — skipped (admin-only)", "muted")
@@ -1203,15 +1206,15 @@ class App(tk.Tk):
                 self._render_groups()
 
     def _tick_heartbeat(self) -> None:
-        """While a send runs, refresh a live 'still working' line every second. The bar
-        only advances when a group finishes and a large group can take minutes, so this
-        is how the user tells a slow-but-healthy send from a frozen one: as long as this
-        keeps ticking, the app is alive. Resets to 0 whenever a group completes."""
+        """Refresh the seconds shown next to the bouncing loader every second. The
+        loader's motion says 'alive'; this number says how long the current group has
+        been going (resets when a group finishes) — together they tell a slow-but-
+        healthy big-group send from a frozen app."""
         if not getattr(self, "_sending", False):
             self.heartbeat.configure(text="")
             return
         waiting = time.monotonic() - getattr(self, "_last_progress_at", time.monotonic())
-        text = f"⏳ Still working — {self._fmt_secs(waiting)} since the last group finished"
+        text = f"Working — {self._fmt_secs(waiting)} on the current group"
         if waiting > 90:  # reassure that a long single send is expected, not a hang
             text += "  ·  a large group can take several minutes (it reports by 10 min)"
         self.heartbeat.configure(text=text)
@@ -1224,6 +1227,7 @@ class App(tk.Tk):
 
     def _finish_send(self, results: list[engine.GroupSendResult]) -> None:
         self._sending = False  # release the in-progress guard set in _begin_send
+        self.progress.stop()   # halt the back-and-forth loader
         job = getattr(self, "_heartbeat_job", None)
         if job:
             self.after_cancel(job)
