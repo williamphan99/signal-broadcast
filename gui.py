@@ -1216,7 +1216,7 @@ class App(tk.Tk):
         waiting = time.monotonic() - getattr(self, "_last_progress_at", time.monotonic())
         text = f"Working — {self._fmt_secs(waiting)} on the current group"
         if waiting > 90:  # reassure that a long single send is expected, not a hang
-            text += "  ·  a large group can take several minutes (it reports by 10 min)"
+            text += "  ·  a large group can take several minutes (it reports by 15 min)"
         self.heartbeat.configure(text=text)
         self._heartbeat_job = self.after(1000, self._tick_heartbeat)
 

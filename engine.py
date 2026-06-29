@@ -51,7 +51,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.14.1"
+APP_VERSION = "1.14.2"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -103,12 +103,14 @@ THROTTLE_BACKOFF_BASE_S = 30.0   # first throttle wait; doubles each retry
 THROTTLE_BACKOFF_CAP_S = 300.0   # never wait longer than 5 min between retries
 NON_THROTTLE_RETRIES = 2         # quick retries for transient (non-rate) errors
 NON_THROTTLE_WAIT_S = 5.0
-SEND_TIMEOUT_S = 600             # per-send ceiling (10 min). Very large groups can take
-                                 # several minutes to fan out to every member, and 300s
-                                 # was still cutting some off and wrongly marking them
-                                 # "uncertain". 10 min leaves ample headroom (incl.
-                                 # signal-cli's own throttle retries) while still bounding
-                                 # a genuinely stuck send so a run can't hang forever.
+SEND_TIMEOUT_S = 900             # per-send ceiling (15 min). Very large groups can take
+                                 # several minutes to fan out to every member; this is a
+                                 # CEILING, not a target — a healthy send returns the
+                                 # instant signal-cli replies, so a generous value never
+                                 # slows a normal run, it only buys buffer against falsely
+                                 # flagging a slow-but-fine giant group "uncertain". Still
+                                 # bounded so a genuinely stuck send can't hang forever
+                                 # (the live loader/heartbeat lets the operator Stop one).
 CONFIRM_GRACE_S = 60             # after a send times out, how long to keep listening
                                  # for signal-cli's late reply before declaring the
                                  # daemon stuck. Confirms a slow-but-fine send instead
