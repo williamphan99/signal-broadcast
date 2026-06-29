@@ -1001,6 +1001,7 @@ class App(tk.Tk):
         self.progress.start(15)  # animate the back-and-forth loader for the whole run
         self.counter.configure(text=f"0 / {len(groups)}")
         self._done_count = 0  # completions so far; shown in the "X / N" counter
+        self._total = len(groups)
         self._inflight = {}   # pos -> (name, start_monotonic): groups sending right now
         self._tick_heartbeat()
         threading.Thread(target=self._send_worker,
@@ -1224,8 +1225,12 @@ class App(tk.Tk):
             return
         now = time.monotonic()
         inflight = sorted(getattr(self, "_inflight", {}).values(), key=lambda v: v[1])  # oldest first
+        done, total = getattr(self, "_done_count", 0), getattr(self, "_total", 0)
         if not inflight:
-            text = "Working…"  # a brief pacing gap between launches, or wrapping up
+            # Nothing sending this instant: either the deliberate pacing gap between
+            # quick sends, or the very start. Say which, and show progress, so it never
+            # looks stuck. (Big groups send back-to-back, so this rarely shows for them.)
+            text = "Starting…" if done == 0 else f"Pausing between groups — {done}/{total} done"
         elif len(inflight) == 1:
             name, start = inflight[0]
             text = f"Sending {name} — {self._fmt_secs(now - start)}"
