@@ -32,6 +32,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterator
 
+# Platform switch. Assigning to a bool (rather than testing sys.platform inline)
+# deliberately defeats type-checker platform-narrowing, so the Linux/Termux branches
+# aren't flagged "unreachable" when the checker runs on macOS. The macOS wrapper
+# (Dock app, launchd schedule, station-mode watcher, pmset) only runs when this is True;
+# elsewhere the portable CLI core (engine send loop + broadcast.py) is what's used.
+IS_DARWIN = sys.platform == "darwin"
+
 # Everything resolves relative to this file, so behaviour is identical whether a
 # human, a launcher, or launchd starts it from an arbitrary working directory.
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -583,31 +590,34 @@ def _jvm_signal_cli() -> Path | None:
     return found[-1] if found else None
 
 
+def _termux_prefix() -> str:
+    """Termux installs everything under $PREFIX (default when unset for a plain probe)."""
+    return os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
+
+
+def _find_bin(name: str) -> str:
+    """Locate a binary: PATH first, then the known per-platform bin dirs (Homebrew, /usr,
+    Termux's $PREFIX). A minimal PATH — macOS launchd/Dock, or a cron job — can exclude the
+    real bin dir, so a bare which() would wrongly report it missing even when installed."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for base in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", f"{_termux_prefix()}/bin"):
+        p = Path(base) / name
+        if p.exists():
+            return str(p)
+    raise BroadcastError(f"{name} is not installed. Run Setup first.")
+
+
 def signal_cli_bin() -> str:
     jvm = _jvm_signal_cli()
     if jvm:
         return str(jvm)
-    found = shutil.which("signal-cli")
-    if found:
-        return found
-    # launchd runs with a minimal PATH that excludes Homebrew; check known spots.
-    for p in ("/opt/homebrew/bin/signal-cli", "/usr/local/bin/signal-cli"):
-        if Path(p).exists():
-            return p
-    raise BroadcastError("signal-cli is not installed. Run Setup first.")
+    return _find_bin("signal-cli")
 
 
 def qrencode_bin() -> str:
-    """Locate qrencode the same way as signal-cli: PATH first, then Homebrew's bin.
-    The Dock app and launchd run with a minimal PATH that excludes Homebrew, so a
-    bare which() would wrongly report it missing even when it's installed."""
-    found = shutil.which("qrencode")
-    if found:
-        return found
-    for p in ("/opt/homebrew/bin/qrencode", "/usr/local/bin/qrencode"):
-        if Path(p).exists():
-            return p
-    raise BroadcastError("qrencode is not installed. Run Setup first.")
+    return _find_bin("qrencode")
 
 
 def _is_jvm_build(binary: str) -> bool:
@@ -616,14 +626,39 @@ def _is_jvm_build(binary: str) -> bool:
 
 
 def _java_home() -> str | None:
-    """A Java 25+ home for the JVM build. signal-cli 0.14.x is compiled for Java 25,
-    so an older JDK would fail to load it — only offer @25 and the unversioned
-    (newer) Homebrew kegs, never @21."""
-    for base in ("/opt/homebrew/opt/openjdk@25", "/usr/local/opt/openjdk@25",
-                 "/opt/homebrew/opt/openjdk", "/usr/local/opt/openjdk"):
-        if (Path(base) / "bin" / "java").exists():
-            return base
-    return os.environ.get("JAVA_HOME")  # last resort: whatever the machine has set
+    """The Java home for the JVM build.
+
+    signal-cli 0.14.x is compiled for Java 25 (older JDKs can't load it), and 0.14.x is
+    also the version Signal's *current* linking protocol requires — 0.13.x on Java 21 hits
+    "Invalid ACI!" when finishing a device link. So both platforms target Java 25.
+
+    macOS: only offer @25 and the unversioned (newer) Homebrew kegs, never @21.
+    Linux/Termux: prefer a JDK we vendored (a portable Temurin 25, since Debian/Termux
+    don't package Java 25), then $JAVA_HOME, then whatever's on PATH / in the system."""
+    if IS_DARWIN:
+        for base in ("/opt/homebrew/opt/openjdk@25", "/usr/local/opt/openjdk@25",
+                     "/opt/homebrew/opt/openjdk", "/usr/local/opt/openjdk"):
+            if (Path(base) / "bin" / "java").exists():
+                return base
+        return os.environ.get("JAVA_HOME")  # last resort: whatever the machine has set
+
+    # Linux / Termux (non-Darwin).
+    for jdk in sorted(VENDOR_DIR.glob("jdk*"), reverse=True):  # vendored Temurin 25
+        if (jdk / "bin" / "java").exists():
+            return str(jdk)
+    env_home = os.environ.get("JAVA_HOME")
+    if env_home and (Path(env_home) / "bin" / "java").exists():
+        return env_home
+    java = shutil.which("java")
+    if java:
+        # <home>/bin/java → <home>, following the alternatives/symlink chain.
+        return str(Path(java).resolve().parent.parent)
+    jvm_dir = Path("/usr/lib/jvm")
+    if jvm_dir.is_dir():
+        for base in sorted((str(p) for p in jvm_dir.glob("*")), reverse=True):
+            if (Path(base) / "bin" / "java").exists():
+                return base
+    return None
 
 
 def _signal_env(binary: str) -> dict | None:
@@ -1602,7 +1637,11 @@ def clear_logs() -> None:
 # --------------------------------------------------------------------------- #
 def on_ac_power() -> bool:
     """True if the Mac is on AC (wall) power. On any read failure, assume AC — a
-    transient glitch must never be the thing that triggers a wipe."""
+    transient glitch must never be the thing that triggers a wipe. Only macOS is
+    queried (via pmset); the station-mode watcher that uses this is macOS-only, so on
+    any other platform we simply assume AC and never shell out."""
+    if not IS_DARWIN:
+        return True
     try:
         r = subprocess.run(["pmset", "-g", "ps"], capture_output=True, text=True, timeout=5)
     except Exception:
@@ -1631,6 +1670,18 @@ def parse_times(times: list[str]) -> list[dict]:
     if not entries:
         raise BroadcastError("Add at least one send time.")
     return entries
+
+
+# Tag on the crontab lines this app owns, so the Linux/Termux schedule scripts replace only
+# their own entries and leave any other cron jobs alone.
+CRON_TAG = "# signal-broadcast"
+
+
+def format_cron_line(hour: int, minute: int, tag: str = CRON_TAG) -> str:
+    """One crontab line that runs broadcast.py at HH:MM. Shared by webui.py and
+    scripts/schedule-termux.sh so the command + log path never diverge between them."""
+    return (f"{minute} {hour} * * * cd {PROJECT_DIR} && "
+            f"/usr/bin/python3 broadcast.py >> logs/cron.log 2>&1  {tag}")
 
 
 def build_plist(times: list[str], python_exe: str) -> dict:
@@ -1667,13 +1718,22 @@ def write_plist(times: list[str], python_exe: str | None = None, dest: Path = LO
     return dest
 
 
+# launchd is macOS-only. These are called by the Tkinter GUI (macOS) and by unlink().
+# On any other platform they must be safe no-ops — scheduling on Linux/Termux is cron,
+# set up via scripts/schedule-termux.sh or the web UI's Schedule tab — because launchctl
+# doesn't exist there and would otherwise crash (e.g. unlink() calls disable_schedule()).
 def schedule_enabled() -> bool:
+    if not IS_DARWIN:
+        return False
     r = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{SCHEDULE_LABEL}"],
                        capture_output=True, text=True)
     return r.returncode == 0
 
 
 def enable_schedule(times: list[str], python_exe: str | None = None) -> None:
+    if not IS_DARWIN:
+        raise BroadcastError("On this platform scheduling uses cron, not launchd — use "
+                             "the Schedule tab or scripts/schedule-termux.sh.")
     parse_times(times)  # validate before touching anything
     write_plist(times, python_exe, dest=INSTALLED_PLIST)
     uid = os.getuid()
@@ -1685,6 +1745,8 @@ def enable_schedule(times: list[str], python_exe: str | None = None) -> None:
 
 
 def disable_schedule() -> None:
+    if not IS_DARWIN:
+        return  # no launchd here; cron is managed separately (web UI / schedule-termux.sh)
     subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{SCHEDULE_LABEL}"], capture_output=True)
     INSTALLED_PLIST.unlink(missing_ok=True)
 
@@ -1709,6 +1771,8 @@ def build_watcher_plist(python_exe: str) -> dict:
 
 
 def enable_watcher(python_exe: str | None = None) -> None:
+    if not IS_DARWIN:
+        raise BroadcastError("Station mode (wipe-on-unplug) is macOS-only.")
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     WATCHER_PLIST.parent.mkdir(parents=True, exist_ok=True)
     with WATCHER_PLIST.open("wb") as fh:
@@ -1722,11 +1786,15 @@ def enable_watcher(python_exe: str | None = None) -> None:
 
 
 def disable_watcher() -> None:
+    if not IS_DARWIN:
+        return
     subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{WATCHER_LABEL}"], capture_output=True)
     WATCHER_PLIST.unlink(missing_ok=True)
 
 
 def watcher_enabled() -> bool:
+    if not IS_DARWIN:
+        return False
     r = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{WATCHER_LABEL}"],
                        capture_output=True, text=True)
     return r.returncode == 0

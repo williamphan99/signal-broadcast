@@ -1,0 +1,14 @@
+# Build context for scripts/sandbox.Dockerfile (the `dev.sh` preview image).
+# Keep secrets and per-user data OUT of the image, and let setup seed fresh copies.
+.git
+signal-cli-data
+config.toml
+groups.txt
+message.txt
+attachments.txt
+logs
+vendor
+.sandbox-data
+webui-uploads
+__pycache__
+Signal Broadcast.app

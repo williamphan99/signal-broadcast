@@ -5,7 +5,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-command -v signal-cli >/dev/null || { echo "Install signal-cli first (run Setup)." >&2; exit 1; }
+# Don't hard-check `signal-cli` on PATH: on Android it's the vendored JVM build under
+# vendor/ (found by engine.signal_cli_bin(), not on PATH). The engine raises a clear
+# BroadcastError if it's genuinely missing.
 
 python3 - <<'PY'
 import sys

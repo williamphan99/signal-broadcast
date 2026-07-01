@@ -21,4 +21,10 @@ logs/*
 # Bundled JVM build of signal-cli (~110 MB), downloaded by Setup per machine
 vendor/
 
+# Docker "pixel-sandbox" persistent state (PERSIST=1) — holds link KEYS. Never commit.
+.sandbox-data/
+
+# Images uploaded through the mobile web UI (per-user content).
+webui-uploads/
+
 __pycache__/
