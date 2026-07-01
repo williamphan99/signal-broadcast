@@ -69,8 +69,35 @@ Install these three apps **from [F-Droid](https://f-droid.org)** — *not* the P
 | App | Why |
 |---|---|
 | **Termux** | the Linux terminal everything runs in |
-| **Termux:API** | provides `termux-wake-lock` / `termux-open-url` (used for scheduling + linking) |
+| **Termux:API** | provides `termux-wake-lock` / `termux-open-url` (used for launching + scheduling) |
+| **Termux:Widget** | the home-screen **Launch** and **Update** icons |
 | **Termux:Boot** | restarts the schedule after a reboot (only needed for scheduled sends) |
+
+---
+
+## Install — one command (recommended)
+
+Once the F-Droid apps above are installed, open **Termux** and paste this single line:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/williamphan99/signal-broadcast/main/scripts/install-pixel.sh | bash
+```
+
+It does everything: installs the Debian guest, clones the app, sets up Java 25 + signal-cli
++ the native lib, and creates two home-screen icons. It's safe to re-run (it updates).
+
+Then **add the icons to your home screen**: long-press the home screen → **Widgets →
+Termux:Widget**, and place:
+- **Signal Broadcast** — launches the app (opens the web UI in your browser)
+- **Update Signal Broadcast** — pulls the latest code (the Android version of re-running
+  Setup on the Mac)
+
+**First run:** tap **Signal Broadcast** → in the browser tap **Start linking** → scan the QR
+with Signal (**Settings → Linked devices → ＋**). After that, daily use is: **tap → type →
+Send**. Updating later is: **tap Update Signal Broadcast**.
+
+> Prefer to see each step (or the one-liner didn't fit your setup)? The manual walkthrough
+> below does exactly the same thing, one command at a time.
 
 ---
 
