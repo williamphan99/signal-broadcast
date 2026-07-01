@@ -59,6 +59,7 @@ class WebUITests(unittest.TestCase):
         patch("write_run_summary", lambda r: None)
         patch("failure_breakdown", lambda r: "")
         patch("save_send_times", lambda t: None)
+        patch("read_run_summary", lambda: None)  # Schedule tab's "last send"; deterministic default
 
     # ---- state ----
     def test_index_serves_html(self):
@@ -200,6 +201,25 @@ class WebUITests(unittest.TestCase):
     def test_schedule_invalid_time_rejected(self):
         r = self.c.post("/api/schedule", json={"times": ["25:00"], "enabled": True})
         self.assertEqual(r.status_code, 400)
+
+    def test_schedule_get_shape(self):
+        # GET mirrors the Mac Schedule tab: times + enabled + next_send + last_send.
+        summ = engine.RunSummary(at="2026-07-01T09:00:00", total=5, sent=5,
+                                 failed=0, skipped=0, uncertain=0)
+        with mock.patch.object(webui, "_cron_installed", lambda: True), \
+             mock.patch.object(engine, "read_run_summary", lambda: summ):
+            j = self.c.get("/api/schedule").get_json()
+        self.assertTrue(j["enabled"])
+        self.assertEqual(j["times"], ["09:00"])
+        self.assertIsNotNone(j["next_send"])          # computed while enabled
+        self.assertEqual(j["last_send"]["sent"], 5)
+        self.assertIn("Jul", j["last_send"]["at"])     # ISO reformatted to "Jul 01, 09:00"
+
+    def test_schedule_get_next_send_none_when_off(self):
+        with mock.patch.object(webui, "_cron_installed", lambda: False):
+            j = self.c.get("/api/schedule").get_json()
+        self.assertFalse(j["enabled"])
+        self.assertIsNone(j["next_send"])
 
     def test_schedule_enable_surfaces_cron_failure(self):
         # crontab missing / write failed → must NOT report "on" (else a schedule that
