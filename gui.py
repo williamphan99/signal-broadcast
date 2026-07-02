@@ -230,6 +230,21 @@ class App(tk.Tk):
             self.link_progress.stop()
             self.link_progress.pack_forget()
 
+    def _linklog(self, msg: str) -> None:
+        """Append raw link diagnostics to logs/link-debug.txt so a failed Mac link
+        leaves evidence (what signal-cli printed, whether the account registered).
+        gui.py used to log nothing here, which is why a broken link was a guessing
+        game. Best-effort — never raises into the link flow."""
+        try:
+            p = engine.LOGS_DIR / "link-debug.txt"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if p.exists() and p.stat().st_size > 1_000_000:  # cap so retries can't grow it forever
+                p.unlink()
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(msg.rstrip("\n") + "\n")
+        except Exception:
+            pass
+
     def _link_worker(self) -> None:
         png = None
         proc = None
@@ -238,6 +253,7 @@ class App(tk.Tk):
             engine.DATA_DIR.mkdir(parents=True, exist_ok=True)
             cmd, env = engine.signal_cli_command(
                 "--config", str(engine.DATA_DIR), "link", "-n", "broadcast-laptop")
+            self._linklog("--- attempt start ---")
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                 errors="replace", env=env)
@@ -248,6 +264,7 @@ class App(tk.Tk):
                 line = line.strip()
                 if line.startswith(("sgnl://linkdevice", "tsdevice:")):
                     uri = line
+                    self._linklog("URI generated")
                     break
             if not uri:
                 proc.wait()
@@ -267,20 +284,36 @@ class App(tk.Tk):
             # so the first line after the URI doubles as a "scanned" signal.
             scanned = False
             for line in proc.stdout:
-                if line.strip() and not scanned:
+                line = line.strip()
+                if not line:
+                    continue
+                self._linklog("out: " + line[:200])
+                if not scanned:
                     scanned = True
                     self.events.put(("link_status", "Code scanned — finishing the link…"))
-            if proc.wait() != 0:
+            rc = proc.wait()
+            self._linklog(f"attempt ended rc={rc}")
+            if rc != 0:
                 raise engine.BroadcastError("Linking did not complete. Try again.")
 
             self.events.put(("link_status", "Linked! Setting things up…"))
             number = engine.detect_account()
-            if number:
-                engine.save_account(number)
-                count = engine.sync_groups(number, on_log=lambda m: self.events.put(("link_status", m)))
-                self.events.put(("link_status", f"Ready — found {count} groups."))
+            self._linklog(f"detect_account -> {number!r}")
+            # signal-cli can exit 0 yet leave the account half-provisioned (device
+            # associated, registration not finished) — detect_account then returns
+            # None. Don't drop the user onto a dead main screen; treat it as a link
+            # failure so they can simply scan again.
+            if not number:
+                raise engine.BroadcastError(
+                    "The link didn't finish registering. On your phone, remove any "
+                    "'broadcast-laptop' entry under Signal → Linked Devices, then scan again.")
+            engine.save_account(number)
+            count = engine.sync_groups(number, on_log=lambda m: self.events.put(("link_status", m)))
+            self._linklog(f"sync_groups -> {count}")
+            self.events.put(("link_status", f"Ready — found {count} groups."))
             self.events.put(("linked_done", None))
         except Exception as exc:
+            self._linklog(f"link_error: {exc}")
             self.events.put(("link_error", str(exc)))
         finally:
             # Never leave a live `signal-cli link` behind (e.g. qrencode failed): it
