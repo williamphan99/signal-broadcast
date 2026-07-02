@@ -65,6 +65,7 @@ class _State:
     def reset_link(self) -> None:
         self.link_running = False
         self.link_uri: str | None = None
+        self.link_uri_ts = 0.0            # when the current URI was issued (codes live ~60s)
         self.link_qr: str | None = None   # base64 PNG data (no prefix)
         self.link_scanned = False         # True once signal-cli reports post-QR activity (a scan)
         self.link_linked = False
@@ -368,7 +369,7 @@ def create_app(state: _State | None = None) -> Flask:
             if p.exists() and p.stat().st_size > 1_000_000:  # reset so retries can't grow it forever
                 p.unlink()
             with open(p, "a", encoding="utf-8") as f:
-                f.write(msg.rstrip("\n") + "\n")
+                f.write(time.strftime("%H:%M:%S ") + msg.rstrip("\n") + "\n")
         except Exception:
             pass
 
@@ -379,6 +380,13 @@ def create_app(state: _State | None = None) -> Flask:
         progress is never cut off; the caller just issues a fresh QR once this one ends."""
         argv, env = engine.signal_cli_command(
             "--config", str(engine.DATA_DIR), "link", "-n", DEVICE_NAME)
+        with st.lock:
+            # The previous attempt's code is dead the moment its process ends — never let the
+            # page (or a mid-flight "Open Signal" tap) grab it while the new JVM boots, which
+            # takes tens of seconds under proot on the phone.
+            st.link_uri = None
+            st.link_qr = None
+            st.link_scanned = False
         proc = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, bufsize=1)
         with st.lock:
@@ -402,6 +410,7 @@ def create_app(state: _State | None = None) -> Flask:
                     _linklog("URI generated")
                     with st.lock:
                         st.link_uri = line
+                        st.link_uri_ts = time.time()
                         st.link_qr = _qr_png_b64(line)
                         st.link_scanned = False  # fresh code on screen → back to "waiting to scan"
                 elif line:
@@ -489,6 +498,12 @@ def create_app(state: _State | None = None) -> Flask:
             threading.Thread(target=_run_link, daemon=True).start()
             return jsonify(started=True)
         if p is not None and p.poll() is None:
+            with st.lock:
+                # Kill the on-screen code the instant we abandon it, so nothing can open
+                # Signal with a code whose provisioning socket is already gone.
+                st.link_uri = None
+                st.link_qr = None
+                st.link_scanned = False
             try:
                 p.terminate()  # ends the current attempt → the loop immediately issues a fresh code
             except Exception:
@@ -501,6 +516,7 @@ def create_app(state: _State | None = None) -> Flask:
         # so the page never shows "Linked!" while state still says otherwise.
         with st.lock:
             return jsonify(running=st.link_running, uri=st.link_uri, qr=st.link_qr,
+                           age=(round(time.time() - st.link_uri_ts, 1) if st.link_uri else None),
                            scanned=st.link_scanned,
                            linked=bool(st.link_linked or _linked_account()),
                            error=st.link_error)
@@ -1029,7 +1045,7 @@ PAGE = r"""<!doctype html>
 
 <script>
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
-let S={}, offline=false, times=[], schedEnabled=false, sendStart=0, msgTimer=null, heartbeat=null, curUri='';
+let S={}, offline=false, times=[], schedEnabled=false, sendStart=0, msgTimer=null, heartbeat=null, curUri='', curAge=null;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
 async function api(path,opts){
@@ -1270,25 +1286,29 @@ function setLinkStatus(mode,text){
   el.classList.toggle('done', mode==='done');
   $('#linkStatusTxt').textContent=text;
 }
-// Get a brand-new code (full ~60s window) and open Signal with it, so the code the user
-// confirms hasn't expired — the fix for the single-phone "Connection closed" race.
-async function openInSignal(){
-  const before=curUri;
-  setLinkStatus('working','Getting a fresh code…');
-  await api('/api/link/fresh',{method:'POST'});
-  for(let i=0;i<24;i++){                 // wait up to ~12s for the new code to appear
-    await sleep(500);
-    if(curUri && curUri!==before) break;
+// Single-phone handoff. Chrome only honours a custom-scheme (sgnl://) navigation while the
+// tap's "user activation" is alive (~5s) — ANY await before location.href gets the launch
+// silently dropped ("Open Signal → nothing"). So: if the on-screen code is still young,
+// navigate synchronously in the tap. If it's stale, request a fresh one and have the user
+// tap again once it lands (the poller flips the button back when the new code is ready —
+// a fresh code needs a new signal-cli JVM, which can take 30s+ under proot on the phone).
+const FRESH_S=25;                          // codes live ~60s; open only within their youth
+let wantOpen=false;
+function codeIsFresh(){ return curUri && curAge!==null && curAge<FRESH_S; }
+function openInSignal(){
+  if(codeIsFresh()){
+    setLinkStatus('wait','Signal is opening — tap “Link device” now, then come back.');
+    window.location.href=curUri;           // synchronous: inside the user gesture
+    return;
   }
-  setLinkStatus('wait','Signal is opening — tap “Link device” now, then come back.');
-  if(curUri) window.location.href=curUri;
-  else toast('Couldn’t get a code — tap Start linking again','err');
+  wantOpen=true;
+  setLinkStatus('working','Getting a fresh code — takes up to a minute on the phone…');
+  api('/api/link/fresh',{method:'POST'});
 }
 async function freshCode(){                // for the "another device" QR path
   setLinkStatus('working','Getting a fresh code…');
-  const before=curUri;
   await api('/api/link/fresh',{method:'POST'});
-  for(let i=0;i<24;i++){ await sleep(500); if(curUri&&curUri!==before) break; }
+  for(let i=0;i<120;i++){ await sleep(500); if(codeIsFresh()) break; }  // JVM restart is slow under proot
   setLinkStatus('wait','Fresh code ready — scan it now.');
   toast('Fresh code ready');
 }
@@ -1301,9 +1321,16 @@ async function startLink(){
   if(linkTimer)clearInterval(linkTimer);
   linkTimer=setInterval(async()=>{
     const s=await api('/api/link'); if(s.__neterr)return;
+    // Track the live code + its age; a cleared/rotated code must never be openable.
+    if(s.uri){ curUri=s.uri; curAge=(s.age==null?null:s.age); } else { curUri=''; curAge=null; }
     // Show the link options only while we're still waiting for a scan.
-    if(s.uri && !s.scanned && !s.linked){ curUri=s.uri; $('#linkReady').classList.remove('hidden');
+    if(s.uri && !s.scanned && !s.linked){ $('#linkReady').classList.remove('hidden');
       if(s.qr && s.qr!==lastQr){ lastQr=s.qr; $('#qr').src='data:image/png;base64,'+s.qr; } }
+    // A fresh code the user asked for just landed → re-arm the button (we can't auto-open
+    // Signal: the launch needs a real tap).
+    if(wantOpen && codeIsFresh() && !s.scanned && !s.linked){ wantOpen=false;
+      setLinkStatus('wait','Fresh code ready — tap “Open Signal on this phone” now.');
+      toast('Code ready — tap Open Signal now','ok'); }
     if(s.error){ clearInterval(linkTimer); linkTimer=null; $('#linkOut').classList.add('hidden');
       $('#linkBtn').classList.remove('hidden'); $('#linkBtn').disabled=false; $('#linkBtn').textContent='Try again';
       toast(s.error,'err'); return; }

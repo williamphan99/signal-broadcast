@@ -259,6 +259,41 @@ class WebUITests(unittest.TestCase):
             j = self.c.post("/api/link/fresh").get_json()
         self.assertTrue(j.get("started") or j.get("ok"))
 
+    def test_link_status_reports_code_age(self):
+        # The page opens Signal only while a code is young (Chrome drops the sgnl:// launch
+        # outside a fresh user gesture), so /api/link must say how old the code is.
+        self.state.link_uri = "sgnl://linkdevice?uuid=x"
+        self.state.link_uri_ts = time.time() - 3
+        with mock.patch.object(engine, "is_linked", lambda: False), \
+             mock.patch.object(engine, "detect_account", lambda: None):
+            j = self.c.get("/api/link").get_json()
+        self.assertGreaterEqual(j["age"], 3)
+        self.assertLess(j["age"], 10)
+        self.state.link_uri = None
+        with mock.patch.object(engine, "is_linked", lambda: False), \
+             mock.patch.object(engine, "detect_account", lambda: None):
+            j = self.c.get("/api/link").get_json()
+        self.assertIsNone(j["age"])
+
+    def test_link_fresh_clears_stale_code(self):
+        # Asking for a fresh code abandons the current one — the dead code must vanish
+        # immediately, so a tap can't open Signal with a code whose provisioning socket
+        # is already gone (the JVM restart takes tens of seconds under proot).
+        import subprocess
+        proc = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(proc.kill)
+        self.state.link_running = True
+        self.state.link_proc = proc
+        self.state.link_uri = "sgnl://linkdevice?uuid=stale"
+        self.state.link_qr = "QRB64"
+        with mock.patch.object(engine, "is_linked", lambda: False), \
+             mock.patch.object(engine, "detect_account", lambda: None):
+            j = self.c.post("/api/link/fresh").get_json()
+        self.assertTrue(j.get("ok"))
+        self.assertIsNone(self.state.link_uri)
+        self.assertIsNone(self.state.link_qr)
+        proc.wait(timeout=5)  # terminate() was delivered → the attempt actually ended
+
     def test_link_status_not_linked_without_account(self):
         # The bug: link *started* (keys on disk, URI shown) must NOT report "linked" until a
         # real account is saved — otherwise the page shows "Linked!" but never advances.
