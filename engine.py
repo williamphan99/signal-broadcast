@@ -58,7 +58,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.15.5"
+APP_VERSION = "1.15.6"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -126,7 +126,9 @@ CONFIRM_GRACE_S = 60             # after a send times out, how long to keep list
 # First-sync after linking. A big account's groups don't all arrive in one
 # receive, so we drain in short bursts until the count stops growing (or the cap).
 SYNC_BURST_S = 5                 # one receive burst while draining the phone's sync
-SYNC_MAX_S = 60                  # overall cap — large accounts (100+ groups) take longer
+SYNC_MAX_S = 60                  # budget once no more progress is being made
+SYNC_HARD_CAP_S = 240            # absolute ceiling, even while a big backlog is still
+                                 # actively downloading (deadline extends toward this)
 SYNC_STABLE_ROUNDS = 2           # stop once the group count holds steady this many rounds
 LISTGROUPS_TIMEOUT_S = 30        # listGroups is mostly local; guard against a network hang
 MIN_DELAY_S = 10.0               # hard floor: never send faster than this, whatever the config
@@ -835,50 +837,63 @@ def sync_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
     on_log("Syncing your groups from your phone…")
     recv_timeout = SYNC_BURST_S + 10
     deadline = time.monotonic() + SYNC_MAX_S
+    hard_cap = time.monotonic() + SYNC_HARD_CAP_S   # ceiling even while draining a backlog
     last, stable = -1, 0     # last == -1 means "no listGroups has EVER succeeded"
     last_error = ""
-    timeouts = 0
-    while time.monotonic() < deadline and stable < SYNC_STABLE_ROUNDS:
+    dead_timeouts = 0        # receive timeouts that produced NO output (real connect hang)
+    connected = False        # did receive ever reach the server (produce any output)?
+    while time.monotonic() < deadline and time.monotonic() < hard_cap and stable < SYNC_STABLE_ROUNDS:
         try:
-            # --timeout is signal-cli's own burst cap; the outer subprocess timeout is
-            # a hard kill-switch for a wedged JVM that ignores it (with a little slack).
+            # --timeout is signal-cli's own idle cap; the outer subprocess timeout is a
+            # hard kill-switch. A burst can hit that ceiling two ways: hung on connect
+            # (no output), or busy downloading a large message backlog (lots of output).
             recv = subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-a", account,
                                        "receive", "--timeout", str(SYNC_BURST_S)),
                                   capture_output=True, text=True, errors="replace",
                                   timeout=recv_timeout, env=_signal_env(binary))
         except subprocess.TimeoutExpired as exc:
-            # receive was hard-killed at recv_timeout. signal-cli's own --timeout bounds
-            # only the IDLE wait, NOT the connect phase — so this means it couldn't
-            # reach Signal's servers (no internet, a VPN/firewall/proxy, or an IPv6
-            # routing stall). Record it as the real reason instead of a blank failure.
-            partial = ""
-            if getattr(exc, "output", None) or getattr(exc, "stderr", None):
-                raw = exc.stderr or exc.output or b""
-                partial = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
-            last_error = (f"signal-cli couldn't connect to Signal (timed out after "
-                          f"{recv_timeout}s). This is a network/connection problem — "
-                          "check the internet connection, and any VPN, firewall, or "
-                          "proxy on this machine.")
-            _sync_log(f"receive TIMEOUT after {recv_timeout}s; partial: {partial.strip()[:300]!r}")
-            timeouts += 1
-            if timeouts >= 2:   # one retry for a cold-connect blip, then give up
+            raw = exc.stderr or exc.output or b""
+            partial = (raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)).strip()
+            if partial and ACCOUNT_UNUSABLE_PATTERN.search(partial):
+                last_error = partial   # dead account, surfaced even mid-timeout
                 break
-            continue
-        if recv.returncode != 0:
-            err = (recv.stderr or recv.stdout or "").strip()
-            _sync_log(f"receive rc={recv.returncode}: {err[:200]}")
-            if err:
-                last_error = err
-            # A permanent account problem won't fix itself — stop churning and report.
-            if ACCOUNT_UNUSABLE_PATTERN.search(err):
-                break
+            if partial:
+                # receive was actively downloading (backlog) — it CONNECTED, it's just
+                # busy. That's progress, not a connection failure. Give it more total
+                # time and fall through to listGroups: the group sync may already be in.
+                connected = True
+                deadline = min(hard_cap, time.monotonic() + SYNC_MAX_S)
+                _sync_log(f"receive busy-timeout ({recv_timeout}s), still downloading: {partial[:150]!r}")
+            else:
+                # No output at all → genuinely stuck reaching the server.
+                dead_timeouts += 1
+                last_error = (f"signal-cli couldn't connect to Signal (timed out after "
+                              f"{recv_timeout}s). This is a network/connection problem — "
+                              "check the internet connection, and any VPN, firewall, or "
+                              "proxy on this machine.")
+                _sync_log(f"receive DEAD-timeout {dead_timeouts} ({recv_timeout}s), no output")
+                if dead_timeouts >= 2:   # one retry for a cold-connect blip, then give up
+                    break
+                continue
+        else:
+            out = ((recv.stderr or "") + (recv.stdout or "")).strip()
+            if recv.returncode != 0:
+                _sync_log(f"receive rc={recv.returncode}: {out[:200]}")
+                if out:
+                    last_error = out
+                # A permanent account problem won't fix itself — stop and report it.
+                # (Don't set `connected`: an error reply is not a healthy connection.)
+                if ACCOUNT_UNUSABLE_PATTERN.search(out):
+                    break
+            elif out:
+                connected = True   # clean receive with output → we reached the server
         try:
             count = pull_groups(account)
         except BroadcastError as exc:
             last_error = str(exc)
             _sync_log(f"listGroups FAILED: {last_error[:200]}")
             if ACCOUNT_UNUSABLE_PATTERN.search(last_error):
-                break  # dead account / removed device — no point retrying for 60s
+                break  # dead account / removed device — no point retrying
             continue   # transient fetch error — try another burst
         _sync_log(f"listGroups OK: {count} groups")
         on_log(f"Syncing your groups from your phone… ({count} so far)")
@@ -886,10 +901,17 @@ def sync_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
         # draining until the cap, since the phone's first sync can be slow.
         stable = stable + 1 if (count == last and count > 0) else 0
         last = count
-    _sync_log(f"--- sync end: last={last}, last_error={last_error[:120]!r} ---")
+    _sync_log(f"--- sync end: last={last}, connected={connected}, last_error={last_error[:120]!r} ---")
     if last < 0:
-        # Never read the list once — this is a failure, not an empty account. Report
-        # the real reason so the UI can show it (and relink if the account is dead).
+        if connected:
+            # We reached Signal and were downloading, but the group list hadn't come
+            # through before the time budget ran out — a large backlog. Each attempt
+            # persists progress, so another try picks up where this left off.
+            raise BroadcastError(
+                "Connected to Signal, but your groups haven't finished syncing yet — "
+                "this account has a large backlog of messages. Wait a few seconds and "
+                "tap “Update list from phone” again; each try gets further.")
+        # Never reached the server at all — surface the real reason (network / dead account).
         raise BroadcastError(last_error.strip() or
                              "Couldn't reach signal-cli to sync your groups. Try again.")
     return last

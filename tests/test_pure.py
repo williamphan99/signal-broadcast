@@ -240,6 +240,46 @@ class SyncGroupsTests(unittest.TestCase):
                 engine.sync_groups("+1", on_log=lambda *_: None)
         self.assertLessEqual(calls["n"], 2)  # bailed, did not churn
 
+    def _sync_recv_raises(self, exc_factory, pull_side_effect):
+        """Like _sync but the `receive` subprocess RAISES (e.g. TimeoutExpired) each
+        call. pull_groups still runs from pull_side_effect."""
+        seq = iter(pull_side_effect)
+
+        def fake_pull(_acct):
+            item = next(seq, pull_side_effect[-1])
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        def fake_run(*a, **k):
+            raise exc_factory()
+
+        with mock.patch.object(engine, "signal_cli_bin", lambda: "/bin/true"), \
+             mock.patch.object(engine, "_request_sync", lambda *a, **k: None), \
+             mock.patch.object(engine, "pull_groups", fake_pull), \
+             mock.patch.object(engine.subprocess, "run", fake_run):
+            return engine.sync_groups("+1", on_log=lambda *_: None)
+
+    def test_busy_receive_timeout_is_progress_not_a_connection_error(self):
+        # receive keeps hitting its outer timeout WHILE producing output (downloading a
+        # backlog). That must be treated as progress: keep draining, and the eventual
+        # group count wins — NOT reported as "couldn't connect".
+        def busy_timeout():
+            return engine.subprocess.TimeoutExpired(
+                cmd="receive", timeout=15,
+                stderr="INFO IncomingMessageHandler - server timestamp received")
+        # groups arrive after a couple of busy bursts, then hold steady
+        self.assertEqual(self._sync_recv_raises(busy_timeout, [0, 4, 4, 4]), 4)
+
+    def test_silent_receive_timeout_reports_connection_problem(self):
+        # receive times out with NO output at all → a real connect hang → surface the
+        # network/connection message, not a groups count.
+        def silent_timeout():
+            return engine.subprocess.TimeoutExpired(cmd="receive", timeout=15, stderr="")
+        with self.assertRaises(engine.BroadcastError) as ctx:
+            self._sync_recv_raises(silent_timeout, [0])
+        self.assertIn("connect", str(ctx.exception).lower())
+
 
 if __name__ == "__main__":
     unittest.main()
