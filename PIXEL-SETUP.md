@@ -189,14 +189,25 @@ phone's browser:
 bash scripts/webui-termux.sh          # inside the guest; leave it running
 ```
 
-Then open **http://127.0.0.1:8787** in Chrome on the Pixel. You get the same three tabs as
-the Mac app:
+Then open **http://127.0.0.1:8787** in Chrome on the Pixel. The app ("BROADCAST") has a
+bottom tab bar with four tabs, designed to be tap-and-type simple:
 
-- **Send** — type the message, **Add images…**, tap **Send to N groups** (it confirms and
-  shows a time estimate), watch live progress, **Resend failed** if needed.
-- **Groups** — tick/untick groups, **Update from phone**, **Save selection**.
-- **Schedule** — set daily times, **Turn on/off**.
-- **Settings** — shows your linked number and an **Unlink & erase** button.
+- **Send** — type the message, **Add photos**, tap **Send to N groups** (it confirms and
+  shows a time estimate). During a send you get a live console — a progress bar, "Sending
+  N of M — <group>", and an activity log — then a clear result card with **Resend failed**
+  if anything didn't go through.
+- **Groups** — **Sync from phone** (with a "last synced" note), tick/untick groups (with a
+  search box when the list is long), **Save selection**.
+- **Schedule** — add daily times as chips, **Turn on / Turn off / Update times**, and see
+  the current status, **next send**, and how the **last send** went. Best-effort on
+  Android — see the Scheduling section below.
+- **Settings** — your linked number, a reminder about the **Update** icon, and
+  **Unlink & erase**.
+
+**Linking (first run):** the Send/Groups screens only appear once you're linked. On the
+link screen tap **Start linking**; it shows a QR and walks through **Waiting for you to
+scan… → Scanned ✓ → Linked!**. On the phone itself, tap **Open Signal on this phone**;
+from another device, scan the QR (**Signal → Settings → Linked devices → ＋**).
 
 It's **private by design**: the server listens on `127.0.0.1` only (nothing leaves the
 phone), and there's no account or login — it just uses your Signal link.
@@ -242,24 +253,69 @@ python3 broadcast.py --groups logs/failures-$(date +%F).txt
 
 ---
 
-## 7. Optional: scheduled sending (best-effort)
+## 8. Optional: scheduled sending (best-effort)
 
 > **Read this first.** Android's **Doze** mode aggressively suspends background apps to
 > save battery. Even with the steps below, unattended scheduled sends on a phone are
 > **less reliable** than a manual run. If a send *must* go out, run it manually — or run
 > this on an always-on Linux box instead of the phone.
 
-Set your times in `config.toml` (`send_times = ["12:00", "16:00"]`), then **inside the
-guest**:
+**Set the times.** Easiest is the app's **Schedule** tab (add times, **Turn on**). Or set
+them in `config.toml` (`send_times = ["12:00", "16:00"]`) and run, **inside the guest**:
 
 ```bash
 bash scripts/schedule-termux.sh
 ```
 
-It installs a cron entry per time and prints the **host-side steps you must also do**
-(battery-optimization exemption + a Termux:Boot script that holds a wake lock and starts
-cron). Follow those exactly, then verify by checking `logs/cron.log` after a scheduled
-time with the screen off for a while.
+Either way installs one cron entry per time inside the guest. That alone is **not enough**
+on Android — you must also do the **host-side** steps below (in Termux itself, *outside*
+the guest) or Doze will freeze the schedule once the screen is off.
+
+### Host-side steps (do these once, in Termux — not inside the guest)
+
+**1. Exempt Termux from battery optimization.** Android **Settings → Apps → Termux →
+Battery → Unrestricted**. Without this, Doze stops cron after the screen is off a while.
+
+**2. Add a Termux:Boot script** so a wake lock is held and the guest's cron starts on
+every reboot. Install **Termux:Boot** (F-Droid), **open it once** (required — it arms
+itself), then in Termux:
+
+```bash
+mkdir -p ~/.termux/boot
+cat > ~/.termux/boot/10-signal-broadcast.sh <<'BOOT'
+#!/data/data/com.termux/files/usr/bin/sh
+termux-wake-lock
+proot-distro login debian -- sh -lc 'cron || /usr/sbin/cron'
+BOOT
+chmod +x ~/.termux/boot/10-signal-broadcast.sh
+```
+
+(Use your guest's name if it isn't `debian`. `termux-wake-lock` needs **Termux:API**
+installed — `pkg install termux-api` if it's missing.)
+
+**3. Start it now without rebooting** (in Termux):
+
+```bash
+termux-wake-lock
+proot-distro login debian -- sh -lc 'cron || /usr/sbin/cron'
+```
+
+### Test it
+
+Set a time a few minutes out, turn the screen off, and wait. After the time passes, check
+inside the guest:
+
+```bash
+tail logs/cron.log
+```
+
+You should see a run logged. To confirm it survives a reboot, restart the phone (don't
+open anything), then after the next scheduled time check `logs/cron.log` again.
+
+> **Two different wake locks — don't mix them up.** The **Signal Broadcast** launcher icon
+> holds a wake lock so a *manual* send you're watching finishes even if the screen dims.
+> The **Termux:Boot** script above holds one so *scheduled* sends fire in the background.
+> You want both if you rely on scheduling.
 
 ---
 
