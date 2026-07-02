@@ -249,6 +249,16 @@ class WebUITests(unittest.TestCase):
         self.assertTrue(s.get("linked"))
         self.assertTrue(s.get("uri", "").startswith("sgnl://linkdevice"))
 
+    def test_link_fresh_starts_when_idle(self):
+        # Tapping "Open Signal" calls /api/link/fresh; with no loop running it should kick
+        # one off (so the user gets a code) rather than erroring.
+        with mock.patch.object(engine, "is_linked", lambda: False), \
+             mock.patch.object(engine, "detect_account", lambda: None), \
+             mock.patch.object(engine, "signal_cli_command",
+                               lambda *a: (["sleep", "30"], None)):
+            j = self.c.post("/api/link/fresh").get_json()
+        self.assertTrue(j.get("started") or j.get("ok"))
+
     def test_link_status_not_linked_without_account(self):
         # The bug: link *started* (keys on disk, URI shown) must NOT report "linked" until a
         # real account is saved — otherwise the page shows "Linked!" but never advances.

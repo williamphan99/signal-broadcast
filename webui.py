@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import subprocess
 import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
@@ -36,6 +37,8 @@ DEVICE_NAME = "pixel-broadcast"
 # hung attempt, and is set far above normal completion so a real scan is never interrupted.
 LINK_HANG_GUARD_S = 200
 LINK_MAX_ATTEMPTS = 8      # loop fresh QRs for a while, then ask the user to retry
+LINK_TOTAL_S = 900         # keep issuing fresh codes for up to 15 min (single-phone linking
+                           # is fiddly; the user drives it, so don't give up after N attempts)
 
 
 # --------------------------------------------------------------------------- #
@@ -66,6 +69,7 @@ class _State:
         self.link_scanned = False         # True once signal-cli reports post-QR activity (a scan)
         self.link_linked = False
         self.link_error: str | None = None
+        self.link_proc: subprocess.Popen | None = None  # live `signal-cli link` proc (to force a fresh code)
 
     def reset_refresh(self) -> None:
         self.refresh_running = False
@@ -377,8 +381,16 @@ def create_app(state: _State | None = None) -> Flask:
             "--config", str(engine.DATA_DIR), "link", "-n", DEVICE_NAME)
         proc = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, bufsize=1)
+        with st.lock:
+            st.link_proc = proc  # so /api/link/fresh can end this attempt and issue a new code
 
         _linklog("--- attempt start ---")
+
+        # A post-QR line that signals a genuine scan/provisioning vs. one that's just an
+        # error (the link code expiring prints "Link request error: Connection closed!",
+        # which must NOT masquerade as "Scanned ✓").
+        _ERR_WORDS = ("error", "closed", "exception", "expired", "timeout", "timed out",
+                      "failed", "invalid", "refused", "reset", "warn", "unable")
 
         def _reader():  # grab the sgnl:// URI as soon as signal-cli prints it
             assert proc.stdout is not None
@@ -394,9 +406,10 @@ def create_app(state: _State | None = None) -> Flask:
                         st.link_scanned = False  # fresh code on screen → back to "waiting to scan"
                 elif line:
                     _linklog("out: " + line[:160])  # non-URI lines (scan/associate/errors)
-                    # signal-cli stays silent after printing the QR until the phone scans it;
-                    # so the first line *after* a URI means provisioning has begun (i.e. scanned).
-                    if have_uri:
+                    # signal-cli is silent after printing the QR until the phone scans it, so a
+                    # post-URI line usually means provisioning began — UNLESS it's an error line
+                    # (an expiring code prints "Connection closed!"), which is NOT a scan.
+                    if have_uri and not any(w in line.lower() for w in _ERR_WORDS):
                         with st.lock:
                             st.link_scanned = True
         rt = threading.Thread(target=_reader, daemon=True)
@@ -427,10 +440,13 @@ def create_app(state: _State | None = None) -> Flask:
         return False
 
     def _run_link():
-        # Auto-refreshing loop: keep issuing a fresh QR (~every LINK_ATTEMPT_S) until the
-        # user scans one or we hit LINK_MAX_ATTEMPTS, so the code on screen never goes stale.
+        # Auto-refreshing loop: keep issuing a fresh QR until the user links or LINK_TOTAL_S
+        # elapses, so the code on screen never goes stale. Each signal-cli link code is only
+        # valid ~60s; /api/link/fresh ends the current attempt so the loop hands out a new one
+        # right when the user is about to confirm (the key to single-phone linking).
+        deadline = time.time() + LINK_TOTAL_S
         try:
-            for _ in range(LINK_MAX_ATTEMPTS):
+            while time.time() < deadline:
                 if st.link_linked or _one_link_attempt():
                     return
             with st.lock:
@@ -442,6 +458,7 @@ def create_app(state: _State | None = None) -> Flask:
         finally:
             with st.lock:
                 st.link_running = False
+                st.link_proc = None
 
     @app.post("/api/link/start")
     def api_link_start():
@@ -454,6 +471,29 @@ def create_app(state: _State | None = None) -> Flask:
             st.link_running = True
         threading.Thread(target=_run_link, daemon=True).start()
         return jsonify(started=True)
+
+    @app.post("/api/link/fresh")
+    def api_link_fresh():
+        """Force a brand-new link code. Tapping 'Open Signal' calls this first so the code
+        the user is about to confirm has its full ~60s validity window (the fix for the
+        single-phone 'Connection closed' race). Starts the loop if it isn't running yet."""
+        if _linked_account():
+            return jsonify(linked=True)
+        with st.lock:
+            running = st.link_running
+            p = st.link_proc
+            if not running:
+                st.reset_link()
+                st.link_running = True
+        if not running:
+            threading.Thread(target=_run_link, daemon=True).start()
+            return jsonify(started=True)
+        if p is not None and p.poll() is None:
+            try:
+                p.terminate()  # ends the current attempt → the loop immediately issues a fresh code
+            except Exception:
+                pass
+        return jsonify(ok=True)
 
     @app.get("/api/link")
     def api_link_status():
@@ -851,11 +891,15 @@ PAGE = r"""<!doctype html>
       <div id="linkOut" class="hidden">
         <div id="linkStatus" class="linkstatus"><span class="dot"></span> <span id="linkStatusTxt">Getting your secure code ready…</span></div>
         <div id="linkReady" class="hidden">
-          <div class="qrwrap"><img id="qr" class="qr" alt="Signal link code"></div>
-          <a id="deep" class="btn primary" href="#">Open Signal on this phone</a>
-          <p class="muted small center" style="margin:12px 0 0">
-            <b>On this phone:</b> tap the button above to open Signal and confirm.<br>
-            <b>From another device:</b> open <b>Signal → Settings → Linked devices → ＋</b> and scan this code.</p>
+          <button id="deep" class="btn primary" onclick="openInSignal()">Open Signal on this phone</button>
+          <p class="muted small center" style="margin:10px 0 0"><b>On this phone:</b> tap the button
+             above — Signal opens, then tap <b>Link device</b> <u>right away</u> and come back here.</p>
+          <details class="explain" style="margin-top:12px">
+            <summary>Linking from another device instead?</summary>
+            <div class="qrwrap"><img id="qr" class="qr" alt="Signal link code"></div>
+            <p class="muted small center">On your other device open <b>Signal → Settings → Linked
+               devices → ＋</b> and scan this code. <a class="ext" href="#" onclick="freshCode();return false">Get a fresh code</a></p>
+          </details>
         </div>
         <p id="linkMsg" class="small center"></p>
       </div>
@@ -985,7 +1029,8 @@ PAGE = r"""<!doctype html>
 
 <script>
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
-let S={}, offline=false, times=[], schedEnabled=false, sendStart=0, msgTimer=null, heartbeat=null;
+let S={}, offline=false, times=[], schedEnabled=false, sendStart=0, msgTimer=null, heartbeat=null, curUri='';
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
 async function api(path,opts){
   try{const r=await fetch(path,opts); setOffline(false); return await r.json().catch(()=>({}));}
@@ -1225,6 +1270,28 @@ function setLinkStatus(mode,text){
   el.classList.toggle('done', mode==='done');
   $('#linkStatusTxt').textContent=text;
 }
+// Get a brand-new code (full ~60s window) and open Signal with it, so the code the user
+// confirms hasn't expired — the fix for the single-phone "Connection closed" race.
+async function openInSignal(){
+  const before=curUri;
+  setLinkStatus('working','Getting a fresh code…');
+  await api('/api/link/fresh',{method:'POST'});
+  for(let i=0;i<24;i++){                 // wait up to ~12s for the new code to appear
+    await sleep(500);
+    if(curUri && curUri!==before) break;
+  }
+  setLinkStatus('wait','Signal is opening — tap “Link device” now, then come back.');
+  if(curUri) window.location.href=curUri;
+  else toast('Couldn’t get a code — tap Start linking again','err');
+}
+async function freshCode(){                // for the "another device" QR path
+  setLinkStatus('working','Getting a fresh code…');
+  const before=curUri;
+  await api('/api/link/fresh',{method:'POST'});
+  for(let i=0;i<24;i++){ await sleep(500); if(curUri&&curUri!==before) break; }
+  setLinkStatus('wait','Fresh code ready — scan it now.');
+  toast('Fresh code ready');
+}
 async function startLink(){
   $('#linkBtn').classList.add('hidden'); $('#linkMsg').textContent='';
   $('#linkOut').classList.remove('hidden'); $('#linkReady').classList.add('hidden');
@@ -1234,8 +1301,8 @@ async function startLink(){
   if(linkTimer)clearInterval(linkTimer);
   linkTimer=setInterval(async()=>{
     const s=await api('/api/link'); if(s.__neterr)return;
-    // Show the QR only while we're still waiting for a scan.
-    if(s.uri && !s.scanned && !s.linked){ $('#deep').href=s.uri; $('#linkReady').classList.remove('hidden');
+    // Show the link options only while we're still waiting for a scan.
+    if(s.uri && !s.scanned && !s.linked){ curUri=s.uri; $('#linkReady').classList.remove('hidden');
       if(s.qr && s.qr!==lastQr){ lastQr=s.qr; $('#qr').src='data:image/png;base64,'+s.qr; } }
     if(s.error){ clearInterval(linkTimer); linkTimer=null; $('#linkOut').classList.add('hidden');
       $('#linkBtn').classList.remove('hidden'); $('#linkBtn').disabled=false; $('#linkBtn').textContent='Try again';
