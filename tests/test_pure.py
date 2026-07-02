@@ -183,5 +183,63 @@ class LinkIsBrokenTests(unittest.TestCase):
         self.assertFalse(self._run(True, 0, "not json"))
 
 
+class SyncGroupsTests(unittest.TestCase):
+    """sync_groups must never report a total failure as '0 groups' — that made a dead
+    account look identical to an account with no groups, which was the reported bug."""
+
+    class _Recv:
+        def __init__(self, rc=0, err=""):
+            self.returncode, self.stderr, self.stdout = rc, err, ""
+
+    def _sync(self, recv, pull_side_effect):
+        """Run sync_groups with receive + pull_groups stubbed. pull_side_effect is a
+        list consumed one per iteration; an item that's an Exception is raised."""
+        seq = iter(pull_side_effect)
+
+        def fake_pull(_acct):
+            item = next(seq, pull_side_effect[-1])
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        with mock.patch.object(engine, "signal_cli_bin", lambda: "/bin/true"), \
+             mock.patch.object(engine, "_request_sync", lambda *a, **k: None), \
+             mock.patch.object(engine, "pull_groups", fake_pull), \
+             mock.patch.object(engine.subprocess, "run", lambda *a, **k: recv):
+            return engine.sync_groups("+1", on_log=lambda *_: None)
+
+    def test_all_failures_raise_with_reason(self):
+        err = engine.BroadcastError("Could not fetch groups:\nUser +1 is not registered.")
+        with self.assertRaises(engine.BroadcastError) as ctx:
+            self._sync(self._Recv(rc=1, err="User +1 is not registered."), [err])
+        self.assertIn("not registered", str(ctx.exception))
+
+    def test_success_returns_count(self):
+        # Three stable reads settle the loop and return the count.
+        self.assertEqual(self._sync(self._Recv(), [5, 5, 5]), 5)
+
+    def test_transient_error_then_success(self):
+        # A non-permanent error is retried, not surfaced, and the eventual count wins.
+        transient = engine.BroadcastError("connection reset by peer")
+        self.assertEqual(self._sync(self._Recv(), [transient, 2, 2, 2]), 2)
+
+    def test_permanent_error_bails_fast(self):
+        # A "not registered" error must break out immediately, not loop for SYNC_MAX_S.
+        calls = {"n": 0}
+        dead = engine.BroadcastError("User +1 is not registered.")
+
+        def fake_pull(_acct):
+            calls["n"] += 1
+            raise dead
+
+        with mock.patch.object(engine, "signal_cli_bin", lambda: "/bin/true"), \
+             mock.patch.object(engine, "_request_sync", lambda *a, **k: None), \
+             mock.patch.object(engine, "pull_groups", fake_pull), \
+             mock.patch.object(engine.subprocess, "run", lambda *a, **k: self._Recv()):
+            with self.assertRaises(engine.BroadcastError):
+                engine.sync_groups("+1", on_log=lambda *_: None)
+        self.assertLessEqual(calls["n"], 2)  # bailed, did not churn
+
+
 if __name__ == "__main__":
     unittest.main()

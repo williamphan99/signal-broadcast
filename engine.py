@@ -58,7 +58,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.15.2"
+APP_VERSION = "1.15.3"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -726,6 +726,23 @@ def detect_account() -> str | None:
     return None
 
 
+def wait_for_account(timeout_s: float = 12.0) -> str | None:
+    """Poll detect_account() briefly, for use right after `signal-cli link` exits.
+    The just-exited link JVM can still hold the account DB lock for a moment — more
+    pronounced on macOS, where JVM shutdown lags — so an immediate detect_account()
+    can return None even though the link fully succeeded. Retrying for a few seconds
+    rides out that window instead of falsely declaring the link failed (which showed
+    up as a fresh, valid link reporting zero groups)."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        acct = detect_account()
+        if acct:
+            return acct
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(1.0)
+
+
 def is_linked() -> bool:
     data = DATA_DIR / "data"
     return data.exists() and any(data.iterdir())
@@ -770,36 +787,67 @@ def _request_sync(binary: str, account: str) -> None:
         pass  # best-effort nudge; a network stall must not hang the sync
 
 
+# signal-cli errors that will NEVER recover by retrying: the account isn't usable
+# (link died mid-provision, or this device was removed from the phone). Looping the
+# sync for the full SYNC_MAX_S against these is pointless — bail out and report.
+ACCOUNT_UNUSABLE_PATTERN = re.compile(
+    r"not registered|not a registered|unregistered|no account|account.*not found|"
+    r"\b401\b|\b403\b|unauthor|authentication", re.IGNORECASE)
+
+
 def sync_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
     """Drain the phone's contacts/groups sync and (over)write groups.txt. A large
     account's groups arrive over several seconds, so nudge the phone then receive
     in short bursts until the count stops growing (or SYNC_MAX_S). Reports a running
-    count so the wait is visibly progressing. Returns the final group count."""
+    count so the wait is visibly progressing. Returns the final group count.
+
+    Raises BroadcastError if we never once managed to read the group list — that is a
+    real failure (signal-cli erroring on every call), and it must NOT be reported as
+    "0 groups", which is indistinguishable from an account that simply has none. This
+    surfaced the reported bug: a broken link / dead account churned for 60s and then
+    silently showed zero groups with no reason. A successful listGroups that returns
+    0 is a genuine empty account and returns 0 normally."""
     binary = signal_cli_bin()
     _request_sync(binary, account)
     on_log("Syncing your groups from your phone…")
     deadline = time.monotonic() + SYNC_MAX_S
-    last, stable = -1, 0
+    last, stable = -1, 0     # last == -1 means "no listGroups has EVER succeeded"
+    last_error = ""
     while time.monotonic() < deadline and stable < SYNC_STABLE_ROUNDS:
         try:
             # --timeout is signal-cli's own burst cap; the outer subprocess timeout is
             # a hard kill-switch for a wedged JVM that ignores it (with a little slack).
-            subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-a", account,
-                                "receive", "--timeout", str(SYNC_BURST_S)),
-                           capture_output=True, text=True, errors="replace",
-                           timeout=SYNC_BURST_S + 10, env=_signal_env(binary))
+            recv = subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-a", account,
+                                       "receive", "--timeout", str(SYNC_BURST_S)),
+                                  capture_output=True, text=True, errors="replace",
+                                  timeout=SYNC_BURST_S + 10, env=_signal_env(binary))
         except subprocess.TimeoutExpired:
             break  # a single hung burst must not block past SYNC_MAX_S
+        if recv.returncode != 0:
+            err = (recv.stderr or recv.stdout or "").strip()
+            if err:
+                last_error = err
+            # A permanent account problem won't fix itself — stop churning and report.
+            if ACCOUNT_UNUSABLE_PATTERN.search(err):
+                break
         try:
             count = pull_groups(account)
-        except BroadcastError:
-            continue  # transient fetch error — try another burst
+        except BroadcastError as exc:
+            last_error = str(exc)
+            if ACCOUNT_UNUSABLE_PATTERN.search(last_error):
+                break  # dead account / removed device — no point retrying for 60s
+            continue   # transient fetch error — try another burst
         on_log(f"Syncing your groups from your phone… ({count} so far)")
         # Only settle on a non-zero count; while we still have nothing, keep
         # draining until the cap, since the phone's first sync can be slow.
         stable = stable + 1 if (count == last and count > 0) else 0
         last = count
-    return max(last, 0)
+    if last < 0:
+        # Never read the list once — this is a failure, not an empty account. Report
+        # the real reason so the UI can show it (and relink if the account is dead).
+        raise BroadcastError(last_error.strip() or
+                             "Couldn't reach signal-cli to sync your groups. Try again.")
+    return last
 
 
 def pull_groups(account: str) -> int:

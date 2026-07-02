@@ -297,7 +297,9 @@ class App(tk.Tk):
                 raise engine.BroadcastError("Linking did not complete. Try again.")
 
             self.events.put(("link_status", "Linked! Setting things up…"))
-            number = engine.detect_account()
+            # Retry briefly: the just-exited link JVM can still hold the account lock
+            # for a moment on macOS, so an immediate detect would miss a good link.
+            number = engine.wait_for_account()
             self._linklog(f"detect_account -> {number!r}")
             # signal-cli can exit 0 yet leave the account half-provisioned (device
             # associated, registration not finished) — detect_account then returns
