@@ -58,7 +58,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.15.7"
+APP_VERSION = "1.15.8"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -130,6 +130,8 @@ SYNC_MAX_S = 60                  # budget once no more progress is being made
 SYNC_HARD_CAP_S = 240            # absolute ceiling, even while a big backlog is still
                                  # actively downloading (deadline extends toward this)
 SYNC_STABLE_ROUNDS = 2           # stop once the group count holds steady this many rounds
+SYNC_RENUDGE_EVERY = 3           # re-ask the phone for the groups sync every N rounds while
+                                 # we still have none (the first nudge can be missed/delayed)
 LISTGROUPS_TIMEOUT_S = 30        # listGroups is mostly local; guard against a network hang
 MIN_DELAY_S = 10.0               # hard floor: never send faster than this, whatever the config
 # Parallel sending: how many whole-group sends may be in flight at once on the single
@@ -842,7 +844,17 @@ def sync_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
     last_error = ""
     dead_timeouts = 0        # receive timeouts that produced NO output (real connect hang)
     connected = False        # did receive ever reach the server (produce any output)?
+    rounds = 0
     while time.monotonic() < deadline and time.monotonic() < hard_cap and stable < SYNC_STABLE_ROUNDS:
+        rounds += 1
+        # Re-nudge the phone periodically while we still have no groups. The group list
+        # arrives as a sync message the PRIMARY pushes in response to sendSyncRequest,
+        # and the phone can miss or delay the first nudge — which is exactly why a manual
+        # second "Update" used to be needed. Re-asking mid-drain makes the one run
+        # succeed on its own instead of relying on the user to tap again.
+        if last <= 0 and rounds > 1 and rounds % SYNC_RENUDGE_EVERY == 1:
+            _sync_log(f"re-nudging phone (sendSyncRequest), round {rounds}")
+            _request_sync(binary, account)
         try:
             # --timeout is signal-cli's own idle cap; the outer subprocess timeout is a
             # hard kill-switch. A burst can hit that ceiling two ways: hung on connect
