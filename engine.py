@@ -58,7 +58,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.15.3"
+APP_VERSION = "1.15.4"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -794,6 +794,24 @@ ACCOUNT_UNUSABLE_PATTERN = re.compile(
     r"not registered|not a registered|unregistered|no account|account.*not found|"
     r"\b401\b|\b403\b|unauthor|authentication", re.IGNORECASE)
 
+SYNC_DEBUG_FILE = LOGS_DIR / "sync-debug.txt"
+
+
+def _sync_log(msg: str) -> None:
+    """Always-on breadcrumb of what the group sync actually did (each receive /
+    listGroups rc + first line of output). Unlike append_debug this is NOT gated on
+    debug=true, because the whole point is diagnosing a sync that fails on a machine
+    we can't reach. Lives in logs/, so unlink / station-mode wipe still erase it.
+    Best-effort — never raises into the sync."""
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        if SYNC_DEBUG_FILE.exists() and SYNC_DEBUG_FILE.stat().st_size > 500_000:
+            SYNC_DEBUG_FILE.unlink()  # cap so repeated syncs can't grow it forever
+        with SYNC_DEBUG_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
+    except Exception:
+        pass
+
 
 def sync_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
     """Drain the phone's contacts/groups sync and (over)write groups.txt. A large
@@ -808,11 +826,14 @@ def sync_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
     silently showed zero groups with no reason. A successful listGroups that returns
     0 is a genuine empty account and returns 0 normally."""
     binary = signal_cli_bin()
+    _sync_log(f"--- sync start (binary={binary}, jvm_build={_is_jvm_build(binary)}) ---")
     _request_sync(binary, account)
     on_log("Syncing your groups from your phone…")
+    recv_timeout = SYNC_BURST_S + 10
     deadline = time.monotonic() + SYNC_MAX_S
     last, stable = -1, 0     # last == -1 means "no listGroups has EVER succeeded"
     last_error = ""
+    timeouts = 0
     while time.monotonic() < deadline and stable < SYNC_STABLE_ROUNDS:
         try:
             # --timeout is signal-cli's own burst cap; the outer subprocess timeout is
@@ -820,11 +841,28 @@ def sync_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
             recv = subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-a", account,
                                        "receive", "--timeout", str(SYNC_BURST_S)),
                                   capture_output=True, text=True, errors="replace",
-                                  timeout=SYNC_BURST_S + 10, env=_signal_env(binary))
-        except subprocess.TimeoutExpired:
-            break  # a single hung burst must not block past SYNC_MAX_S
+                                  timeout=recv_timeout, env=_signal_env(binary))
+        except subprocess.TimeoutExpired as exc:
+            # receive was hard-killed at recv_timeout. signal-cli's own --timeout bounds
+            # only the IDLE wait, NOT the connect phase — so this means it couldn't
+            # reach Signal's servers (no internet, a VPN/firewall/proxy, or an IPv6
+            # routing stall). Record it as the real reason instead of a blank failure.
+            partial = ""
+            if getattr(exc, "output", None) or getattr(exc, "stderr", None):
+                raw = exc.stderr or exc.output or b""
+                partial = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+            last_error = (f"signal-cli couldn't connect to Signal (timed out after "
+                          f"{recv_timeout}s). This is a network/connection problem — "
+                          "check the internet connection, and any VPN, firewall, or "
+                          "proxy on this machine.")
+            _sync_log(f"receive TIMEOUT after {recv_timeout}s; partial: {partial.strip()[:300]!r}")
+            timeouts += 1
+            if timeouts >= 2:   # one retry for a cold-connect blip, then give up
+                break
+            continue
         if recv.returncode != 0:
             err = (recv.stderr or recv.stdout or "").strip()
+            _sync_log(f"receive rc={recv.returncode}: {err[:200]}")
             if err:
                 last_error = err
             # A permanent account problem won't fix itself — stop churning and report.
@@ -834,14 +872,17 @@ def sync_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
             count = pull_groups(account)
         except BroadcastError as exc:
             last_error = str(exc)
+            _sync_log(f"listGroups FAILED: {last_error[:200]}")
             if ACCOUNT_UNUSABLE_PATTERN.search(last_error):
                 break  # dead account / removed device — no point retrying for 60s
             continue   # transient fetch error — try another burst
+        _sync_log(f"listGroups OK: {count} groups")
         on_log(f"Syncing your groups from your phone… ({count} so far)")
         # Only settle on a non-zero count; while we still have nothing, keep
         # draining until the cap, since the phone's first sync can be slow.
         stable = stable + 1 if (count == last and count > 0) else 0
         last = count
+    _sync_log(f"--- sync end: last={last}, last_error={last_error[:120]!r} ---")
     if last < 0:
         # Never read the list once — this is a failure, not an empty account. Report
         # the real reason so the UI can show it (and relink if the account is dead).
