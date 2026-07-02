@@ -146,5 +146,42 @@ class PlatformGuardTests(unittest.TestCase):
                 self.assertEqual(engine._java_home(), str(java_home))
 
 
+class LinkIsBrokenTests(unittest.TestCase):
+    """link_is_broken() must say True ONLY on positive evidence (files on disk but
+    signal-cli reports zero accounts); every error path must read as 'not broken' so
+    a transient problem never bounces a healthy install to the link screen."""
+
+    @staticmethod
+    def _completed(rc: int, stdout: str):
+        proc = mock.Mock()
+        proc.returncode = rc
+        proc.stdout = stdout
+        return proc
+
+    def _run(self, is_linked: bool, rc: int, stdout: str) -> bool:
+        with mock.patch.object(engine, "is_linked", lambda: is_linked), \
+             mock.patch.object(engine, "signal_cli_bin", lambda: "/bin/true"), \
+             mock.patch.object(engine.subprocess, "run",
+                               lambda *a, **k: self._completed(rc, stdout)):
+            return engine.link_is_broken()
+
+    def test_not_linked_is_not_broken(self):
+        self.assertFalse(self._run(False, 0, "[]"))
+
+    def test_no_accounts_is_broken(self):
+        # The half-linked state: files exist, listAccounts succeeds with no account
+        # (signal-cli logs "User is not registered" and returns an empty list).
+        self.assertTrue(self._run(True, 0, "[]\n"))
+
+    def test_registered_account_is_not_broken(self):
+        self.assertFalse(self._run(True, 0, '[{"number": "+61400000000"}]'))
+
+    def test_cli_failure_is_not_broken(self):
+        self.assertFalse(self._run(True, 1, ""))
+
+    def test_bad_json_is_not_broken(self):
+        self.assertFalse(self._run(True, 0, "not json"))
+
+
 if __name__ == "__main__":
     unittest.main()

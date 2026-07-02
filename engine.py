@@ -731,6 +731,34 @@ def is_linked() -> bool:
     return data.exists() and any(data.iterdir())
 
 
+def link_is_broken() -> bool:
+    """True only when link files exist on disk but signal-cli POSITIVELY reports no
+    registered account — a link that died mid-provision, or this device was removed
+    from the phone's Linked Devices. In that state every receive/listGroups/send
+    fails with "User … is not registered" and only relinking helps. Any error or
+    timeout returns False, so a transient JVM/network problem can never bounce a
+    healthy install back to the link screen."""
+    if not is_linked():
+        return False
+    try:
+        binary = signal_cli_bin()
+    except BroadcastError:
+        return False
+    try:
+        proc = subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-o", "json", "listAccounts"),
+                              capture_output=True, text=True, errors="replace",
+                              timeout=LISTGROUPS_TIMEOUT_S, env=_signal_env(binary))
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if proc.returncode != 0:
+        return False
+    try:
+        accounts = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError:
+        return False
+    return not any(e.get("number") or e.get("account") for e in accounts)
+
+
 def _request_sync(binary: str, account: str) -> None:
     """Best-effort nudge: ask the phone (primary) to (re)send contacts + groups.
     Ignored on failure — the phone usually pushes a sync on linking anyway."""

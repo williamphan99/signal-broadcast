@@ -107,6 +107,11 @@ class App(tk.Tk):
 
         if os.environ.get("SB_SKIP_LINK") or engine.is_linked():
             self.show_main()
+            # is_linked() only checks that link FILES exist — they outlive a valid
+            # link (a link that died mid-provision, or this Mac removed from the
+            # phone's Linked Devices). Verify with signal-cli off the UI thread and
+            # fall back to the link screen if the account isn't actually registered.
+            threading.Thread(target=self._verify_link, daemon=True).start()
         else:
             self.show_link()
 
@@ -165,8 +170,16 @@ class App(tk.Tk):
         return inner
 
     # ------------------------------------------------------------ link screen
-    def show_link(self) -> None:
+    def _verify_link(self) -> None:
+        """Worker: if signal-cli positively reports no registered account behind the
+        on-disk link files, tell the UI to route back to the link screen. Without this
+        a broken link shows a normal main screen where every sync/send just fails."""
+        if engine.link_is_broken():
+            self.events.put(("relink_needed", None))
+
+    def show_link(self, notice: str = "") -> None:
         self._screen = "link"
+        self._link_notice = notice
         self._clear()
         if engine.watcher_enabled() and not engine.on_ac_power():
             self._awaiting_power = True
@@ -184,8 +197,11 @@ class App(tk.Tk):
         self.qr_label = ttk.Label(self.container,
                                   text="Click “Start linking” below, then scan the code.")
         self.qr_label.pack(pady=10)
-        self.link_status = ttk.Label(self.container, text="", foreground=PALETTE["muted"])
+        self.link_status = ttk.Label(self.container, text="", foreground=PALETTE["muted"],
+                                     wraplength=620, justify="center")
         self.link_status.pack(pady=(4, 12))
+        if self._link_notice:  # why they landed here (e.g. the previous link broke)
+            self.link_status.configure(text=self._link_notice, foreground=PALETTE["error"])
         # Animated only while linking — a moving bar says "working, not frozen"
         # through the fixed ~12s phone sync. Packed on start (see _start_link).
         self.link_progress = ttk.Progressbar(self.container, mode="indeterminate", length=280)
@@ -216,6 +232,7 @@ class App(tk.Tk):
 
     def _link_worker(self) -> None:
         png = None
+        proc = None
         try:
             qrencode = engine.qrencode_bin()
             engine.DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -241,6 +258,18 @@ class App(tk.Tk):
             self.events.put(("qr", str(png)))
             self.events.put(("link_status", "Scan the code with your phone…"))
 
+            # Keep DRAINING stdout until signal-cli exits. Stopping at the URI (as
+            # this used to) let the post-scan provisioning/sync output fill the pipe
+            # (stderr is merged into it) — once full, signal-cli blocks mid-write and
+            # the link deadlocks forever: the phone says "linked" but this side never
+            # finishes, leaving a half-provisioned account and an empty group list.
+            # signal-cli is silent between printing the URI and the phone scanning it,
+            # so the first line after the URI doubles as a "scanned" signal.
+            scanned = False
+            for line in proc.stdout:
+                if line.strip() and not scanned:
+                    scanned = True
+                    self.events.put(("link_status", "Code scanned — finishing the link…"))
             if proc.wait() != 0:
                 raise engine.BroadcastError("Linking did not complete. Try again.")
 
@@ -254,6 +283,14 @@ class App(tk.Tk):
         except Exception as exc:
             self.events.put(("link_error", str(exc)))
         finally:
+            # Never leave a live `signal-cli link` behind (e.g. qrencode failed): it
+            # would sit on the account lock and wedge every later signal-cli call.
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
             # The QR encodes a one-time link token — don't leave it in /tmp.
             if png is not None:
                 png.unlink(missing_ok=True)
@@ -1040,6 +1077,8 @@ class App(tk.Tk):
                 self.events.put(("refresh_done", count))
             except engine.BroadcastError as exc:
                 self.events.put(("refresh_done", f"Error: {exc}"))
+                if engine.link_is_broken():  # "not registered" → only relinking helps
+                    self.events.put(("relink_needed", None))
         threading.Thread(target=work, daemon=True).start()
 
     def _finish_refresh(self, result) -> None:
@@ -1167,6 +1206,14 @@ class App(tk.Tk):
         elif kind == "linked_done":
             self._stop_link_progress()
             self.show_main()
+        elif kind == "relink_needed":
+            # The on-disk link is dead (removed from the phone, or a link that never
+            # finished). The main screen would be a dead end — route back to linking.
+            if self._screen == "main" and not getattr(self, "_sending", False):
+                self.show_link(notice=(
+                    "This Mac's Signal link is no longer valid — it was removed from "
+                    "your phone's Linked Devices, or an earlier link didn't finish. "
+                    "Link again to continue."))
         elif kind == "log":
             m = payload
             low = m.lower()
