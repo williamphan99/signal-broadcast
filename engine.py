@@ -58,7 +58,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.15.6"
+APP_VERSION = "1.15.7"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -847,8 +847,16 @@ def sync_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
             # --timeout is signal-cli's own idle cap; the outer subprocess timeout is a
             # hard kill-switch. A burst can hit that ceiling two ways: hung on connect
             # (no output), or busy downloading a large message backlog (lots of output).
+            #
+            # We only want the group list, so tell receive NOT to download any message
+            # CONTENT — attachments, avatars, stickers, stories. On an account with a big
+            # media backlog that's the whole bottleneck; the group/contacts sync that
+            # populates listGroups is a small control message that still comes through.
+            # This makes the drain many times faster without changing what we learn.
             recv = subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-a", account,
-                                       "receive", "--timeout", str(SYNC_BURST_S)),
+                                       "receive", "--timeout", str(SYNC_BURST_S),
+                                       "--ignore-attachments", "--ignore-avatars",
+                                       "--ignore-stickers", "--ignore-stories"),
                                   capture_output=True, text=True, errors="replace",
                                   timeout=recv_timeout, env=_signal_env(binary))
         except subprocess.TimeoutExpired as exc:
