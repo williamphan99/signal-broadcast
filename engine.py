@@ -58,7 +58,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.15.4"
+APP_VERSION = "1.15.5"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -662,24 +662,28 @@ def _java_home() -> str | None:
 
 
 def _signal_env(binary: str) -> dict | None:
-    """Environment for a signal-cli call. For the JVM build, point it at a Java 25+
-    home and enlarge every thread's stack via JAVA_OPTS — this is the actual fix for
-    the StackOverflowError. Returns None for the native build (inherit the parent env).
+    """Environment for a signal-cli call.
 
-    We also force IPv4 (-Djava.net.preferIPv4Stack=true): on machines whose network
-    advertises IPv6 but can't actually route it (common behind some VPNs/routers),
-    Java tries the IPv6 address first and stalls or fails with NoRouteToHostException —
-    which shows up as failed image (CDN) uploads and a daemon that times out on start.
-    Forcing IPv4 sidesteps that. Safe on any machine with working IPv4 (i.e. all but
-    the rare IPv6-only host)."""
-    if not _is_jvm_build(binary):
-        return None
+    We ALWAYS force IPv4 (-Djava.net.preferIPv4Stack=true) via JAVA_OPTS, for every
+    build — not just our bundled one. On a network that advertises IPv6 but can't
+    actually route it (common behind some VPNs/routers/ISPs), Java tries the IPv6
+    address first and stalls: `receive` hangs until it's killed, which surfaces as
+    "signal-cli couldn't connect (timed out)" and empty groups. This was the reported
+    bug — the fix only applied to our vendored build, so a machine running Homebrew's
+    signal-cli (also a JVM launcher that reads JAVA_OPTS) got no IPv4 forcing and hung.
+    Every signal-cli launcher script honours JAVA_OPTS; a true native image just
+    ignores it, so setting it is safe everywhere and never worse than before.
+
+    For our bundled JVM build we additionally point at a Java 25+ home and enlarge
+    every thread's stack (-Xss) — the actual fix for the libsignal StackOverflowError."""
     env = dict(os.environ)
-    home = _java_home()
-    if home:
-        env["JAVA_HOME"] = home
-    extra = f"-Xss{THREAD_STACK} -Djava.net.preferIPv4Stack=true"
-    env["JAVA_OPTS"] = f"{env.get('JAVA_OPTS', '')} {extra}".strip()
+    opts = ["-Djava.net.preferIPv4Stack=true"]   # force IPv4 for ANY JVM signal-cli
+    if _is_jvm_build(binary):
+        home = _java_home()
+        if home:
+            env["JAVA_HOME"] = home
+        opts.insert(0, f"-Xss{THREAD_STACK}")    # stack fix: only our bundled build needs it
+    env["JAVA_OPTS"] = f"{env.get('JAVA_OPTS', '')} {' '.join(opts)}".strip()
     return env
 
 
