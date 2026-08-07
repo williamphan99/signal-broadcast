@@ -43,6 +43,8 @@ class WebUITests(unittest.TestCase):
         def patch(name, val):
             m = mock.patch.object(engine, name, val); m.start(); self.addCleanup(m.stop)
         patch("is_linked", lambda: True)
+        # Healthy by default. MUST be patched: unpatched it spawns a real signal-cli.
+        patch("link_is_broken", lambda: False)
         patch("detect_account", lambda: "+61400000000")
         patch("load_config", lambda: _cfg())
         patch("read_message", lambda *a, **k: "hello world")
@@ -90,6 +92,67 @@ class WebUITests(unittest.TestCase):
             j = self.c.get("/api/state").get_json()
         self.assertFalse(j["linked"])
         self.assertIsNone(j["account"])
+
+    # ---- link health ----
+    def _settle(self, timeout=2.0):
+        """Wait for the background link-health worker to publish its verdict."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            with self.state.lock:
+                if not self.state.link_checking and self.state.link_checked_at:
+                    return
+            time.sleep(0.01)
+        self.fail("link health check did not finish")
+
+    def test_dead_link_reads_as_not_linked(self):
+        # On-disk keys survive the phone removing this device, so is_linked() stays
+        # True. Without the health check the page shows a normal app whose every send
+        # fails; it must route to the link screen instead.
+        with mock.patch.object(engine, "link_is_broken", lambda: True):
+            self.c.get("/api/state")          # first poll kicks off the worker
+            self._settle()
+            j = self.c.get("/api/state").get_json()
+        self.assertFalse(j["linked"])
+        self.assertIsNone(j["account"])
+
+    def test_health_check_is_cached_not_run_per_poll(self):
+        # /api/state is polled every couple of seconds and the real check spawns
+        # signal-cli, so repeated polls must reuse the cached verdict.
+        calls = []
+        with mock.patch.object(engine, "link_is_broken", lambda: calls.append(1) or False):
+            for _ in range(12):
+                self.c.get("/api/state")
+                self._settle()
+        self.assertEqual(len(calls), 1, "should check once, then serve from cache")
+
+    def test_stale_verdict_is_rechecked_after_ttl(self):
+        calls = []
+        with mock.patch.object(engine, "link_is_broken", lambda: calls.append(1) or False):
+            self.c.get("/api/state")
+            self._settle()
+            with self.state.lock:      # pretend the TTL elapsed
+                self.state.link_checked_at -= (webui.LINK_CHECK_TTL_S + 1)
+            self.c.get("/api/state")
+            self._settle()
+        self.assertEqual(len(calls), 2)
+
+    def test_a_healthy_link_stays_linked(self):
+        self.c.get("/api/state")
+        self._settle()
+        j = self.c.get("/api/state").get_json()
+        self.assertTrue(j["linked"])
+        self.assertEqual(j["account"], "+61400000000")
+
+    def test_transient_check_failure_does_not_bounce_a_healthy_install(self):
+        # link_is_broken() raising must never read as "broken" — that would throw a
+        # working install back to the link screen on a blip.
+        def boom():
+            raise engine.BroadcastError("signal-cli busy")
+        with mock.patch.object(engine, "link_is_broken", boom):
+            self.c.get("/api/state")
+            self._settle()
+            j = self.c.get("/api/state").get_json()
+        self.assertTrue(j["linked"])
 
     # ---- message + groups ----
     def test_message_save(self):

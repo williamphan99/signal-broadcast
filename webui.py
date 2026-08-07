@@ -39,6 +39,12 @@ LINK_HANG_GUARD_S = 200
 LINK_MAX_ATTEMPTS = 8      # loop fresh QRs for a while, then ask the user to retry
 LINK_TOTAL_S = 900         # keep issuing fresh codes for up to 15 min (single-phone linking
                            # is fiddly; the user drives it, so don't give up after N attempts)
+# How long a link-health verdict stays good. The check spawns signal-cli (seconds, and
+# it takes the account lock), while /api/state is polled every couple of seconds — so
+# it must be cached hard. A device only ever gets unlinked from the phone, which the
+# user then has to act on, so a few minutes of staleness costs nothing; a failed run
+# forces an immediate re-check anyway.
+LINK_CHECK_TTL_S = 300
 
 
 # --------------------------------------------------------------------------- #
@@ -47,6 +53,12 @@ LINK_TOTAL_S = 900         # keep issuing fresh codes for up to 15 min (single-p
 class _State:
     def __init__(self) -> None:
         self.lock = threading.RLock()
+        # Cached result of engine.link_is_broken(). That call spawns signal-cli, which
+        # /api/state (polled every couple of seconds) must never wait on, so the check
+        # runs on a worker and the poll only ever reads this.
+        self.link_broken = False
+        self.link_checked_at = 0.0   # monotonic; 0 = never checked
+        self.link_checking = False
         self.reset_send()
         self.reset_link()
         self.reset_refresh()
@@ -105,6 +117,32 @@ def create_app(state: _State | None = None) -> Flask:
         except Exception:
             return default
 
+    def _check_link_health(force: bool = False) -> None:
+        """Refresh the cached link_is_broken() verdict on a worker thread.
+
+        Without this the Pixel shows a perfectly normal app whose every send fails,
+        because on-disk keys look like a link even after the phone removes this device
+        from Linked Devices. engine.link_is_broken() only returns True when signal-cli
+        POSITIVELY reports no registered account, so a transient error can't bounce a
+        healthy install to the link screen. Re-checked at most every LINK_CHECK_TTL_S,
+        and immediately after a run fails (force), never on the poll's own thread."""
+        with st.lock:
+            if st.link_checking:
+                return
+            fresh = (time.monotonic() - st.link_checked_at) < LINK_CHECK_TTL_S
+            if fresh and not force and st.link_checked_at:
+                return
+            st.link_checking = True
+
+        def work() -> None:
+            broken = _safe(engine.link_is_broken, False)
+            with st.lock:
+                st.link_broken = broken
+                st.link_checked_at = time.monotonic()
+                st.link_checking = False
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _linked_account() -> str | None:
         """The real linked number, or None. Single source of truth for "are we linked?"
         used by BOTH /api/state and /api/link so they never disagree. Requires on-disk keys
@@ -113,6 +151,14 @@ def create_app(state: _State | None = None) -> Flask:
         (which fixes the premature "Linked!" that left the page stuck on the link screen)."""
         if not _safe(engine.is_linked, False):
             return None
+        # On-disk keys survive the phone removing this device from Linked Devices, so
+        # they alone don't prove a usable link. Kick off (or reuse) the cached health
+        # check and treat a POSITIVELY broken link as not linked, which routes the page
+        # to the link screen instead of an app where every send fails.
+        _check_link_health()
+        with st.lock:
+            if st.link_broken:
+                return None
         cfg = _safe(engine.load_config, None)
         return getattr(cfg, "account", None) if cfg else None
 
@@ -227,9 +273,15 @@ def create_app(state: _State | None = None) -> Flask:
                     "skipped": sum(1 for r in results if r.skipped),
                     "breakdown": engine.failure_breakdown(results),
                 }
+            # A run where nothing got through is the signal that the link may be dead.
+            # Re-check now rather than waiting out the TTL, so the very next poll can
+            # route to the link screen instead of leaving them to retry a dead install.
+            if failed and not any(r.ok for r in results):
+                _check_link_health(force=True)
         except Exception as exc:  # BroadcastError or anything unexpected
             with st.lock:
                 st.send_error = str(exc)
+            _check_link_health(force=True)
         finally:
             with st.lock:
                 st.send_running = False
@@ -457,6 +509,11 @@ def create_app(state: _State | None = None) -> Flask:
             _safe(lambda: engine.sync_groups(acct, on_log=lambda *_: None), None)
             with st.lock:
                 st.link_linked = True
+                # A fresh link supersedes any earlier "broken" verdict. Clearing it
+                # here (rather than waiting out the TTL) is what lets the page leave
+                # the link screen immediately after a successful re-link.
+                st.link_broken = False
+                st.link_checked_at = time.monotonic()
             return True
         return False
 

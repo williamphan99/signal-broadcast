@@ -34,14 +34,32 @@ brew install openjdk@25 signal-cli qrencode python-tk
 # 2b. Download the JVM build of signal-cli into ./vendor (version-pinned). The app
 #     prefers this over the native build; see engine.py's signal_cli_bin().
 SIGNAL_CLI_VERSION="0.14.5"
-JVM_CLI="vendor/signal-cli-${SIGNAL_CLI_VERSION}/bin/signal-cli"
-if [ ! -x "$JVM_CLI" ]; then
-  echo "Downloading signal-cli ${SIGNAL_CLI_VERSION} (JVM build)…"
+JVM_DIR="vendor/signal-cli-${SIGNAL_CLI_VERSION}"
+JVM_CLI="${JVM_DIR}/bin/signal-cli"
+# Check for libsignal-client, not just the launcher. It carries the native library
+# signal-cli loads on startup for EVERY command, and it's the biggest jar in the
+# tarball — so a truncated download or an interrupted extract loses it while still
+# leaving bin/signal-cli in place. Guarding on the launcher alone made that state
+# permanent: Setup saw an install and skipped, while every send died with
+# NoClassDefFoundError. Re-download whenever the jar is missing.
+if ! compgen -G "${JVM_DIR}/lib/libsignal-client*.jar" >/dev/null; then
+  [ -e "$JVM_DIR" ] && echo "Existing signal-cli install is incomplete — reinstalling…"
+  echo "Downloading signal-cli ${SIGNAL_CLI_VERSION} (JVM build, ~100 MB)…"
   mkdir -p vendor
   URL="https://github.com/AsamK/signal-cli/releases/download/v${SIGNAL_CLI_VERSION}/signal-cli-${SIGNAL_CLI_VERSION}.tar.gz"
-  if curl -fsSL "$URL" -o vendor/signal-cli.tar.gz; then
-    tar -xzf vendor/signal-cli.tar.gz -C vendor && rm -f vendor/signal-cli.tar.gz
-    echo "Installed JVM signal-cli to $JVM_CLI"
+  if curl -fSL --retry 3 --retry-delay 2 "$URL" -o vendor/signal-cli.tar.gz; then
+    # Extract to a staging dir and only swap it in once the jar is confirmed present,
+    # so a failure here leaves any previous working install untouched.
+    rm -rf vendor/.staging && mkdir -p vendor/.staging
+    if tar -xzf vendor/signal-cli.tar.gz -C vendor/.staging \
+       && compgen -G "vendor/.staging/signal-cli-${SIGNAL_CLI_VERSION}/lib/libsignal-client*.jar" >/dev/null; then
+      rm -rf "$JVM_DIR"
+      mv "vendor/.staging/signal-cli-${SIGNAL_CLI_VERSION}" "$JVM_DIR"
+      echo "Installed JVM signal-cli to $JVM_CLI"
+    else
+      echo "(Download was incomplete — the app will fall back to the native build.)"
+    fi
+    rm -rf vendor/.staging vendor/signal-cli.tar.gz
   else
     rm -f vendor/signal-cli.tar.gz
     echo "(Could not download the JVM build — the app will fall back to the native one.)"
