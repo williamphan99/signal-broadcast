@@ -281,5 +281,118 @@ class SyncGroupsTests(unittest.TestCase):
         self.assertIn("connect", str(ctx.exception).lower())
 
 
+class MessageStyleTests(unittest.TestCase):
+    """Signal measures style ranges in UTF-16 code units, not characters. Getting the
+    length wrong doesn't error — it silently styles the wrong span — so pin it down."""
+
+    def test_plain_is_no_metadata_at_all(self):
+        self.assertEqual(engine.message_text_styles("hello", "none"), [])
+
+    def test_italic_covers_the_whole_message(self):
+        self.assertEqual(engine.message_text_styles("hello", "italic"), ["0:5:ITALIC"])
+
+    def test_bold_italic_emits_two_overlapping_ranges(self):
+        self.assertEqual(engine.message_text_styles("hi", "bold_italic"),
+                         ["0:2:BOLD", "0:2:ITALIC"])
+
+    def test_emoji_counts_as_two_utf16_units(self):
+        # "hi 👋" is 4 Python characters but 5 UTF-16 code units — len() would style
+        # one unit short and leave the last half of the emoji unformatted.
+        self.assertEqual(engine.utf16_length("hi 👋"), 5)
+        self.assertEqual(engine.message_text_styles("hi 👋", "bold"), ["0:5:BOLD"])
+
+    def test_astral_only_message(self):
+        self.assertEqual(engine.message_text_styles("👋👋", "italic"), ["0:4:ITALIC"])
+
+    def test_empty_message_styles_nothing(self):
+        self.assertEqual(engine.message_text_styles("", "bold"), [])
+
+    def test_unknown_style_degrades_to_plain_rather_than_raising(self):
+        # A hand-edited config must never be able to block a broadcast.
+        self.assertEqual(engine.normalize_message_style("rainbow"), "none")
+        self.assertEqual(engine.message_text_styles("hello", "rainbow"), [])
+
+    def test_style_keys_are_forgiving_about_shape(self):
+        for raw in ("BOLD_ITALIC", "bold-italic", "  Bold Italic  "):
+            self.assertEqual(engine.normalize_message_style(raw), "bold_italic")
+
+    def test_every_labelled_style_is_a_real_key(self):
+        # The pickers are built from MESSAGE_STYLE_LABELS; a typo there would render a
+        # button that silently sends plain text.
+        self.assertEqual([k for k, _ in engine.MESSAGE_STYLE_LABELS],
+                         list(engine.MESSAGE_STYLES))
+
+
+class ErrorClassificationTests(unittest.TestCase):
+    """These labels are the ONLY thing the user sees about a failure, so a wrong one
+    sends them chasing the wrong problem. A bare "ssl" in the network pattern matched
+    the "ssL" inside "ClassLoader", so every Java stack trace read as a network fault
+    and a broken install hid behind "network or connection problem" for weeks."""
+
+    BROKEN_INSTALL = (
+        "java.lang.NoClassDefFoundError: org/signal/libsignal/internal/Native\n"
+        "\tat org.asamk.signal.manager.Manager.isSignalClientAvailable(Manager.java:81)\n"
+        "Caused by: java.lang.ClassNotFoundException: org.signal.libsignal.internal.Native\n"
+        "\tat java.base/jdk.internal.loader.BuiltinClassLoader.loadClass(BuiltinClassLoader.java:580)")
+
+    def test_classloader_stack_trace_is_not_a_network_problem(self):
+        self.assertNotIn("network", engine.classify_error(self.BROKEN_INSTALL))
+
+    def test_broken_install_says_so(self):
+        self.assertIn("install", engine.classify_error(self.BROKEN_INSTALL))
+
+    def test_wrong_java_version_is_also_a_broken_install(self):
+        self.assertIn("install", engine.classify_error(
+            "UnsupportedClassVersionError: org/asamk/signal/Main has been compiled by a "
+            "more recent version of the Java Runtime"))
+
+    def test_our_own_account_deregistered_is_not_blamed_on_the_recipient(self):
+        # "User +61… is not registered" is OUR account being removed from the phone's
+        # Linked Devices. Labelling it a recipient problem hides the one fix: re-link.
+        label = engine.classify_error("User +61415747310 is not registered.")
+        self.assertIn("re-link", label)
+        self.assertNotIn("recipient", label)
+
+    def test_genuine_network_errors_still_classify_as_network(self):
+        for err in ("javax.net.ssl.SSLHandshakeException: bad cert",
+                    "java.net.SocketException: Failed to get response for request",
+                    "java.net.ConnectException: Connection refused",
+                    "no route to host"):
+            self.assertEqual(engine.classify_error(err), "network or connection problem", err)
+
+
+class BundledBinaryTests(unittest.TestCase):
+    """A vendored signal-cli whose lib/ is missing libsignal-client can't run at all.
+    Preferring it over a working signal-cli on PATH makes every send fail until someone
+    notices the directory — so an unusable bundle must report as absent."""
+
+    def _vendor(self, tmp, jars):
+        lib = Path(tmp) / "signal-cli-0.14.5" / "lib"
+        lib.mkdir(parents=True)
+        for j in jars:
+            (lib / j).touch()
+        binary = Path(tmp) / "signal-cli-0.14.5" / "bin" / "signal-cli"
+        binary.parent.mkdir(parents=True)
+        binary.touch()
+        return binary
+
+    def test_incomplete_bundle_reports_absent_so_we_fall_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._vendor(tmp, ["libsignal-cli-0.14.5.jar", "jackson-core-2.20.2.jar"])
+            with mock.patch.object(engine, "VENDOR_DIR", Path(tmp)):
+                self.assertIsNone(engine._jvm_signal_cli())
+
+    def test_complete_bundle_is_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = self._vendor(tmp, ["libsignal-client-0.83.1.jar", "libsignal-cli-0.14.5.jar"])
+            with mock.patch.object(engine, "VENDOR_DIR", Path(tmp)):
+                self.assertEqual(engine._jvm_signal_cli(), binary)
+
+    def test_missing_vendor_dir_is_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(engine, "VENDOR_DIR", Path(tmp) / "nope"):
+                self.assertIsNone(engine._jvm_signal_cli())
+
+
 if __name__ == "__main__":
     unittest.main()

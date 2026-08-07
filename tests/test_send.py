@@ -23,6 +23,7 @@ class FakeDaemon:
     per group id; records call counts so we can assert "no retry"."""
     plan: dict = {}            # gid -> list of (ok, throttled, err) to return in order
     calls: dict = {}           # gid -> attempt count
+    styles: dict = {}          # gid -> text_styles passed on the last send
     _lock = threading.Lock()   # calls[] is bumped from K worker threads in parallel mode
 
     def __init__(self, account, start_timeout=30.0):
@@ -31,9 +32,10 @@ class FakeDaemon:
     def is_running(self) -> bool:
         return True
 
-    def send(self, gid, msg, atts):
+    def send(self, gid, msg, atts, text_styles=None):
         with FakeDaemon._lock:
             FakeDaemon.calls[gid] = FakeDaemon.calls.get(gid, 0) + 1
+            FakeDaemon.styles[gid] = text_styles
             n = FakeDaemon.calls[gid]
         seq = FakeDaemon.plan.get(gid, [(True, False, "")])
         return seq[min(n - 1, len(seq) - 1)]
@@ -46,6 +48,7 @@ class SendPathTests(unittest.TestCase):
     def setUp(self):
         FakeDaemon.plan = {}
         FakeDaemon.calls = {}
+        FakeDaemon.styles = {}
         self._orig = (engine.signal_cli_bin, engine.unsendable_groups,
                       engine.SignalCliDaemon, engine._send_one,
                       engine.MIN_DELAY_S, engine.NON_THROTTLE_WAIT_S)
@@ -183,7 +186,7 @@ class SendPathTests(unittest.TestCase):
 
     def test_marker_survives_a_run_that_aborts_with_an_error(self):
         class Boom(FakeDaemon):
-            def send(self, gid, msg, atts):
+            def send(self, gid, msg, atts, text_styles=None):
                 raise RuntimeError("boom")
         engine.SignalCliDaemon = Boom
         with self.assertRaises(Exception):
@@ -211,13 +214,13 @@ class SendPathTests(unittest.TestCase):
         # Daemon both times out AND reports dead: the fallback must NOT re-send (the
         # timed-out message may already have gone out) — it stays uncertain.
         resends = []
-        engine._send_one = lambda b, a, gid, m, at: (resends.append(gid), (True, False, ""))[1]
+        engine._send_one = lambda b, a, gid, m, at, st=None: (resends.append(gid), (True, False, ""))[1]
 
         class DeadAfterTimeout(FakeDaemon):
             def is_running(self):
                 return False
 
-            def send(self, gid, msg, atts):
+            def send(self, gid, msg, atts, text_styles=None):
                 FakeDaemon.calls[gid] = FakeDaemon.calls.get(gid, 0) + 1
                 return (False, False, "daemon timed out after 300s")
 
@@ -232,7 +235,7 @@ class SendPathTests(unittest.TestCase):
         observed = {}
 
         class Spy(FakeDaemon):
-            def send(self, gid, msg, atts):
+            def send(self, gid, msg, atts, text_styles=None):
                 data = json.loads(engine.RUN_PROGRESS_FILE.read_text(encoding="utf-8"))
                 observed[gid] = data["done"].get(gid)
                 return (True, False, "")
@@ -273,13 +276,13 @@ class SendPathTests(unittest.TestCase):
         # A write that broke after the request line went out may already have dispatched;
         # it must be uncertain, never re-sent one-shot.
         resends = []
-        engine._send_one = lambda b, a, gid, m, at: (resends.append(gid), (True, False, ""))[1]
+        engine._send_one = lambda b, a, gid, m, at, st=None: (resends.append(gid), (True, False, ""))[1]
 
         class WriteBroke(FakeDaemon):
             def is_running(self):
                 return False
 
-            def send(self, gid, msg, atts):
+            def send(self, gid, msg, atts, text_styles=None):
                 FakeDaemon.calls[gid] = FakeDaemon.calls.get(gid, 0) + 1
                 return (False, False, "daemon send may have dispatched (write failed): EPIPE")
 
@@ -292,13 +295,13 @@ class SendPathTests(unittest.TestCase):
         # If the daemon was already down before we wrote, nothing left us — re-sending
         # this one group via per-send is safe (no duplicate risk).
         oneshot = []
-        engine._send_one = lambda b, a, gid, m, at: (oneshot.append(gid), (True, False, ""))[1]
+        engine._send_one = lambda b, a, gid, m, at, st=None: (oneshot.append(gid), (True, False, ""))[1]
 
         class DeadNotRunning(FakeDaemon):
             def is_running(self):
                 return False
 
-            def send(self, gid, msg, atts):
+            def send(self, gid, msg, atts, text_styles=None):
                 FakeDaemon.calls[gid] = FakeDaemon.calls.get(gid, 0) + 1
                 return (False, False, "signal-cli daemon is not running")
 
@@ -313,13 +316,13 @@ class SendPathTests(unittest.TestCase):
         # retired and the rest of the run goes one-shot.
         closed = []
         oneshot = []
-        engine._send_one = lambda b, a, gid, m, at: (oneshot.append(gid), (True, False, ""))[1]
+        engine._send_one = lambda b, a, gid, m, at, st=None: (oneshot.append(gid), (True, False, ""))[1]
 
         class TimeoutThenOk(FakeDaemon):
             def close(self):
                 closed.append(True)
 
-            def send(self, gid, msg, atts):
+            def send(self, gid, msg, atts, text_styles=None):
                 FakeDaemon.calls[gid] = FakeDaemon.calls.get(gid, 0) + 1
                 if gid == "g1":
                     return (False, False, "daemon timed out after 120s")
@@ -415,6 +418,69 @@ class AttachmentWipeTests(unittest.TestCase):
         engine._delete_listed_attachments(self.tmp / "nope.txt")  # must not raise
 
 
+class TextStyleDeliveryTests(unittest.TestCase):
+    """The style must survive every route a message can take to signal-cli. The
+    parallel path binds the daemon's send directly, so it's the one that can silently
+    drop the styling while the sequential path looks fine."""
+
+    def setUp(self):
+        FakeDaemon.plan = {}
+        FakeDaemon.calls = {}
+        FakeDaemon.styles = {}
+        self._orig = (engine.signal_cli_bin, engine.unsendable_groups,
+                      engine.SignalCliDaemon, engine._send_one, engine.MIN_DELAY_S,
+                      engine._reap_orphan_signal_cli)
+        engine.signal_cli_bin = lambda: "/usr/bin/true"
+        engine.unsendable_groups = lambda account: set()
+        engine.SignalCliDaemon = FakeDaemon
+        engine.MIN_DELAY_S = 0.0
+
+    def tearDown(self):
+        (engine.signal_cli_bin, engine.unsendable_groups, engine.SignalCliDaemon,
+         engine._send_one, engine.MIN_DELAY_S,
+         engine._reap_orphan_signal_cli) = self._orig
+        engine.clear_run_progress()
+
+    def _run(self, style, message="hello", K=1):
+        cfg = engine.Config(account="+test", base_delay_seconds=0.0, jitter_seconds=0.0,
+                            cooldown_hours=0, max_retries=4, send_times=[],
+                            concurrent_sends=K, message_style=style)
+        engine.broadcast(config=cfg, groups=[("g1", "a"), ("g2", "b")],
+                         message=message, attachments=[])
+
+    def test_italic_reaches_the_daemon_sequentially(self):
+        self._run("italic")
+        self.assertEqual(FakeDaemon.styles["g1"], ["0:5:ITALIC"])
+
+    def test_italic_reaches_the_daemon_in_parallel(self):
+        self._run("italic", K=3)
+        self.assertEqual(FakeDaemon.styles["g1"], ["0:5:ITALIC"])
+        self.assertEqual(FakeDaemon.styles["g2"], ["0:5:ITALIC"])
+
+    def test_plain_sends_no_style_metadata(self):
+        self._run("none")
+        self.assertFalse(FakeDaemon.styles["g1"])
+
+    def test_offsets_use_utf16_units_end_to_end(self):
+        self._run("bold", message="hi 👋")
+        self.assertEqual(FakeDaemon.styles["g1"], ["0:5:BOLD"])
+
+    def test_one_shot_fallback_still_carries_the_style(self):
+        # Daemon unavailable -> per-send subprocess path. It must style too, or a
+        # broadcast that falls back would quietly send everything plain.
+        seen = []
+
+        def boom(account, start_timeout=30.0):
+            raise engine.BroadcastError("no daemon")
+
+        engine.SignalCliDaemon = boom
+        engine._reap_orphan_signal_cli = lambda *a: False  # never touch real processes
+        engine._send_one = lambda binary, acct, gid, msg, atts, styles=None: (
+            seen.append(styles) or (True, False, ""))
+        self._run("bold_italic")
+        self.assertEqual(seen[0], ["0:5:BOLD", "0:5:ITALIC"])
+
+
 class ConcurrentSendTests(unittest.TestCase):
     """Parallel sending (concurrent_sends > 1). The whole point of these is the one
     invariant that must never break under concurrency: every group is sent EXACTLY
@@ -424,6 +490,7 @@ class ConcurrentSendTests(unittest.TestCase):
     def setUp(self):
         FakeDaemon.plan = {}
         FakeDaemon.calls = {}
+        FakeDaemon.styles = {}
         self._orig = (engine.signal_cli_bin, engine.unsendable_groups,
                       engine.SignalCliDaemon, engine._send_one,
                       engine.MIN_DELAY_S, engine.NON_THROTTLE_WAIT_S)
@@ -536,7 +603,7 @@ class ConcurrentSendTests(unittest.TestCase):
         # deadlock on the account lock. K is forced to 1 and the per-send path is used.
         engine.SignalCliDaemon = lambda *a, **k: (_ for _ in ()).throw(engine.BroadcastError("no daemon"))
         seen = []
-        engine._send_one = lambda b, acc, gid, m, a: (seen.append(gid) or (True, False, ""))
+        engine._send_one = lambda b, acc, gid, m, a, st=None: (seen.append(gid) or (True, False, ""))
         res = self._run([("g1", "a"), ("g2", "b")], K=2)
         self.assertEqual(sorted(seen), ["g1", "g2"], "per-send used for every group")
         self.assertTrue(all(r.ok for r in res))

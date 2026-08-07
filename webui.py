@@ -143,6 +143,9 @@ def create_app(state: _State | None = None) -> Flask:
             "groups_total": len(entries),
             "groups_enabled": sum(1 for e in entries if e.enabled),
             "message": _safe(engine.read_message, ""),
+            "message_style": getattr(cfg, "message_style", engine.DEFAULT_MESSAGE_STYLE)
+                             if cfg else engine.DEFAULT_MESSAGE_STYLE,
+            "styles": [{"key": k, "label": l} for k, l in engine.MESSAGE_STYLE_LABELS],
             "attachments": [Path(p).name for p in _safe(engine.read_attachments, [])],
             "base_delay": getattr(cfg, "base_delay_seconds", 10) if cfg else 10,
             "jitter": getattr(cfg, "jitter_seconds", 3) if cfg else 3,
@@ -156,6 +159,15 @@ def create_app(state: _State | None = None) -> Flask:
         data = request.get_json(force=True, silent=True) or {}
         engine.write_message(str(data.get("message", "")))
         return jsonify(ok=True)
+
+    @app.post("/api/style")
+    def api_style():
+        """The whole-message text style. Kept separate from /api/message because that
+        one fires on every keystroke (debounced) — the style only changes on a tap."""
+        data = request.get_json(force=True, silent=True) or {}
+        style = engine.normalize_message_style(data.get("style"))
+        engine.set_config_value("message_style", style)
+        return jsonify(ok=True, style=style)
 
     @app.post("/api/upload")
     def api_upload():
@@ -741,6 +753,19 @@ PAGE = r"""<!doctype html>
   .saved{color:var(--ok);font-weight:600;font-size:12px;transition:opacity .3s}
   .attrow{display:flex;gap:8px;margin-top:10px}
   .attrow .btn{flex:1}
+  .stylerow{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+  .stylebtn{border-radius:999px;padding:7px 13px;font-size:13px;font-weight:600;cursor:pointer;
+    background:transparent;border:1px solid var(--line);color:var(--muted)}
+  .stylebtn.on{color:var(--fg);border-color:var(--accent);background:rgba(47,199,212,.14)}
+  .stylebtn:active{transform:translateY(1px)}
+  /* Live preview: the box shows roughly what Signal will render. Spoiler has no
+     equivalent (Signal hides it until tapped) and blurring the box you're typing in
+     would be unusable, so it previews as plain text and the hint explains it. */
+  #msg.s-italic{font-style:italic}
+  #msg.s-bold{font-weight:700}
+  #msg.s-bold_italic{font-weight:700;font-style:italic}
+  #msg.s-monospace{font-family:ui-monospace,Menlo,Consolas,monospace}
+  #msg.s-strikethrough{text-decoration:line-through}
   .atts{margin-top:10px;display:flex;flex-wrap:wrap;gap:6px}
   .pill{display:inline-flex;align-items:center;gap:5px;background:var(--bg);border:1px solid var(--line);
     border-radius:999px;padding:4px 11px;font-size:13px;max-width:100%}
@@ -930,6 +955,8 @@ PAGE = r"""<!doctype html>
       <div class="card">
         <div class="card-h">Your message <span id="saved" class="saved hidden">Saved ✓</span></div>
         <textarea id="msg" placeholder="Type the message you want to broadcast…" oninput="onMsgInput()"></textarea>
+        <div id="styleRow" class="stylerow"></div>
+        <div id="styleHint" class="muted small" style="margin-top:6px"></div>
         <div class="attrow">
           <button class="btn ghost sm" onclick="pickImgs()">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.6"/><path d="m21 15-5-5L5 21"/></svg>
@@ -1084,6 +1111,7 @@ async function refreshState(manual){
   }
   $('#acct2').textContent=S.account||'—';
   if(document.activeElement!==$('#msg'))$('#msg').value=S.message||'';
+  renderStyles();
   renderAtts(S.attachments||[]);
   updateSendUI();
   if(S.send&&S.send.running){startPolling();}
@@ -1110,6 +1138,29 @@ function updateSendUI(){
   btn.disabled = en===0 || running;
   const est=Math.round((en*(S.base_delay||10))/60);
   $('#est').textContent = (en>0 && !running) ? ('About '+(est<1?'under a minute':(est+' min'))+' · keep the phone on') : '';
+}
+
+// ---------------- message style ----------------
+// Signal ships formatting as separate range metadata, not inside the text, so this
+// picker is the only way to send italics — pasting styled text can't carry it.
+function renderStyles(){
+  const opts=S.styles||[], cur=S.message_style||'none', row=$('#styleRow');
+  // Rebuild only when the option set changes; the state poll runs every couple of
+  // seconds and blowing away the buttons each time would eat taps.
+  if(row.childElementCount!==opts.length){
+    row.innerHTML=opts.map(s=>'<button class="stylebtn" data-k="'+esc(s.key)+'" onclick="setStyle(\''+s.key+'\')">'+esc(s.label)+'</button>').join('');
+  }
+  $$('#styleRow .stylebtn').forEach(b=>b.classList.toggle('on',b.dataset.k===cur));
+  $('#msg').className='s-'+cur;
+  const label=((opts.find(s=>s.key===cur)||{}).label||cur).toLowerCase();
+  $('#styleHint').textContent = cur==='spoiler'
+    ? 'Sent hidden — recipients tap to reveal it.'
+    : (cur==='none' ? '' : 'The whole message is sent as '+label+'.');
+}
+async function setStyle(key){
+  S.message_style=key; renderStyles();   // optimistic: the tap should feel instant
+  const r=await api('/api/style',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({style:key})});
+  if(r.__neterr){ toast('Couldn’t save the style','err'); }
 }
 
 function renderAtts(a){

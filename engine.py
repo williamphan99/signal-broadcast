@@ -58,7 +58,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.15.9"
+APP_VERSION = "1.16.0"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -142,6 +142,28 @@ MIN_DELAY_S = 10.0               # hard floor: never send faster than this, what
 # Opt-in via config.toml / Security tab; capped here so no config can over-parallelise.
 MAX_CONCURRENT_SENDS = 5
 
+# Message styling. Signal does NOT carry formatting inside the text — there is no
+# character sequence that means "italic". The style travels as separate ranges
+# ("start:length:STYLE") sent alongside a plain string, which is why pasting styled
+# text into the box can never work. We offer one style for the WHOLE message, which
+# is all the UI exposes; the value below is the key stored in config.toml.
+MESSAGE_STYLES: dict[str, tuple[str, ...]] = {
+    "none":          (),
+    "italic":        ("ITALIC",),
+    "bold":          ("BOLD",),
+    "bold_italic":   ("BOLD", "ITALIC"),
+    "monospace":     ("MONOSPACE",),
+    "strikethrough": ("STRIKETHROUGH",),
+    "spoiler":       ("SPOILER",),
+}
+DEFAULT_MESSAGE_STYLE = "none"
+# Human labels for the pickers in both front-ends, in the order they're shown.
+MESSAGE_STYLE_LABELS: tuple[tuple[str, str], ...] = (
+    ("none", "Normal"), ("italic", "Italic"), ("bold", "Bold"),
+    ("bold_italic", "Bold italic"), ("monospace", "Monospace"),
+    ("strikethrough", "Strikethrough"), ("spoiler", "Spoiler"),
+)
+
 
 class BroadcastError(Exception):
     """Recoverable, user-facing problem (bad config, missing file, no signal-cli)."""
@@ -158,6 +180,32 @@ StopFn = Callable[[], bool]
 StartFn = Callable[[int, str], None]
 
 
+def normalize_message_style(value: object) -> str:
+    """Any stored/posted style value -> a key of MESSAGE_STYLES. Anything unknown
+    (hand-edited config, stale front-end) falls back to plain rather than raising —
+    a bad style must never be able to block a broadcast."""
+    key = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return key if key in MESSAGE_STYLES else DEFAULT_MESSAGE_STYLE
+
+
+def utf16_length(text: str) -> int:
+    """Length in UTF-16 code units — the unit Signal's style ranges are measured in.
+    This is NOT len(): anything outside the BMP (most emoji) counts as 2, so a message
+    with an emoji in it would otherwise be styled a character or more short."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def message_text_styles(message: str, style: str) -> list[str]:
+    """The signal-cli style ranges covering the whole message: ["0:12:BOLD", ...],
+    passed as --text-style (one-shot) or textStyle (daemon). An empty list means send
+    with no styling metadata at all, exactly as before this feature existed."""
+    names = MESSAGE_STYLES.get(normalize_message_style(style), ())
+    length = utf16_length(message)
+    if not names or length == 0:
+        return []
+    return [f"0:{length}:{name}" for name in names]
+
+
 @dataclass
 class Config:
     account: str
@@ -169,6 +217,7 @@ class Config:
     debug: bool = False  # write raw signal-cli errors to logs/debug-*.txt
     wipe_on_close: bool = False  # erase all data when the app is quit (armed in Security)
     concurrent_sends: int = 1  # whole-group sends in flight at once (1 = safe default; up to 5)
+    message_style: str = DEFAULT_MESSAGE_STYLE  # style applied to the whole message
 
 
 @dataclass
@@ -262,6 +311,7 @@ def load_config() -> Config:
         # and a bad/zero value falls back to the safe one-at-a-time default.
         concurrent_sends=max(1, min(MAX_CONCURRENT_SENDS,
                                     _config_num(raw, "concurrent_sends", 1, int))),
+        message_style=normalize_message_style(raw.get("message_style", DEFAULT_MESSAGE_STYLE)),
     )
 
 
@@ -586,12 +636,23 @@ SIGNAL_CLI_RUNTIME_OPTS = ["-XX:StackSize=16m"]
 
 
 def _jvm_signal_cli() -> Path | None:
-    """The bundled JVM build's launcher, if Setup installed one. Preferred over the
-    Homebrew native build because the native build crashes on some group sends."""
+    """The bundled JVM build's launcher, if Setup installed a COMPLETE one. Preferred
+    over the Homebrew native build because the native build crashes on some group sends.
+
+    The completeness check matters: a half-populated lib/ (interrupted Setup, a partial
+    copy, a sync that skipped big files) still leaves bin/signal-cli sitting there
+    looking installed, but every invocation dies with NoClassDefFoundError before it
+    reaches the network. Preferring that over a working signal-cli on PATH makes every
+    send fail for as long as the broken directory exists. If the launcher can't work,
+    report it as absent so the caller falls back."""
     if not VENDOR_DIR.is_dir():
         return None
-    found = sorted(VENDOR_DIR.glob("signal-cli-*/bin/signal-cli"))
-    return found[-1] if found else None
+    for launcher in sorted(VENDOR_DIR.glob("signal-cli-*/bin/signal-cli"), reverse=True):
+        # libsignal-client carries org.signal.libsignal.internal.Native, which
+        # signal-cli loads on startup for ANY command. No jar, nothing works.
+        if any((launcher.parent.parent / "lib").glob("libsignal-client*.jar")):
+            return launcher
+    return None
 
 
 def _termux_prefix() -> str:
@@ -994,13 +1055,18 @@ def unsendable_groups(account: str) -> set[str]:
 # --------------------------------------------------------------------------- #
 # Sending
 # --------------------------------------------------------------------------- #
-def _send_one(binary: str, account: str, group_id: str,
-              message: str, attachments: list[str]) -> tuple[bool, bool, str]:
+def _send_one(binary: str, account: str, group_id: str, message: str,
+              attachments: list[str],
+              text_styles: list[str] | None = None) -> tuple[bool, bool, str]:
     """Send to one group. Returns (ok, throttled, stderr)."""
     cmd = _cli(binary, "-a", account, "--config", str(DATA_DIR),
                "send", "-g", group_id, "-m", message)
     if attachments:
         cmd += ["-a", *attachments]
+    # Last: both -a and --text-style take a variable number of values, so the flag
+    # that follows is what terminates the previous one's list.
+    if text_styles:
+        cmd += ["--text-style", *text_styles]
     try:
         # errors="replace": signal-cli can emit non-UTF-8 bytes (names, locale text)
         proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
@@ -1167,7 +1233,8 @@ class SignalCliDaemon:
         mid, box = self._dispatch(method, params)
         return self._await(mid, box, timeout, keep_listening=False)
 
-    def send(self, group_id: str, message: str, attachments: list[str]) -> tuple[bool, bool, str]:
+    def send(self, group_id: str, message: str, attachments: list[str],
+             text_styles: list[str] | None = None) -> tuple[bool, bool, str]:
         """Send to one group. Same (ok, throttled, err) shape as the one-shot _send_one.
         If the send times out, signal-cli is probably still finishing it — wait a
         bounded grace (CONFIRM_GRACE_S) for its late reply and return the REAL verdict
@@ -1177,6 +1244,9 @@ class SignalCliDaemon:
         params: dict = {"groupId": group_id, "message": message}
         if attachments:
             params["attachment"] = list(attachments)
+        if text_styles:
+            # JSON-RPC name for --text-style: signal-cli camel-cases the CLI dest.
+            params["textStyle"] = list(text_styles)
         try:
             mid, box = self._dispatch("send", params)
         except BroadcastError as exc:
@@ -1253,8 +1323,21 @@ ADMIN_ONLY_PATTERN = re.compile(
 # text (it can contain a group id or recipient number) — only the category here.
 _ERROR_CATEGORIES = [
     (ADMIN_ONLY_PATTERN, "admin-only group (you can't post here)"),
+    # BEFORE the network pattern: a broken signal-cli install can't send anything, and
+    # calling it a network problem sends you chasing the wrong thing for weeks. This is
+    # a missing/incomplete lib dir (e.g. no libsignal-client jar) — reinstall, not retry.
+    (re.compile(r"NoClassDefFoundError|ClassNotFoundException|UnsupportedClassVersionError|"
+                r"LinkageError", re.I),
+     "signal-cli install is broken — run Setup again"),
+    # Also before the network pattern: "User +61… is not registered" is about OUR OWN
+    # account, not the recipient. It means this device was removed from the phone's
+    # Linked Devices, and only re-linking fixes it.
+    (re.compile(r"user\s+\S+\s+is not registered", re.I),
+     "this device is no longer linked to Signal — re-link it"),
+    # \bssl\b, not bare "ssl": unanchored, it matched the "ssL" inside "ClassLoader",
+    # so every Java stack trace was mislabelled a network problem.
     (re.compile(r"timed?\s*out|timeout|connection|unreachable|unknownhost|refused|"
-                r"no route to host|noroutetohost|ssl|certificate|\bcdn\b|\bdns\b|"
+                r"no route to host|noroutetohost|\bssl\b|certificate|\bcdn\b|\bdns\b|"
                 r"socket|io\s*exception|broken pipe|reset by peer|end of stream|"
                 r"failed to get response", re.I),
      "network or connection problem"),
@@ -1422,6 +1505,10 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
     binary = signal_cli_bin()
     delay = base_delay if base_delay is not None else config.base_delay_seconds
     results: list[GroupSendResult] = []
+    # Computed once for the run: the message text is identical for every group, so the
+    # ranges are too. Empty unless the user picked a style, so a plain send is byte-for
+    # -byte what it always was.
+    text_styles = message_text_styles(message, config.message_style)
 
     # Guarantee at most ONE send per group, even if the list has duplicates — a group
     # listed twice (e.g. two enabled lines in groups.txt) would otherwise be delivered
@@ -1474,8 +1561,8 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
         def send_one(gid: str, msg: str, atts: list[str]) -> tuple[bool, bool, str]:
             nonlocal daemon
             if daemon is None:
-                return _send_one(binary, config.account, gid, msg, atts)
-            res = daemon.send(gid, msg, atts)
+                return _send_one(binary, config.account, gid, msg, atts, text_styles)
+            res = daemon.send(gid, msg, atts, text_styles)
             ok, err = res[0], res[2]
             if ok:
                 return res
@@ -1497,7 +1584,7 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
                     on_log("signal-cli send was abandoned mid-flight; per-send for the rest.")
                     return res
                 on_log("signal-cli daemon stopped; falling back to per-send.")
-                return _send_one(binary, config.account, gid, msg, atts)
+                return _send_one(binary, config.account, gid, msg, atts, text_styles)
             return res
 
         # Parallelism: one at a time (1) unless the user opted in AND the daemon is up.
@@ -1526,7 +1613,9 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
             the remaining sends fail cleanly (the request never left us) — resendable,
             not duplicated."""
             assert daemon is not None                   # K >= 2 only when the daemon is up
-            send_fn = daemon.send
+            d = daemon                                  # bind: the nonlocal can't change here
+            def send_fn(gid: str, msg: str, atts: list[str]) -> tuple[bool, bool, str]:
+                return d.send(gid, msg, atts, text_styles)
             prog_lock = threading.Lock()                # guards results + the progress file
             launch_lock = threading.Lock()              # paces the launch of NEW sends
             next_launch = [0.0]
@@ -1590,7 +1679,9 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
         try:
             on_log(f"Broadcasting to {total} groups | {len(attachments)} attachment(s) | "
                    f"~{delay:.0f}s minimum between sends"
-                   + (f" | up to {K} at once" if K >= 2 else ""))
+                   + (f" | up to {K} at once" if K >= 2 else "")
+                   + (f" | {dict(MESSAGE_STYLE_LABELS)[config.message_style].lower()} text"
+                      if text_styles else ""))
             if K >= 2:
                 run_parallel()
             else:

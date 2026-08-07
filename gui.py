@@ -137,11 +137,18 @@ class App(tk.Tk):
         # close/unplug. Message TEXT is still never logged. disk_msg stays as a safety
         # valve to write a different (e.g. counts-only) version to disk if ever needed.
         stamp = datetime.now().strftime("%H:%M:%S")
-        self.log_box.configure(state="normal")
-        self.log_box.insert("end", f"{stamp}  ", "muted")
-        self.log_box.insert("end", msg + "\n", tag)
-        self.log_box.see("end")
-        self.log_box.configure(state="disabled")
+        # The on-screen box may already be destroyed (we routed to the link screen).
+        # That must never lose the disk line, and must never raise — _log is what the
+        # event pump calls to REPORT a failure, so throwing here turns one bad event
+        # into an unhandled traceback on every poll.
+        try:
+            self.log_box.configure(state="normal")
+            self.log_box.insert("end", f"{stamp}  ", "muted")
+            self.log_box.insert("end", msg + "\n", tag)
+            self.log_box.see("end")
+            self.log_box.configure(state="disabled")
+        except tk.TclError:
+            pass
         engine.append_activity(msg if disk_msg is None else disk_msg)
 
     def _clear_activity(self) -> None:
@@ -406,6 +413,23 @@ class App(tk.Tk):
             self.msg_text.insert("1.0", engine.read_message())
         except engine.BroadcastError:
             pass
+
+        # Style picker. Signal carries formatting as separate range metadata, not in the
+        # text, so this is the only way to send italics — pasting styled text can't work.
+        # The choice applies to the whole message and is saved to config.toml straight
+        # away, so a scheduled auto-send uses it too.
+        style_row = ttk.Frame(tab)
+        style_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(style_row, text="Style", foreground=PALETTE["muted"]).pack(side="left", padx=(0, 8))
+        try:
+            current = engine.load_config().message_style
+        except engine.BroadcastError:
+            current = engine.DEFAULT_MESSAGE_STYLE
+        self.style_var = tk.StringVar(value=current)
+        for key, label in engine.MESSAGE_STYLE_LABELS:
+            ttk.Radiobutton(style_row, text=label, value=key, variable=self.style_var,
+                            command=self._on_style_change).pack(side="left", padx=(0, 6))
+        self._apply_style_preview()
 
         img_row = ttk.Frame(tab)
         img_row.pack(fill="x", pady=(12, 2))
@@ -978,6 +1002,27 @@ class App(tk.Tk):
                 self.show_link()
         self.after(2000, self._health_tick)
 
+    # ----------------------------------------------------------- message style
+    def _apply_style_preview(self) -> None:
+        """Show the chosen style in the message box itself. It's an approximation —
+        Signal does the real rendering — but it's enough to see what you're sending.
+        Spoiler has no font equivalent (Signal hides it behind a tap), so it previews
+        as normal text."""
+        spec = {
+            "italic":        ("", 13, "italic"),
+            "bold":          ("", 13, "bold"),
+            "bold_italic":   ("", 13, "bold italic"),
+            "monospace":     ("Menlo", 12),
+            "strikethrough": ("", 13, "overstrike"),
+        }.get(self.style_var.get(), ("", 13))
+        self.msg_text.configure(font=spec)
+
+    def _on_style_change(self) -> None:
+        style = engine.normalize_message_style(self.style_var.get())
+        engine.set_config_value("message_style", style)  # so auto-send uses it too
+        self._apply_style_preview()
+        self._log(f"Style: {dict(engine.MESSAGE_STYLE_LABELS)[style]}.", "muted")
+
     # --------------------------------------------------------------- sending
     def _on_save(self) -> None:
         """Persist the message + images without sending, so the scheduled run
@@ -1026,6 +1071,8 @@ class App(tk.Tk):
         preview = next((ln for ln in message.splitlines() if ln.strip()), "")[:80]
         imgs = len(attachments)
         img_note = f"{imgs} image(s) attached." if imgs else "No images (text only)."
+        if cfg.message_style != engine.DEFAULT_MESSAGE_STYLE:
+            img_note += f"\nSent as {dict(engine.MESSAGE_STYLE_LABELS)[cfg.message_style].lower()}."
         mins = max(1, round(len(groups) * max(engine.MIN_DELAY_S, cfg.base_delay_seconds) / 60))
         return messagebox.askyesno("Send now?",
             f"Send to {len(groups)} groups?\n\n“{preview}”\n{img_note}\n\n"
@@ -1219,7 +1266,18 @@ class App(tk.Tk):
         finally:
             self.after(80, self._poll)
 
+    # Events produced by main-screen work (sends, group syncs). Routing to the link
+    # screen destroys those widgets, but a worker thread mid-flight keeps queueing
+    # these — rendering one into a destroyed widget raises TclError. Drop them instead:
+    # the work they'd report on belongs to a screen that no longer exists.
+    _MAIN_SCREEN_EVENTS = frozenset({
+        "log", "group_start", "progress", "send_done",
+        "refresh_status", "refresh_done", "update_done", "group_perms",
+    })
+
     def _handle(self, kind: str, payload) -> None:
+        if kind in self._MAIN_SCREEN_EVENTS and self._screen != "main":
+            return
         if kind == "qr":
             try:
                 self._qr_img = tk.PhotoImage(file=payload)
