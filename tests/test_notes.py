@@ -320,6 +320,25 @@ class NotesSurviveTheGroupSync(unittest.TestCase):
         engine._save_notes_seen_during(envelope(dm))
         self.assertEqual(engine.read_notes(), [])
 
+    def test_two_writers_at_once_never_lose_a_note(self):
+        """The sync's worker thread and the window both read-modify-write this file.
+        Unsynchronised, the last writer wins and silently drops the other's note."""
+        import threading
+        engine.write_notes([])
+        barrier = threading.Barrier(8)
+
+        def add(i):
+            barrier.wait()          # maximise the overlap
+            engine.store_notes([{"ts": 1000 + i, "text": f"note {i}", "photos": [],
+                                 "missing_photos": 0, "expires": 0}])
+
+        threads = [threading.Thread(target=add, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(engine.read_notes()), 8)
+
     def test_a_notes_failure_can_never_break_a_sync(self):
         engine.NOTES_FILE = Path(self.tmp.name) / "no-such-dir" / "notes.json"
         engine._save_notes_seen_during(envelope(note("x")))   # must not raise

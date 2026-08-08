@@ -10,7 +10,7 @@ attachments.txt
 
 # Notes copied from the phone's "Note to Self" — personal text. Never commit.
 notes.json
-notes.json.tmp
+notes.json*.tmp
 notes.corrupt.json
 
 # Generated launchd job (machine-specific paths)

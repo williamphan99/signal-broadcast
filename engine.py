@@ -58,7 +58,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.18.4"
+APP_VERSION = "1.18.5"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -1076,6 +1076,11 @@ def unsendable_groups(account: str) -> set[str]:
 # stored, or logged — not the text, not the recipient.
 NOTES_FILE = PROJECT_DIR / "notes.json"
 NOTES_CORRUPT_FILE = PROJECT_DIR / "notes.corrupt.json"   # a file we couldn't parse
+# Notes are written from two places at once: the group sync keeps what it sees from a
+# worker thread while the window can delete or store on the main one. Both do
+# read-modify-write, so without this a delete could resurrect a note, or a note landing
+# mid-sync could be dropped. Reentrant because store_notes() reads and writes under it.
+_NOTES_LOCK = threading.RLock()
 NOTES_BURST_S = 10        # signal-cli's own idle cap for one notes drain
 NOTES_TIMEOUT_S = 180     # hard kill-switch; a note's photos have to download inside it
 NOTES_KEEP = 300          # most recent notes retained
@@ -1242,6 +1247,11 @@ def read_notes() -> list[dict]:
     would otherwise overwrite it, turning a recoverable file into a permanent loss of
     everything you'd collected. Notes can't be re-fetched — the server delivers each
     message to this device once — so they're unrecoverable if this drops them."""
+    with _NOTES_LOCK:
+        return _read_notes_locked()
+
+
+def _read_notes_locked() -> list[dict]:
     try:
         data = json.loads(NOTES_FILE.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -1266,10 +1276,27 @@ def write_notes(notes: list[dict]) -> None:
     A plain write truncates first, so a crash or a full disk mid-write leaves a
     half-written file, which read_notes can only treat as damaged. os.replace is atomic
     on the same filesystem: readers see either the old file or the new one."""
-    NOTES_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = NOTES_FILE.with_name(NOTES_FILE.name + ".tmp")
-    tmp.write_text(json.dumps(prune_notes(notes), indent=1), encoding="utf-8")
-    os.replace(tmp, NOTES_FILE)
+    with _NOTES_LOCK:
+        NOTES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Per-process temp name: the lock only orders threads inside ONE app. A second
+        # process writing at the same moment (a stray second window) would otherwise
+        # race on a shared temp path and one would rename a file the other just moved.
+        tmp = NOTES_FILE.with_name(f"{NOTES_FILE.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(prune_notes(notes), indent=1), encoding="utf-8")
+        os.replace(tmp, NOTES_FILE)
+
+
+def store_notes(found: list[dict]) -> int:
+    """Add freshly-received notes to the stored ones and return how many were new.
+
+    The read, the merge and the write are one operation under the lock — separately
+    they're a lost update: the group sync's worker thread and the window can both be
+    part-way through a read-modify-write at the same moment, and whoever writes last
+    silently discards what the other did."""
+    with _NOTES_LOCK:
+        merged, new = merge_notes(read_notes(), found)
+        write_notes(merged)
+        return new
 
 
 def merge_notes(existing: list[dict], found: list[dict]) -> tuple[list[dict], int]:
@@ -1318,8 +1345,7 @@ def fetch_notes(account: str, on_log: LogFn = lambda *_: None) -> dict:
             raise BroadcastError("Signal says this Mac isn't linked any more — link "
                                  "again from the phone, then check for notes.")
         raise BroadcastError(err or "Couldn't check for notes. Try again.")
-    stored, new = merge_notes(read_notes(), harvest_notes(output, media_downloaded=True))
-    write_notes(stored)
+    new = store_notes(harvest_notes(output, media_downloaded=True))
     report = describe_receive(output)
     report.update(new=new, seconds=round(time.monotonic() - started, 1))
     on_log(f"Notes check: {report['envelopes']} message(s) from Signal, "
@@ -1340,9 +1366,7 @@ def _save_notes_seen_during(receive_output: str) -> None:
     try:
         found = harvest_notes(receive_output, media_downloaded=False)
         if found:
-            stored, new = merge_notes(read_notes(), found)
-            if new:
-                write_notes(stored)
+            store_notes(found)
     except Exception:  # noqa: BLE001 — a notes problem can never break the group sync
         pass
 
