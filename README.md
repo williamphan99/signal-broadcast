@@ -51,10 +51,12 @@ Click **Signal Broadcast** on the Dock. The window opens on the **Send** tab.
   **Send to N groups** button. It asks you to confirm (showing the first line and how
   long it'll take), then sends, showing progress and a live log. Anything that fails is
   listed; **Resend failed** retries just those.
-  - **Photos** appear as numbered thumbnails under the buttons, and that numbering is
-    the order they arrive in everyone's chat. **Drag a photo** to move it, or click one
-    and use **◀ Earlier / Later ▶ / Remove**. Double-click a photo to see it full size.
-    The strip locks while a send is running.
+  - **Photos** are listed by name in send order — `1. shop.jpg · 2. menu.jpg` — which
+    is the order they arrive in everyone's chat. Click **Reorder photos** to open the
+    thumbnails: **drag** one to move it, or select one and use **◀ Earlier / Later ▶ /
+    Remove**; double-click to see it full size. **Hide** puts them away again and keeps
+    the order. It opens by itself when you add photos and stays shut otherwise, so the
+    Send button and the activity log don't get pushed off the window.
   - **Save for auto-send** stores the message for the daily schedule *without* sending
     now — use it when you've set up automatic times (see Schedule).
 - **Notes tab** — whatever you write in Signal's **Note to Self** chat on your phone

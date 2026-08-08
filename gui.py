@@ -118,10 +118,22 @@ class PhotoStrip(ttk.Frame):
         self._enabled = True
         self._cols = 1
         self._previews: dict[str, tk.PhotoImage] = {}   # open preview windows → their image
+        self._open = False
+
+        # Collapsed, this is one line: the photos in order, by name. Two rows of tiles
+        # pushed Send and the Activity log off the bottom of the window, and the tiles
+        # are only needed while you're actually arranging them.
+        head = ttk.Frame(self)
+        head.pack(fill="x")
+        self.toggle_btn = ttk.Button(head, text="Reorder photos ▸", width=17,
+                                     command=self.toggle)
+        self.toggle_btn.pack(side="left")
+        self.summary = ttk.Label(head, foreground=PALETTE["muted"], text="",
+                                 wraplength=430, justify="left")
+        self.summary.pack(side="left", padx=(8, 0))
 
         self.canvas = tk.Canvas(self, height=self.EMPTY_H, bd=0, highlightthickness=1,
                                 highlightbackground="#888", background=PALETTE["text_bg"])
-        self.canvas.pack(fill="x")
         self.canvas.bind("<Configure>", lambda _e: self._redraw())
         self.canvas.bind("<Button-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_motion)
@@ -132,8 +144,9 @@ class PhotoStrip(ttk.Frame):
         self.canvas.bind("<BackSpace>", lambda _e: self._remove_selected())
         self.canvas.bind("<Delete>", lambda _e: self._remove_selected())
 
-        row = ttk.Frame(self)
-        row.pack(fill="x", pady=(5, 0))
+        self.row = row = ttk.Frame(self)
+        self.done_btn = ttk.Button(row, text="Done", command=lambda: self.set_open(False))
+        self.done_btn.pack(side="left", padx=(0, 12))
         self.left_btn = ttk.Button(row, text="◀ Earlier", command=lambda: self._nudge(-1))
         self.right_btn = ttk.Button(row, text="Later ▶", command=lambda: self._nudge(1))
         self.rm_btn = ttk.Button(row, text="Remove", command=self._remove_selected)
@@ -142,19 +155,68 @@ class PhotoStrip(ttk.Frame):
             b.pack(side="left", padx=(0, 6))
         self.hint = ttk.Label(row, foreground=PALETTE["muted"], text="")
         self.hint.pack(side="left", padx=(6, 0))
-        self._sync_buttons()
+        self._sync_layout()
 
     # ------------------------------------------------------------------ public
-    def set_paths(self, paths) -> None:
-        """Show this list, in this order. Does not call back — the caller already
-        knows what it just set."""
+    def set_paths(self, paths, expand: bool | None = None) -> None:
+        """Show this list, in this order. Does not call back — the caller already knows
+        what it just set.
+
+        ``expand`` defaults to opening the tiles only when photos have just been ADDED:
+        that's the moment you want to check the order. Reopening the app, or clearing,
+        leaves it shut, so the Send button stays where you left it."""
         if not self.winfo_exists():   # the screen was replaced (unlink) mid-flight
             return
-        self._paths = list(paths)
+        before, self._paths = len(self._paths), list(paths)
         self._sel = None
         self._drag = None
+        if expand is None:
+            expand = len(self._paths) > max(before, 0) and bool(self._paths)
+        self._open = bool(expand) and bool(self._paths)
         self._request_thumbs()
-        self._redraw()
+        self._sync_layout()
+
+    def toggle(self) -> None:
+        self.set_open(not self._open)
+
+    def set_open(self, on: bool) -> None:
+        """Show or hide the tiles. Collapsed keeps the order visible as text, so the
+        strip costs one line when you're not rearranging."""
+        if not self.winfo_exists():
+            return
+        self._open = bool(on) and bool(self._paths)
+        self._drag = None
+        self._sync_layout()
+
+    def _sync_layout(self) -> None:
+        """Pack or unpack the tiles for the current state, then repaint."""
+        if not self.winfo_exists():
+            return
+        if self._open:
+            self.canvas.pack(fill="x", pady=(6, 0))
+            self.row.pack(fill="x", pady=(5, 0))
+            self.toggle_btn.configure(text="Hide ▾")
+        else:
+            self.canvas.pack_forget()
+            self.row.pack_forget()
+            self.toggle_btn.configure(text="Reorder photos ▸")
+        # With nothing attached there is nothing to reorder, so the button would only be
+        # a dead control — the summary line says what to do instead.
+        if self._paths and self._enabled:
+            self.toggle_btn.pack(side="left")
+        else:
+            self.toggle_btn.pack_forget()
+        self.summary.configure(text=self._summary_text())
+        if self._open:
+            self._redraw()
+
+    def _summary_text(self) -> str:
+        """The order, as words — what you see when the tiles are put away."""
+        if not self._paths:
+            return "No photos yet — “Add images…” puts them here, in send order."
+        shown = [f"{i + 1}. {Path(p).name}" for i, p in enumerate(self._paths[:4])]
+        rest = len(self._paths) - len(shown)
+        return " · ".join(shown) + (f"  +{rest} more" if rest > 0 else "")
 
     def set_enabled(self, on: bool) -> None:
         """Locked while a send is running: the run's fingerprint (and so its ability to
@@ -164,8 +226,11 @@ class PhotoStrip(ttk.Frame):
         self._enabled = on
         self._drag = None
         if not on:
+            # Locked mid-send: put the tiles away too. They can't be used, and the space
+            # is better spent on the progress and log you actually want to watch.
             self._sel = None
-        self._redraw()
+            self._open = False
+        self._sync_layout()
 
     # ------------------------------------------------------------- thumbnails
     def _request_thumbs(self) -> None:
@@ -215,6 +280,12 @@ class PhotoStrip(ttk.Frame):
 
     def _redraw(self) -> None:
         if not self.canvas.winfo_exists():
+            return
+        # The summary is the collapsed view of the same data, so it tracks every
+        # reorder and removal whether or not the tiles are on screen.
+        self.summary.configure(text=self._summary_text())
+        if not self._open:
+            self._sync_buttons()
             return
         width = max(self.canvas.winfo_width(), 1)
         self._cols = max(1, (width - 2 * self.PAD + self.GAP) // self._cell())
@@ -792,7 +863,8 @@ class App(tk.Tk):
             self.selected_images = []
         self.photo_strip = PhotoStrip(tab, on_change=self._on_photos_changed)
         self.photo_strip.pack(fill="x", pady=(6, 0))
-        self.photo_strip.set_paths(self.selected_images)
+        # Start shut: reopening the app shouldn't cost you the Send button.
+        self.photo_strip.set_paths(self.selected_images, expand=False)
         self._refresh_img_label()
 
         send_row = ttk.Frame(tab)
@@ -909,10 +981,9 @@ class App(tk.Tk):
 
     def _refresh_img_label(self) -> None:
         n = len(self.selected_images)
-        # Just the count: the strip below shows which photos and in what order (and says
-        # so itself when empty), and a list of filenames here pushed the buttons around.
-        self.img_label.configure(
-            text="" if not n else f"{n} photo{'' if n == 1 else 's'}, sent in this order")
+        # Just the count — the strip underneath names them in order, so repeating that
+        # here would be two lines saying one thing.
+        self.img_label.configure(text="" if not n else f"{n} photo{'' if n == 1 else 's'}")
 
     def _refresh_schedule_status(self) -> None:
         if engine.schedule_enabled():
