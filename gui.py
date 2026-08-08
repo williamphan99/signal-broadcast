@@ -1080,6 +1080,7 @@ class App(tk.Tk):
         self.note_photos.pack(side="left", padx=10)
 
         self._notes: list[dict] = []
+        self._checking_notes = False
         self._render_notes()
 
     def _render_notes(self) -> None:
@@ -1126,11 +1127,21 @@ class App(tk.Tk):
         self.note_photos.configure(text=" · ".join(parts))
 
     def _fetch_notes(self) -> None:
+        # signal-cli allows one operation per account, and a group sync doesn't take the
+        # send lock (it predates it), so the two would collide as an unexplained red
+        # error. They're both buttons in this window, so keep them out of each other's
+        # way here rather than letting signal-cli arbitrate.
+        if self._refreshing:
+            self.notes_status.configure(
+                text="Groups are syncing — try again when that finishes.",
+                foreground=PALETTE["muted"])
+            return
         try:
             account = engine.load_config().account
         except engine.BroadcastError as exc:
             messagebox.showerror("Can't check for notes", str(exc))
             return
+        self._checking_notes = True
         self.notes_btn.configure(state="disabled")
         self.notes_status.configure(text="Checking your phone…", foreground=PALETTE["muted"])
         self.notes_progress.pack(fill="x", pady=(8, 0))
@@ -1141,9 +1152,15 @@ class App(tk.Tk):
                 self.events.put(("notes_done", engine.fetch_notes(account)))
             except engine.BroadcastError as exc:
                 self.events.put(("notes_done", str(exc)))
+            except Exception as exc:  # noqa: BLE001 — the event MUST be posted: it's
+                # what re-enables the button and clears _checking_notes. An escaped
+                # exception here would leave the Notes and Groups buttons dead until
+                # restart.
+                self.events.put(("notes_done", f"Unexpected error: {exc}"))
         threading.Thread(target=work, daemon=True).start()
 
     def _finish_notes(self, result) -> None:
+        self._checking_notes = False
         self.notes_progress.stop()
         self.notes_progress.pack_forget()
         self.notes_btn.configure(state="normal")
@@ -1715,6 +1732,12 @@ class App(tk.Tk):
     # ----------------------------------------------------------- misc actions
     def _refresh_groups(self) -> None:
         if self._refreshing:                 # one sync at a time — re-clicks are ignored
+            return
+        # Same account, one signal-cli operation at a time — see _fetch_notes.
+        if getattr(self, "_checking_notes", False):
+            self.groups_sync_label.configure(
+                text="Checking for notes — try again in a moment.",
+                foreground=PALETTE["muted"])
             return
         self._refreshing = True
         self.refresh_btn.configure(state="disabled")
