@@ -58,7 +58,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.18.1"
+APP_VERSION = "1.18.2"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -1147,6 +1147,72 @@ def harvest_notes(receive_output: str, media_downloaded: bool = True) -> list[di
     return sorted(found, key=lambda n: n["ts"])
 
 
+NOTES_DEBUG_FILE = LOGS_DIR / "notes-debug.txt"
+
+
+def _notes_log(msg: str) -> None:
+    """Always-on breadcrumb for the notes filter, in the spirit of _sync_log.
+
+    A drain consumes what it reads, so a note wrongly rejected is gone before anyone
+    can inspect it — without this there is no way to tell "no note was sent" from "a
+    note arrived and the filter refused it". Deliberately identifier-light: the last
+    four characters of the source and destination are enough to see whether they're the
+    same person, and nothing else about anyone's messages is written. Lives in logs/,
+    so unlink and station-mode wipe erase it with everything else."""
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        if NOTES_DEBUG_FILE.exists() and NOTES_DEBUG_FILE.stat().st_size > 200_000:
+            NOTES_DEBUG_FILE.unlink()
+        with NOTES_DEBUG_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
+    except Exception:
+        pass
+
+
+def _tail(value) -> str:
+    """Last four characters of an identifier, or a marker for a missing one."""
+    text = str(value or "")
+    return f"…{text[-4:]}" if text else "(none)"
+
+
+def describe_receive(receive_output: str) -> dict:
+    """Count what a drain actually contained, so a check that finds nothing can say
+    WHY on screen instead of just "nothing new".
+
+    The three numbers separate the three failure modes: no envelopes at all means
+    Signal had nothing waiting for this Mac (the note never arrived, or something
+    already drained it); envelopes but no transcripts means traffic came in but none of
+    it was you sending anything; transcripts but no notes means you sent messages —
+    to other people, not to yourself."""
+    envelopes = transcripts = notes = 0
+    for line in (receive_output or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            envelope = json.loads(line).get("envelope")
+        except ValueError:
+            continue
+        if not isinstance(envelope, dict):
+            continue
+        envelopes += 1
+        sent = (envelope.get("syncMessage") or {}).get("sentMessage")
+        if not isinstance(sent, dict):
+            continue
+        transcripts += 1
+        matched = _is_note_to_self(envelope, sent)
+        notes += int(matched)
+        _notes_log(f"transcript src={_tail(envelope.get('sourceUuid'))}/"
+                   f"{_tail(envelope.get('sourceNumber'))} "
+                   f"dst={_tail(sent.get('destinationUuid'))}/"
+                   f"{_tail(sent.get('destinationNumber'))} "
+                   f"group={'yes' if sent.get('groupInfo') else 'no'} "
+                   f"attachments={len(sent.get('attachments') or [])} "
+                   f"note={'YES' if matched else 'no'}")
+    _notes_log(f"drain: {envelopes} envelope(s), {transcripts} transcript(s), {notes} note(s)")
+    return {"envelopes": envelopes, "transcripts": transcripts, "notes": notes}
+
+
 def prune_notes(notes: list[dict], now: float | None = None) -> list[dict]:
     """Drop notes whose disappearing-message timer has run out, and cap the list."""
     now = time.time() if now is None else now
@@ -1178,9 +1244,12 @@ def merge_notes(existing: list[dict], found: list[dict]) -> tuple[list[dict], in
     return prune_notes(list(existing) + fresh), len(fresh)
 
 
-def fetch_notes(account: str, on_log: LogFn = lambda *_: None) -> int:
-    """Drain what's waiting for this device and keep the notes. Returns how many are
-    new.
+def fetch_notes(account: str, on_log: LogFn = lambda *_: None) -> dict:
+    """Drain what's waiting for this device and keep the notes.
+
+    Returns a report — new/envelopes/transcripts/notes/seconds — not just a count, so
+    the screen can explain a check that found nothing rather than leaving you guessing
+    whether the note, the phone, or the app is at fault.
 
     Deliberately a one-shot the user asks for, not a poll: it holds the same lock as a
     broadcast (one signal-cli operation per account), and unlike the group sync it DOES
@@ -1188,6 +1257,7 @@ def fetch_notes(account: str, on_log: LogFn = lambda *_: None) -> int:
     Everything the drain pulls that isn't a note is discarded unread, exactly as it is
     today."""
     binary = signal_cli_bin()
+    started = time.monotonic()
     with send_lock():
         try:
             proc = subprocess.run(
@@ -1213,9 +1283,12 @@ def fetch_notes(account: str, on_log: LogFn = lambda *_: None) -> int:
         raise BroadcastError(err or "Couldn't check for notes. Try again.")
     stored, new = merge_notes(read_notes(), harvest_notes(output, media_downloaded=True))
     write_notes(stored)
-    if new:
-        on_log(f"{new} new note{'' if new == 1 else 's'} from your phone.")
-    return new
+    report = describe_receive(output)
+    report.update(new=new, seconds=round(time.monotonic() - started, 1))
+    on_log(f"Notes check: {report['envelopes']} message(s) from Signal, "
+           f"{report['transcripts']} sent from your phone, {report['notes']} note(s) to "
+           f"self, {new} new — {report['seconds']}s")
+    return report
 
 
 def _save_notes_seen_during(receive_output: str) -> None:

@@ -93,6 +93,45 @@ class WhatCountsAsANote(unittest.TestCase):
         self.assertEqual([n["text"] for n in engine.harvest_notes(stream)], ["first", "second"])
 
 
+class ExplainingAnEmptyCheck(unittest.TestCase):
+    """A check that finds nothing has to say which of the three things went wrong,
+    because the drain consumes what it reads — you don't get a second look."""
+
+    def setUp(self):
+        patch = mock.patch.object(engine, "_notes_log", lambda *_: None)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_nothing_waiting_at_all(self):
+        self.assertEqual(engine.describe_receive(""),
+                         {"envelopes": 0, "transcripts": 0, "notes": 0})
+
+    def test_traffic_arrived_but_none_of_it_was_mine(self):
+        incoming = json.dumps({"envelope": {"source": "+61411111111", "timestamp": 1,
+                                            "dataMessage": {"message": "hey"}}})
+        self.assertEqual(engine.describe_receive(incoming),
+                         {"envelopes": 1, "transcripts": 0, "notes": 0})
+
+    def test_i_sent_messages_but_none_to_myself(self):
+        dm = {"destination": FRIEND_UUID, "destinationUuid": FRIEND_UUID,
+              "destinationNumber": None, "timestamp": 2, "message": "hi"}
+        self.assertEqual(engine.describe_receive(envelope(dm)),
+                         {"envelopes": 1, "transcripts": 1, "notes": 0})
+
+    def test_a_note_is_counted_as_all_three(self):
+        self.assertEqual(engine.describe_receive(envelope(note("x"))),
+                         {"envelopes": 1, "transcripts": 1, "notes": 1})
+
+    def test_counts_match_what_was_harvested(self):
+        stream = "\n".join([envelope(note("one", ts=1)), envelope(note("two", ts=2)),
+                            envelope({"destination": FRIEND_UUID,
+                                      "destinationUuid": FRIEND_UUID,
+                                      "destinationNumber": None, "timestamp": 3,
+                                      "message": "dm"})])
+        self.assertEqual(engine.describe_receive(stream)["notes"],
+                         len(engine.harvest_notes(stream)))
+
+
 class NothingToSend(unittest.TestCase):
     """Photos with no caption are a real broadcast — a note written on the phone is
     often just pictures, and refusing to send it would make those notes useless."""

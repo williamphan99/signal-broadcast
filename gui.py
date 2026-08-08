@@ -1040,9 +1040,14 @@ class App(tk.Tk):
         top.pack(fill="x")
         self.notes_btn = ttk.Button(top, text="Check for new notes", command=self._fetch_notes)
         self.notes_btn.pack(side="left")
-        self.notes_status = ttk.Label(top, text="", foreground=PALETTE["muted"])
+        self.notes_status = ttk.Label(top, text="", foreground=PALETTE["muted"],
+                                      wraplength=430, justify="left")
         self.notes_status.pack(side="left", padx=10)
         self.notes_progress = ttk.Progressbar(tab, mode="indeterminate")
+        # What the last drain actually contained. Kept on screen (not just in the log)
+        # because "found nothing" is the case that needs explaining.
+        self.notes_detail = ttk.Label(tab, text="", foreground=PALETTE["muted"], font=("", 10))
+        self.notes_detail.pack(anchor="w", pady=(4, 0))
 
         listwrap = ttk.Frame(tab)
         listwrap.pack(fill="both", expand=True, pady=(10, 0))
@@ -1142,17 +1147,39 @@ class App(tk.Tk):
         self._render_notes()
         if isinstance(result, str):
             self.notes_status.configure(text=result, foreground=PALETTE["error"])
+            self.notes_detail.configure(text="")
+            self._log(f"Notes check failed: {result}", "error")
             return
-        if result:
+        new = result.get("new", 0)
+        # Always show what the drain actually contained. "Nothing new" on its own can't
+        # tell you whether the note never arrived, arrived and was filtered out, or was
+        # already stored — and that's exactly the moment you need to know.
+        self.notes_detail.configure(text=(
+            f"Last check took {result.get('seconds', 0)}s · "
+            f"{result.get('envelopes', 0)} message(s) waiting · "
+            f"{result.get('transcripts', 0)} sent from your phone · "
+            f"{result.get('notes', 0)} to yourself"))
+        self._log(f"Notes check: {result.get('envelopes', 0)} waiting, "
+                  f"{result.get('notes', 0)} note(s) to self, {new} new.", "muted")
+        if new:
             self.notes_status.configure(
-                text=f"{result} new note{'' if result == 1 else 's'}.", foreground=PALETTE["ok"])
+                text=f"{new} new note{'' if new == 1 else 's'}.", foreground=PALETTE["ok"])
             self.notes_list.selection_clear(0, "end")
             self.notes_list.selection_set(0)     # newest first — land on what just arrived
             self.notes_list.see(0)
             self._show_note()
-        else:
-            self.notes_status.configure(text="Nothing new since the last check.",
+        elif result.get("notes"):
+            self.notes_status.configure(text="Nothing new — those notes are already here.",
                                         foreground=PALETTE["muted"])
+        elif result.get("transcripts"):
+            self.notes_status.configure(
+                text="Messages arrived, but none were notes to yourself.",
+                foreground=PALETTE["muted"])
+        else:
+            self.notes_status.configure(
+                text="Signal had nothing waiting for this Mac. Write a note on your "
+                     "phone, give it a few seconds, then check again.",
+                foreground=PALETTE["muted"])
 
     def _use_note(self) -> None:
         """Drop this note into the Send tab — text into the message, photos into the
