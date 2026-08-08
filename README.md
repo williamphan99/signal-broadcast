@@ -51,6 +51,10 @@ Click **Signal Broadcast** on the Dock. The window opens on the **Send** tab.
   **Send to N groups** button. It asks you to confirm (showing the first line and how
   long it'll take), then sends, showing progress and a live log. Anything that fails is
   listed; **Resend failed** retries just those.
+  - **Photos** appear as numbered thumbnails under the buttons, and that numbering is
+    the order they arrive in everyone's chat. **Drag a photo** to move it, or click one
+    and use **◀ Earlier / Later ▶ / Remove**. Double-click a photo to see it full size.
+    The strip locks while a send is running.
   - **Save for auto-send** stores the message for the daily schedule *without* sending
     now — use it when you've set up automatic times (see Schedule).
 - **Groups tab** — tick the groups to send to; untick any to skip. Click **Save
