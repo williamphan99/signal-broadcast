@@ -1112,9 +1112,12 @@ class App(tk.Tk):
             self.note_photos.configure(text="")
             return
         photos, missing = len(note.get("photos") or []), int(note.get("missing_photos") or 0)
+        transient = int(note.get("view_once_photos") or 0)
         parts = []
         if photos:
             parts.append(f"{photos} photo{'' if photos == 1 else 's'} attached")
+        if transient:
+            parts.append(f"{transient} view-once photo{'' if transient == 1 else 's'} — not kept")
         if missing:
             # Arrived while the group sync was draining the queue, which can't download
             # media. Say so plainly — the photos aren't coming back on their own.

@@ -58,7 +58,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.18.2"
+APP_VERSION = "1.18.3"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -1104,21 +1104,33 @@ def _note_from_envelope(envelope: dict, media_downloaded: bool) -> dict | None:
     if not isinstance(sent, dict) or not _is_note_to_self(envelope, sent):
         return None
     text = sent.get("message") or ""
-    photos, missing = [], 0
+    # A view-once photo is meant to survive exactly one look. signal-cli has already
+    # written it to disk by the time we read the envelope, so the copy is deleted rather
+    # than kept — the same reasoning as the disappearing-message timer below. The note
+    # still appears, saying the photo wasn't kept, so it isn't a silent disappearance.
+    view_once = bool(sent.get("viewOnce"))
+    photos, missing, transient = [], 0, 0
     for att in (sent.get("attachments") or []):
         # signal-cli stores a downloaded attachment under its id in the config dir.
         path = DATA_DIR / "attachments" / str(att.get("id") or "")
-        if media_downloaded and att.get("id") and path.is_file():
+        if view_once:
+            transient += 1
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        elif media_downloaded and att.get("id") and path.is_file():
             photos.append({"path": str(path), "name": att.get("filename") or path.name})
         else:
             missing += 1
-    if not text and not photos and not missing:
+    if not text and not photos and not missing and not transient:
         return None            # an empty transcript (a read receipt, a typing marker)
     return {
         "ts": int(sent.get("timestamp") or envelope.get("timestamp") or 0),
         "text": text,
         "photos": photos,
         "missing_photos": missing,
+        "view_once_photos": transient,
         # Notes inherit the chat's disappearing-message timer. Signal promises those
         # vanish; a copy sitting on this Mac forever would quietly break that, so the
         # expiry is carried here and enforced in prune_notes().

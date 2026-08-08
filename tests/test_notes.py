@@ -183,6 +183,30 @@ class NotesWithPhotos(unittest.TestCase):
         self.assertEqual(found[0]["photos"], [])
         self.assertEqual(found[0]["missing_photos"], 1)
 
+    def test_a_view_once_photo_is_deleted_not_kept(self):
+        """View-once means one look. signal-cli writes the file before we ever see the
+        envelope, so keeping it would leave a permanent copy of a photo that was
+        promised to vanish — the same promise as a disappearing-message timer."""
+        on_disk = self.data / "attachments" / self.att["id"]
+        on_disk.write_bytes(b"jpegbytes")
+        sent = note("look once", attachments=[self.att])
+        sent["viewOnce"] = True
+        found = engine.harvest_notes(envelope(sent))
+        self.assertEqual(found[0]["photos"], [])
+        self.assertEqual(found[0]["view_once_photos"], 1)
+        self.assertFalse(on_disk.exists(), "the view-once file was left on disk")
+
+    def test_a_view_once_note_still_appears_so_it_isnt_a_silent_disappearance(self):
+        sent = note(None, attachments=[self.att])
+        sent["viewOnce"] = True
+        self.assertEqual(len(engine.harvest_notes(envelope(sent))), 1)
+
+    def test_an_ordinary_photo_is_untouched_on_disk(self):
+        on_disk = self.data / "attachments" / self.att["id"]
+        on_disk.write_bytes(b"jpegbytes")
+        engine.harvest_notes(envelope(note("keep", attachments=[self.att])))
+        self.assertTrue(on_disk.exists())
+
     def test_an_attachment_whose_file_never_arrived_is_not_pointed_at(self):
         found = engine.harvest_notes(envelope(note("x", attachments=[self.att])))
         self.assertEqual(found[0]["photos"], [])
