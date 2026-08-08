@@ -58,7 +58,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.18.0"
+APP_VERSION = "1.18.1"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -1643,6 +1643,16 @@ def _start_daemon(account: str, on_log: LogFn, debug: bool) -> "SignalCliDaemon 
                     append_debug(f"daemon start failed after cleanup: {detail}")
         on_log(f"Running signal-cli per send (daemon unavailable: {detail}).")
         return None
+
+
+def nothing_to_send(message: str, attachments: list[str]) -> bool:
+    """True only when a run would carry no content at all.
+
+    Photos on their own are a real broadcast — Signal sends an album with no caption,
+    and a note written on the phone is often just pictures. Requiring text as well as
+    photos would make those notes unsendable. Lives here rather than in a front end so
+    the rule can't drift between the two."""
+    return not message.strip() and not attachments
 
 
 def missing_attachments(attachments: list[str]) -> list[str]:

@@ -1562,8 +1562,9 @@ class App(tk.Tk):
         """Persist the message + images without sending, so the scheduled run
         picks up the new text on its next fire."""
         text = self.msg_text.get("1.0", "end").strip()
-        if not text:
-            messagebox.showwarning("Empty message", "Type a message before saving.")
+        if engine.nothing_to_send(text, self.selected_images):
+            messagebox.showwarning("Nothing to save",
+                                   "Type a message or add a photo before saving.")
             return
         engine.write_message(text)
         engine.write_attachments(self.selected_images)
@@ -1571,8 +1572,9 @@ class App(tk.Tk):
 
     def _on_send(self) -> None:
         text = self.msg_text.get("1.0", "end").strip()
-        if not text:
-            messagebox.showwarning("Empty message", "Type a message before sending.")
+        if engine.nothing_to_send(text, self.selected_images):
+            messagebox.showwarning("Nothing to send",
+                                   "Type a message or add a photo before sending.")
             return
         try:
             cfg = engine.load_config()
@@ -1602,7 +1604,7 @@ class App(tk.Tk):
 
     def _confirm_send(self, cfg, groups, message, attachments) -> bool:
         """Last check before a real blast: show count, preview, and rough duration."""
-        preview = next((ln for ln in message.splitlines() if ln.strip()), "")[:80]
+        preview = next((ln for ln in message.splitlines() if ln.strip()), "")[:80] or "(no caption)"
         imgs = len(attachments)
         img_note = f"{imgs} image(s) attached." if imgs else "No images (text only)."
         if cfg.message_style != engine.DEFAULT_MESSAGE_STYLE:

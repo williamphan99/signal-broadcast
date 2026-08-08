@@ -18,6 +18,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import engine  # noqa: E402
@@ -90,6 +91,23 @@ class WhatCountsAsANote(unittest.TestCase):
     def test_notes_come_back_oldest_first(self):
         stream = "\n".join([envelope(note("second", ts=200)), envelope(note("first", ts=100))])
         self.assertEqual([n["text"] for n in engine.harvest_notes(stream)], ["first", "second"])
+
+
+class NothingToSend(unittest.TestCase):
+    """Photos with no caption are a real broadcast — a note written on the phone is
+    often just pictures, and refusing to send it would make those notes useless."""
+
+    def test_no_text_and_no_photos_is_empty(self):
+        self.assertTrue(engine.nothing_to_send("   \n ", []))
+
+    def test_photos_alone_are_sendable(self):
+        self.assertFalse(engine.nothing_to_send("", ["/tmp/a.jpg"]))
+
+    def test_text_alone_is_sendable(self):
+        self.assertFalse(engine.nothing_to_send("hello", []))
+
+    def test_both_are_sendable(self):
+        self.assertFalse(engine.nothing_to_send("hello", ["/tmp/a.jpg"]))
 
 
 class NotesWithPhotos(unittest.TestCase):
