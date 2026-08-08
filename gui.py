@@ -2,9 +2,10 @@
 """Tkinter front end for Signal Broadcast.
 
 A thin UI over engine.py: a first-run Link screen (renders the QR you scan with
-your phone) and a tabbed main screen — Send (type, attach, send, resend), Groups
-(pick which to send to), Schedule (daily auto-send), and Security (send speed,
-logging, wipe-on-quit, and station-mode wipe-on-unplug). All sending happens on a
+your phone) and a tabbed main screen — Send (type, attach, order the photos, send,
+resend), Notes (what you wrote to yourself on the phone, ready to broadcast),
+Groups (pick which to send to), Schedule (daily auto-send), and Security (send
+speed, logging, wipe-on-quit, and station-mode wipe-on-unplug). All sending happens on a
 worker thread; the engine talks back
 through a thread-safe queue that the Tk main loop drains. Colours are chosen
 explicitly so the log is readable in both macOS Light and Dark mode.
@@ -733,16 +734,20 @@ class App(tk.Tk):
 
         nb = ttk.Notebook(self.container)
         nb.pack(fill="both", expand=True, pady=(12, 0))
+        self.nb = nb                       # the Notes tab hands work back to Send
         send_tab = ttk.Frame(nb, padding=14)
+        notes_tab = ttk.Frame(nb, padding=14)
         groups_tab = ttk.Frame(nb, padding=14)
         sched_tab = ttk.Frame(nb, padding=14)
         security_tab = ttk.Frame(nb, padding=14)
         nb.add(send_tab, text="  Send  ")
+        nb.add(notes_tab, text="  Notes  ")
         nb.add(groups_tab, text="  Groups  ")
         nb.add(sched_tab, text="  Schedule  ")
         nb.add(security_tab, text="  Security  ")
 
         self._build_send_tab(send_tab)
+        self._build_notes_tab(notes_tab)
         self._build_groups_tab(groups_tab)
         self._build_schedule_tab(sched_tab)
         self._build_security_tab(security_tab)
@@ -1017,6 +1022,174 @@ class App(tk.Tk):
         self.selected_images = list(paths)
         self._refresh_img_label()
 
+    # ------------------------------------------------------------------ notes
+    def _build_notes_tab(self, tab) -> None:
+        """Notes you wrote to yourself on the phone, ready to become a broadcast.
+
+        Signal's "Note to Self" is mirrored to every linked device, so this Mac already
+        receives them — it just used to throw them away. Checking is a button, not a
+        poll: a check holds the same lock as a send, and a background one could collide
+        with the scheduler."""
+        ttk.Label(tab, text="Notes from your phone", font=("", 12, "bold")).pack(anchor="w")
+        ttk.Label(tab, wraplength=620, justify="left", foreground=PALETTE["muted"], text=(
+            "Whatever you write in Signal's “Note to Self” chat on your phone — words, "
+            "photos, or both — turns up here, ready to send on. Messages to anyone else "
+            "are never read or kept.")).pack(anchor="w", pady=(2, 10))
+
+        top = ttk.Frame(tab)
+        top.pack(fill="x")
+        self.notes_btn = ttk.Button(top, text="Check for new notes", command=self._fetch_notes)
+        self.notes_btn.pack(side="left")
+        self.notes_status = ttk.Label(top, text="", foreground=PALETTE["muted"])
+        self.notes_status.pack(side="left", padx=10)
+        self.notes_progress = ttk.Progressbar(tab, mode="indeterminate")
+
+        listwrap = ttk.Frame(tab)
+        listwrap.pack(fill="both", expand=True, pady=(10, 0))
+        bar = ttk.Scrollbar(listwrap, orient="vertical")
+        bar.pack(side="right", fill="y")
+        self.notes_list = tk.Listbox(
+            listwrap, height=8, activestyle="none", exportselection=False,
+            background=PALETTE["text_bg"], foreground=PALETTE["text_fg"],
+            selectbackground=PALETTE["accent"], selectforeground=PALETTE["accent_fg"],
+            relief="flat", highlightthickness=1, highlightbackground="#888",
+            yscrollcommand=bar.set)
+        self.notes_list.pack(side="left", fill="both", expand=True)
+        bar.configure(command=self.notes_list.yview)
+        self.notes_list.bind("<<ListboxSelect>>", lambda _e: self._show_note())
+        self.notes_list.bind("<Double-Button-1>", lambda _e: self._use_note())
+
+        self.note_text = self._text_widget(tab, height=5, wrap="word")
+        self.note_text.pack(fill="x", pady=(8, 0))
+        self.note_text.configure(state="disabled")
+
+        row = ttk.Frame(tab)
+        row.pack(fill="x", pady=(8, 0))
+        self.note_use_btn = ttk.Button(row, text="Use as message", command=self._use_note)
+        self.note_use_btn.pack(side="left")
+        self.note_copy_btn = ttk.Button(row, text="Copy text", command=self._copy_note)
+        self.note_copy_btn.pack(side="left", padx=6)
+        self.note_del_btn = ttk.Button(row, text="Delete", command=self._delete_note)
+        self.note_del_btn.pack(side="left")
+        self.note_photos = ttk.Label(row, text="", foreground=PALETTE["muted"])
+        self.note_photos.pack(side="left", padx=10)
+
+        self._notes: list[dict] = []
+        self._render_notes()
+
+    def _render_notes(self) -> None:
+        self._notes = engine.read_notes()
+        self.notes_list.delete(0, "end")
+        for n in self._notes:
+            when = datetime.fromtimestamp(n.get("ts", 0) / 1000).strftime("%d %b %H:%M")
+            first = next((ln for ln in (n.get("text") or "").splitlines() if ln.strip()), "")
+            shots = len(n.get("photos") or []) + int(n.get("missing_photos") or 0)
+            tag = f"  [{shots} photo{'' if shots == 1 else 's'}]" if shots else ""
+            self.notes_list.insert("end", f"{when}{tag}   {first[:70] or '(photo only)'}")
+        if not self._notes:
+            self.notes_status.configure(
+                text="No notes yet — write one in Note to Self, then check.")
+        self._show_note()
+
+    def _selected_note(self) -> dict | None:
+        sel = self.notes_list.curselection()
+        return self._notes[sel[0]] if sel and sel[0] < len(self._notes) else None
+
+    def _show_note(self) -> None:
+        note = self._selected_note()
+        self.note_text.configure(state="normal")
+        self.note_text.delete("1.0", "end")
+        self.note_text.insert("1.0", (note or {}).get("text", ""))
+        self.note_text.configure(state="disabled")
+        for b in (self.note_use_btn, self.note_copy_btn, self.note_del_btn):
+            b.configure(state="normal" if note else "disabled")
+        if not note:
+            self.note_photos.configure(text="")
+            return
+        photos, missing = len(note.get("photos") or []), int(note.get("missing_photos") or 0)
+        parts = []
+        if photos:
+            parts.append(f"{photos} photo{'' if photos == 1 else 's'} attached")
+        if missing:
+            # Arrived while the group sync was draining the queue, which can't download
+            # media. Say so plainly — the photos aren't coming back on their own.
+            parts.append(f"{missing} photo{'' if missing == 1 else 's'} weren't downloaded "
+                         "(arrived during a group sync) — send the note again to get them")
+        self.note_photos.configure(text=" · ".join(parts))
+
+    def _fetch_notes(self) -> None:
+        try:
+            account = engine.load_config().account
+        except engine.BroadcastError as exc:
+            messagebox.showerror("Can't check for notes", str(exc))
+            return
+        self.notes_btn.configure(state="disabled")
+        self.notes_status.configure(text="Checking your phone…", foreground=PALETTE["muted"])
+        self.notes_progress.pack(fill="x", pady=(8, 0))
+        self.notes_progress.start(15)
+
+        def work():
+            try:
+                self.events.put(("notes_done", engine.fetch_notes(account)))
+            except engine.BroadcastError as exc:
+                self.events.put(("notes_done", str(exc)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_notes(self, result) -> None:
+        self.notes_progress.stop()
+        self.notes_progress.pack_forget()
+        self.notes_btn.configure(state="normal")
+        self._render_notes()
+        if isinstance(result, str):
+            self.notes_status.configure(text=result, foreground=PALETTE["error"])
+            return
+        if result:
+            self.notes_status.configure(
+                text=f"{result} new note{'' if result == 1 else 's'}.", foreground=PALETTE["ok"])
+            self.notes_list.selection_clear(0, "end")
+            self.notes_list.selection_set(0)     # newest first — land on what just arrived
+            self.notes_list.see(0)
+            self._show_note()
+        else:
+            self.notes_status.configure(text="Nothing new since the last check.",
+                                        foreground=PALETTE["muted"])
+
+    def _use_note(self) -> None:
+        """Drop this note into the Send tab — text into the message, photos into the
+        strip — and switch to it. The note itself stays here."""
+        note = self._selected_note()
+        if not note:
+            return
+        self.msg_text.delete("1.0", "end")
+        self.msg_text.insert("1.0", note.get("text", ""))
+        self._apply_style_preview()
+        photos = [p["path"] for p in (note.get("photos") or []) if Path(p["path"]).is_file()]
+        if photos:
+            self.selected_images = list(photos)
+            self._sync_photos()
+        self.nb.select(0)
+        self.msg_text.focus_set()
+        gone = len(note.get("photos") or []) - len(photos)
+        self._log("Note loaded into the message." +
+                  (f" {gone} photo(s) no longer on disk." if gone else ""), "ok")
+
+    def _copy_note(self) -> None:
+        note = self._selected_note()
+        if not note:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(note.get("text", ""))
+        self.notes_status.configure(text="Copied.", foreground=PALETTE["ok"])
+
+    def _delete_note(self) -> None:
+        note = self._selected_note()
+        if not note:
+            return
+        engine.write_notes([n for n in self._notes if n.get("ts") != note.get("ts")])
+        self._render_notes()
+        self.notes_status.configure(text="Note deleted from this Mac (your phone keeps it).",
+                                    foreground=PALETTE["muted"])
+
     # ----------------------------------------------------------------- groups
     def _build_groups_tab(self, tab) -> None:
         top = ttk.Frame(tab)
@@ -1244,7 +1417,8 @@ class App(tk.Tk):
         ttk.Checkbutton(tab, variable=self.wipe_var, command=self._toggle_wipe_on_close,
                         text="Erase all data every time I close the app").pack(anchor="w", pady=(2, 0))
         ttk.Label(tab, wraplength=600, justify="left", foreground=PALETTE["muted"], text=(
-            "When armed, quitting erases the Signal link, groups, message, schedule, and "
+            "When armed, quitting erases the Signal link, groups, message, saved notes, "
+            "schedule, and "
             "logs — and deletes the image files you attached, from wherever they live on "
             "this Mac. You confirm once at quit, then re-link next time. Off by default.")
         ).pack(anchor="w", pady=(0, 4))
@@ -1258,7 +1432,8 @@ class App(tk.Tk):
         ttk.Label(tab, wraplength=600, justify="left", foreground=PALETTE["muted"], text=(
             "For a Mac that stays plugged in at one spot. When armed, unplugging the "
             "power automatically ERASES all of this app's data after a 10-second grace "
-            "— the Signal link, your groups, the message, the schedule, logs, and the "
+            "— the Signal link, your groups, the message, your saved notes, the "
+            "schedule, logs, and the "
             "image files you attached. Apart from those images it touches nothing else "
             "on the Mac. Plug back in within those 10 seconds to cancel. After a wipe "
             "you scan the QR to link again.")
@@ -1308,7 +1483,7 @@ class App(tk.Tk):
         on = self.wipe_var.get()
         if on and not messagebox.askyesno("Arm wipe-on-quit?",
                 "From now on, every time you quit the app it will ERASE all of its data "
-                "(the Signal link, groups, message, schedule, and logs) AND delete the "
+                "(the Signal link, groups, message, saved notes, schedule, and logs) AND delete the "
                 "image files you attached, from wherever they live on this Mac. You'll "
                 "confirm once at quit, then re-link next time you open it.\n\nArm it?",
                 icon="warning", default="no"):
@@ -1323,7 +1498,7 @@ class App(tk.Tk):
             return
         if not messagebox.askyesno("Arm station mode?",
                 "From now on, unplugging this Mac will ERASE all of this app's data "
-                "(the Signal link, groups, message, schedule, and logs) AND delete the "
+                "(the Signal link, groups, message, saved notes, schedule, and logs) AND delete the "
                 "image files you attached, from wherever they live on this Mac, after a "
                 "10-second grace, and you'll have to link again. Nothing else on the "
                 "Mac is touched.\n\nArm it now?",
@@ -1534,6 +1709,9 @@ class App(tk.Tk):
         if isinstance(result, int):
             self.groups_sync_label.configure(text=f"Updated — {result} groups.",
                                              foreground=PALETTE["muted"])
+            # A sync drains the same queue notes arrive on, so it may have picked some up.
+            if hasattr(self, "notes_list"):
+                self._render_notes()
             self._populate_groups()
             self._refresh_status()
         else:
@@ -1542,7 +1720,8 @@ class App(tk.Tk):
     def _unlink(self) -> None:
         if not messagebox.askyesno("Unlink and erase the app's data?",
                 "This signs this Mac out of Signal and deletes all the data this app "
-                "stored here — the link keys, your groups, the message, the schedule, "
+                "stored here — the link keys, your groups, the message, your saved notes, "
+                "the schedule, "
                 "and logs — and deletes the image files you attached, from wherever they "
                 "live on this Mac. Nothing else on the Mac is touched, and nothing "
                 "personal is left behind.\n\nUse this before handing the Mac to someone "
@@ -1599,8 +1778,8 @@ class App(tk.Tk):
         if armed:
             if not messagebox.askyesno("Wipe everything and quit?",
                     "“Wipe when I quit” is armed, so quitting now ERASES all of this "
-                    "app's data — the Signal link, your groups, the message, the "
-                    "schedule, and logs — and deletes the image files you attached, from "
+                    "app's data — the Signal link, your groups, the message, your saved "
+                    "notes, the schedule, and logs — and deletes the image files you attached, from "
                     "wherever they live on this Mac. You'll scan the QR to link again "
                     "next time.\n\nQuit and erase?", icon="warning", default="no"):
                 return
@@ -1637,7 +1816,7 @@ class App(tk.Tk):
     # the work they'd report on belongs to a screen that no longer exists.
     _MAIN_SCREEN_EVENTS = frozenset({
         "log", "group_start", "progress", "send_done",
-        "refresh_status", "refresh_done", "update_done", "group_perms",
+        "refresh_status", "refresh_done", "update_done", "group_perms", "notes_done",
     })
 
     def _handle(self, kind: str, payload) -> None:
@@ -1711,6 +1890,8 @@ class App(tk.Tk):
                 self.groups_sync_label.configure(text=payload)
         elif kind == "refresh_done":
             self._finish_refresh(payload)
+        elif kind == "notes_done":
+            self._finish_notes(payload)
         elif kind == "update_done":
             self._finish_update(payload)
         elif kind == "group_perms":

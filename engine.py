@@ -58,7 +58,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.17.0"
+APP_VERSION = "1.18.0"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -926,13 +926,21 @@ def sync_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
             # media backlog that's the whole bottleneck; the group/contacts sync that
             # populates listGroups is a small control message that still comes through.
             # This makes the drain many times faster without changing what we learn.
+            #
+            # -o json so the drain is parseable on the way past: this queue also
+            # carries the phone's notes-to-self, and each message is delivered to this
+            # device exactly once, so anything we don't keep here is lost.
             recv = subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-a", account,
+                                       "-o", "json",
                                        "receive", "--timeout", str(SYNC_BURST_S),
                                        "--ignore-attachments", "--ignore-avatars",
                                        "--ignore-stickers", "--ignore-stories"),
                                   capture_output=True, text=True, errors="replace",
                                   timeout=recv_timeout, env=_signal_env(binary))
         except subprocess.TimeoutExpired as exc:
+            out_raw = exc.output or b""
+            _save_notes_seen_during(out_raw.decode("utf-8", "replace")
+                                    if isinstance(out_raw, bytes) else str(out_raw))
             raw = exc.stderr or exc.output or b""
             partial = (raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)).strip()
             if partial and ACCOUNT_UNUSABLE_PATTERN.search(partial):
@@ -957,6 +965,7 @@ def sync_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
                     break
                 continue
         else:
+            _save_notes_seen_during(recv.stdout or "")
             out = ((recv.stderr or "") + (recv.stdout or "")).strip()
             if recv.returncode != 0:
                 _sync_log(f"receive rc={recv.returncode}: {out[:200]}")
@@ -1050,6 +1059,182 @@ def unsendable_groups(account: str) -> set[str]:
         if me is not None and not me.get("isAdmin"):
             blocked.add(gid)  # confirmed non-admin in an admin-only group
     return blocked
+
+
+# --------------------------------------------------------------------------- #
+# Notes to self
+# --------------------------------------------------------------------------- #
+# Anything typed into Signal's "Note to Self" chat on the phone is mirrored to every
+# linked device — this Mac included — as a sync transcript. We keep those, so a note
+# written on the phone (text, photos, or both) can be turned into a broadcast here.
+#
+# The filter has to be exact, and this is the important part: a phone also mirrors
+# every ORDINARY message you send to anyone as the same kind of transcript. The only
+# thing separating "my note to myself" from "my private message to a friend" is that a
+# note's destination is me. So a transcript counts as a note only when its destination
+# is positively our own account, and nothing else about a non-note envelope is parsed,
+# stored, or logged — not the text, not the recipient.
+NOTES_FILE = PROJECT_DIR / "notes.json"
+NOTES_BURST_S = 10        # signal-cli's own idle cap for one notes drain
+NOTES_TIMEOUT_S = 180     # hard kill-switch; a note's photos have to download inside it
+NOTES_KEEP = 300          # most recent notes retained
+
+
+def _is_note_to_self(envelope: dict, sent: dict) -> bool:
+    """True only when this sync transcript is a message we sent to OURSELVES.
+
+    Matched on identity, not on absence of a recipient: a direct message to another
+    person is the same envelope shape with someone else's UUID in it, so a looser test
+    (e.g. "no group info") would sweep private conversations into the notes list."""
+    src_uuid, dst_uuid = envelope.get("sourceUuid"), sent.get("destinationUuid")
+    if src_uuid and dst_uuid and src_uuid == dst_uuid:
+        return True
+    src_num, dst_num = envelope.get("sourceNumber"), sent.get("destinationNumber")
+    return bool(src_num and dst_num and src_num == dst_num)
+
+
+def _note_from_envelope(envelope: dict, media_downloaded: bool) -> dict | None:
+    """One stored note from one received envelope, or None if it isn't a note.
+
+    ``media_downloaded`` says whether this drain was allowed to fetch attachments. The
+    group sync deliberately isn't (it would pull the whole media backlog), so a note
+    that arrives during one keeps its text and records that its photos never landed —
+    better than showing a note with silently missing images."""
+    sent = (envelope.get("syncMessage") or {}).get("sentMessage")
+    if not isinstance(sent, dict) or not _is_note_to_self(envelope, sent):
+        return None
+    text = sent.get("message") or ""
+    photos, missing = [], 0
+    for att in (sent.get("attachments") or []):
+        # signal-cli stores a downloaded attachment under its id in the config dir.
+        path = DATA_DIR / "attachments" / str(att.get("id") or "")
+        if media_downloaded and att.get("id") and path.is_file():
+            photos.append({"path": str(path), "name": att.get("filename") or path.name})
+        else:
+            missing += 1
+    if not text and not photos and not missing:
+        return None            # an empty transcript (a read receipt, a typing marker)
+    return {
+        "ts": int(sent.get("timestamp") or envelope.get("timestamp") or 0),
+        "text": text,
+        "photos": photos,
+        "missing_photos": missing,
+        # Notes inherit the chat's disappearing-message timer. Signal promises those
+        # vanish; a copy sitting on this Mac forever would quietly break that, so the
+        # expiry is carried here and enforced in prune_notes().
+        "expires": int(sent.get("expiresInSeconds") or 0),
+    }
+
+
+def harvest_notes(receive_output: str, media_downloaded: bool = True) -> list[dict]:
+    """Every note-to-self in one `receive -o json` run, oldest first. Tolerant by
+    design: a malformed line is skipped, never fatal — this runs inside the group sync,
+    which must not fail because of an odd envelope."""
+    found = []
+    for line in (receive_output or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            envelope = json.loads(line).get("envelope")
+        except ValueError:
+            continue
+        if not isinstance(envelope, dict):
+            continue
+        note = _note_from_envelope(envelope, media_downloaded)
+        if note:
+            found.append(note)
+    return sorted(found, key=lambda n: n["ts"])
+
+
+def prune_notes(notes: list[dict], now: float | None = None) -> list[dict]:
+    """Drop notes whose disappearing-message timer has run out, and cap the list."""
+    now = time.time() if now is None else now
+    kept = [n for n in notes
+            if not n.get("expires") or (n["ts"] / 1000 + n["expires"]) > now]
+    return sorted(kept, key=lambda n: n["ts"], reverse=True)[:NOTES_KEEP]
+
+
+def read_notes() -> list[dict]:
+    """Stored notes, newest first. Expired ones are filtered on the way out, so a note
+    disappears on time even if nothing has fetched since."""
+    try:
+        data = json.loads(NOTES_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return prune_notes([n for n in data if isinstance(n, dict) and "ts" in n])
+
+
+def write_notes(notes: list[dict]) -> None:
+    NOTES_FILE.write_text(json.dumps(prune_notes(notes), indent=1), encoding="utf-8")
+
+
+def merge_notes(existing: list[dict], found: list[dict]) -> tuple[list[dict], int]:
+    """Add newly-received notes to the stored ones. Returns (merged, new_count).
+    Deduped on the send timestamp, which is unique per message, so re-running a drain
+    can't double up a note."""
+    seen = {n["ts"] for n in existing}
+    fresh = [n for n in found if n["ts"] not in seen]
+    return prune_notes(list(existing) + fresh), len(fresh)
+
+
+def fetch_notes(account: str, on_log: LogFn = lambda *_: None) -> int:
+    """Drain what's waiting for this device and keep the notes. Returns how many are
+    new.
+
+    Deliberately a one-shot the user asks for, not a poll: it holds the same lock as a
+    broadcast (one signal-cli operation per account), and unlike the group sync it DOES
+    download attachments, because a note's photos are half the point of reading it here.
+    Everything the drain pulls that isn't a note is discarded unread, exactly as it is
+    today."""
+    binary = signal_cli_bin()
+    with send_lock():
+        try:
+            proc = subprocess.run(
+                _cli(binary, "--config", str(DATA_DIR), "-a", account, "-o", "json",
+                     "receive", "--timeout", str(NOTES_BURST_S),
+                     "--ignore-avatars", "--ignore-stickers", "--ignore-stories"),
+                capture_output=True, text=True, errors="replace",
+                timeout=NOTES_TIMEOUT_S, env=_signal_env(binary))
+            output, err = proc.stdout or "", (proc.stderr or "").strip()
+            failed = proc.returncode != 0
+        except subprocess.TimeoutExpired as exc:
+            # Timed out mid-drain: keep whatever notes already came through rather than
+            # losing them — the queue delivered them, so this is the only chance to.
+            raw = exc.output or b""
+            output = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+            output, err, failed = output, "", False
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise BroadcastError(f"Couldn't run signal-cli to check for notes: {exc}")
+    if failed and not output:
+        if ACCOUNT_UNUSABLE_PATTERN.search(err):
+            raise BroadcastError("Signal says this Mac isn't linked any more — link "
+                                 "again from the phone, then check for notes.")
+        raise BroadcastError(err or "Couldn't check for notes. Try again.")
+    stored, new = merge_notes(read_notes(), harvest_notes(output, media_downloaded=True))
+    write_notes(stored)
+    if new:
+        on_log(f"{new} new note{'' if new == 1 else 's'} from your phone.")
+    return new
+
+
+def _save_notes_seen_during(receive_output: str) -> None:
+    """Keep any notes that turn up in the group sync's drain.
+
+    The sync consumes the same queue and used to throw all of it away, so a note that
+    happened to arrive during an "Update list from phone" was gone for good — the
+    server delivers a message to this device once. That sync can't download media
+    (the whole point of it is to skip the media backlog), so those notes keep their
+    text and are marked as having photos we never got. Best-effort: this must never
+    raise into a group sync."""
+    try:
+        found = harvest_notes(receive_output, media_downloaded=False)
+        if found:
+            stored, new = merge_notes(read_notes(), found)
+            if new:
+                write_notes(stored)
+    except Exception:  # noqa: BLE001 — a notes problem can never break the group sync
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -2104,7 +2289,10 @@ def unlink() -> None:
     _delete_listed_attachments()
     # Delete config.toml outright — it holds the number — then recreate a fresh
     # placeholder from the template, so no local copy of the number survives.
-    for f in (GROUPS_FILE, MESSAGE_FILE, ATTACHMENTS_FILE, CONFIG_FILE):
+    # NOTES_FILE holds notes copied from the phone — the most personal thing here after
+    # the number, so it goes with everything else. The photos they point at live inside
+    # DATA_DIR, removed by the rmtree above.
+    for f in (GROUPS_FILE, MESSAGE_FILE, ATTACHMENTS_FILE, NOTES_FILE, CONFIG_FILE):
         f.unlink(missing_ok=True)
     _clear_dir(LOGS_DIR, keep={".gitkeep"})
     ensure_config()

@@ -5,7 +5,7 @@ to stay under Signal's rate limit. Runs on a Mac, linked to your phone as a
 secondary device — your number is **never re-registered**, so your phone stays
 logged in, exactly like Signal Desktop.
 
-It's a small app: a window with three tabs — **Send**, **Groups**, **Schedule**.
+It's a small app: a window with tabs — **Send**, **Notes**, **Groups**, **Schedule**.
 The same engine also runs from the command line for the automatic daily schedule.
 
 ---
@@ -57,6 +57,14 @@ Click **Signal Broadcast** on the Dock. The window opens on the **Send** tab.
     The strip locks while a send is running.
   - **Save for auto-send** stores the message for the daily schedule *without* sending
     now — use it when you've set up automatic times (see Schedule).
+- **Notes tab** — whatever you write in Signal's **Note to Self** chat on your phone
+  shows up here, words and photos, ready to broadcast. Click **Check for new notes**
+  (it's a button, not a background poll), pick one, then **Use as message** — the text
+  lands in the Send tab and its photos load into the photo strip. **Copy text** and
+  **Delete** do what they say; deleting removes the copy on this Mac, never the note on
+  your phone. Messages you send to other people are never read or stored.
+  - Only notes that arrive *after* this Mac was linked can appear — Signal never sends
+    a linked device your older history.
 - **Groups tab** — tick the groups to send to; untick any to skip. Click **Save
   selection**. Your choices stick even when you **Update list from phone**.
 - **Schedule tab** — turn on automatic daily sending at times you choose.
