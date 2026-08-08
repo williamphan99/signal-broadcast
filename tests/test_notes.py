@@ -218,8 +218,11 @@ class StoringNotes(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self._real = engine.NOTES_FILE
+        self._real_corrupt = engine.NOTES_CORRUPT_FILE
         engine.NOTES_FILE = Path(self.tmp.name) / "notes.json"
+        engine.NOTES_CORRUPT_FILE = Path(self.tmp.name) / "notes.corrupt.json"
         self.addCleanup(lambda: setattr(engine, "NOTES_FILE", self._real))
+        self.addCleanup(lambda: setattr(engine, "NOTES_CORRUPT_FILE", self._real_corrupt))
 
     def test_missing_file_reads_as_no_notes(self):
         self.assertEqual(engine.read_notes(), [])
@@ -263,6 +266,36 @@ class StoringNotes(unittest.TestCase):
 
     def test_a_corrupt_notes_file_reads_as_empty_rather_than_crashing(self):
         engine.NOTES_FILE.write_text("{not json", encoding="utf-8")
+        self.assertEqual(engine.read_notes(), [])
+
+    def test_a_corrupt_file_is_set_aside_instead_of_overwritten(self):
+        """Notes can't be re-fetched — each message reaches this device once — so a
+        damaged file must survive long enough to be salvaged by hand."""
+        engine.NOTES_FILE.write_text('[{"ts": 1, "text": "truncat', encoding="utf-8")
+        engine.read_notes()
+        self.assertFalse(engine.NOTES_FILE.exists())
+        self.assertIn("truncat", engine.NOTES_CORRUPT_FILE.read_text(encoding="utf-8"))
+        engine.write_notes([{"ts": 2, "text": "new"}])          # next write is unimpeded
+        self.assertEqual([n["text"] for n in engine.read_notes()], ["new"])
+
+    def test_a_write_leaves_no_temp_file_behind(self):
+        engine.write_notes([{"ts": 1, "text": "a"}])
+        self.assertEqual(sorted(p.name for p in engine.NOTES_FILE.parent.iterdir()),
+                         ["notes.json"])
+
+    def test_an_interrupted_write_cannot_destroy_the_previous_notes(self):
+        """The rename is the commit point: readers see the old file or the new one,
+        never a half-written one."""
+        engine.write_notes([{"ts": 1, "text": "safe"}])
+        original = engine.NOTES_FILE.read_text(encoding="utf-8")
+        with mock.patch("os.replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                engine.write_notes([{"ts": 2, "text": "doomed"}])
+        self.assertEqual(engine.NOTES_FILE.read_text(encoding="utf-8"), original)
+        self.assertEqual([n["text"] for n in engine.read_notes()], ["safe"])
+
+    def test_a_file_that_is_json_but_not_a_list_is_not_trusted(self):
+        engine.NOTES_FILE.write_text('{"ts": 1}', encoding="utf-8")
         self.assertEqual(engine.read_notes(), [])
 
 

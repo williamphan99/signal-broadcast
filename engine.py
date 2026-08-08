@@ -58,7 +58,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.18.3"
+APP_VERSION = "1.18.4"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -1075,6 +1075,7 @@ def unsendable_groups(account: str) -> set[str]:
 # is positively our own account, and nothing else about a non-note envelope is parsed,
 # stored, or logged — not the text, not the recipient.
 NOTES_FILE = PROJECT_DIR / "notes.json"
+NOTES_CORRUPT_FILE = PROJECT_DIR / "notes.corrupt.json"   # a file we couldn't parse
 NOTES_BURST_S = 10        # signal-cli's own idle cap for one notes drain
 NOTES_TIMEOUT_S = 180     # hard kill-switch; a note's photos have to download inside it
 NOTES_KEEP = 300          # most recent notes retained
@@ -1235,16 +1236,40 @@ def prune_notes(notes: list[dict], now: float | None = None) -> list[dict]:
 
 def read_notes() -> list[dict]:
     """Stored notes, newest first. Expired ones are filtered on the way out, so a note
-    disappears on time even if nothing has fetched since."""
+    disappears on time even if nothing has fetched since.
+
+    A file we can't parse is set aside rather than treated as "no notes": the next write
+    would otherwise overwrite it, turning a recoverable file into a permanent loss of
+    everything you'd collected. Notes can't be re-fetched — the server delivers each
+    message to this device once — so they're unrecoverable if this drops them."""
     try:
         data = json.loads(NOTES_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as exc:
+        try:
+            if NOTES_FILE.exists():
+                NOTES_FILE.replace(NOTES_CORRUPT_FILE)
+                _notes_log(f"unreadable notes file set aside as "
+                           f"{NOTES_CORRUPT_FILE.name}: {exc}")
+        except OSError:
+            pass
+        return []
+    if not isinstance(data, list):
         return []
     return prune_notes([n for n in data if isinstance(n, dict) and "ts" in n])
 
 
 def write_notes(notes: list[dict]) -> None:
-    NOTES_FILE.write_text(json.dumps(prune_notes(notes), indent=1), encoding="utf-8")
+    """Replace the stored notes atomically — write beside the file, then rename over it.
+
+    A plain write truncates first, so a crash or a full disk mid-write leaves a
+    half-written file, which read_notes can only treat as damaged. os.replace is atomic
+    on the same filesystem: readers see either the old file or the new one."""
+    NOTES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = NOTES_FILE.with_name(NOTES_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(prune_notes(notes), indent=1), encoding="utf-8")
+    os.replace(tmp, NOTES_FILE)
 
 
 def merge_notes(existing: list[dict], found: list[dict]) -> tuple[list[dict], int]:
@@ -2387,7 +2412,8 @@ def unlink() -> None:
     # NOTES_FILE holds notes copied from the phone — the most personal thing here after
     # the number, so it goes with everything else. The photos they point at live inside
     # DATA_DIR, removed by the rmtree above.
-    for f in (GROUPS_FILE, MESSAGE_FILE, ATTACHMENTS_FILE, NOTES_FILE, CONFIG_FILE):
+    for f in (GROUPS_FILE, MESSAGE_FILE, ATTACHMENTS_FILE, NOTES_FILE,
+              NOTES_CORRUPT_FILE, CONFIG_FILE):
         f.unlink(missing_ok=True)
     _clear_dir(LOGS_DIR, keep={".gitkeep"})
     ensure_config()
