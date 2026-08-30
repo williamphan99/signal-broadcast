@@ -51,6 +51,7 @@ class GroupSnapshotTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
              mock.patch.object(engine, "GROUPS_FILE", Path(directory) / "groups.txt"), \
              mock.patch.object(engine, "GROUPS_LOCK_FILE", Path(directory) / "groups.lock"), \
+             mock.patch.object(engine, "GROUP_PERMISSIONS_FILE", Path(directory) / "permissions.json"), \
              mock.patch.object(engine, "signal_cli_bin", return_value="/bin/true"), \
              mock.patch.object(engine.subprocess, "run", return_value=proc) as run:
             count = engine.pull_groups("+1")
@@ -59,6 +60,22 @@ class GroupSnapshotTests(unittest.TestCase):
         self.assertEqual(engine.cached_unsendable_groups("+1"), {"g2"})
         self.assertEqual(engine.cached_unsendable_groups("+other"), set())
         self.assertEqual(run.call_count, 1)
+
+    def test_permissions_survive_a_process_cache_reset(self):
+        groups = [
+            {"id": "g1", "name": "One", "permissionSendMessage": "ONLY_ADMINS",
+             "members": [{"number": "+1", "isAdmin": False}]},
+        ]
+        proc = mock.Mock(returncode=0, stdout=json.dumps(groups), stderr="")
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(engine, "GROUPS_FILE", Path(directory) / "groups.txt"), \
+             mock.patch.object(engine, "GROUPS_LOCK_FILE", Path(directory) / "groups.lock"), \
+             mock.patch.object(engine, "GROUP_PERMISSIONS_FILE", Path(directory) / "permissions.json"), \
+             mock.patch.object(engine, "signal_cli_bin", return_value="/bin/true"), \
+             mock.patch.object(engine.subprocess, "run", return_value=proc):
+            engine.pull_groups("+1")
+            engine._GROUP_PERMISSION_CACHE = ("", set())
+            self.assertEqual(engine.stored_unsendable_groups("+1"), {"g1"})
 
     def test_stable_group_sync_stays_within_seven_process_launches(self):
         calls = []
@@ -73,6 +90,7 @@ class GroupSnapshotTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
              mock.patch.object(engine, "GROUPS_FILE", Path(directory) / "groups.txt"), \
              mock.patch.object(engine, "GROUPS_LOCK_FILE", Path(directory) / "groups.lock"), \
+             mock.patch.object(engine, "GROUP_PERMISSIONS_FILE", Path(directory) / "permissions.json"), \
              mock.patch.object(engine, "signal_cli_bin", return_value="/bin/true"), \
              mock.patch.object(engine, "_sync_log"), \
              mock.patch.object(engine.subprocess, "run", side_effect=fake_run):

@@ -7,6 +7,8 @@ config.toml
 groups.txt
 groups.txt.*.tmp
 groups.lock
+group-permissions.json
+group-permissions.json.*.tmp
 message.txt
 attachments.txt
 

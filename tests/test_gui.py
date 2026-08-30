@@ -227,6 +227,23 @@ class GroupRefreshTests(unittest.TestCase):
         app._render_groups.assert_called_once_with()
         app._check_group_perms.assert_not_called()
 
+    def test_startup_uses_stored_permission_labels_without_signal_cli(self):
+        app = gui.App.__new__(gui.App)
+        app.group_entries = [engine.GroupEntry("g1", "One", True)]
+        app.events = queue.Queue()
+
+        def immediate_thread(*, target, daemon):
+            return types.SimpleNamespace(start=target)
+
+        with mock.patch.object(engine, "load_config", return_value=mock.Mock(account="+1")), \
+             mock.patch.object(engine, "stored_unsendable_groups", return_value={"g1"}), \
+             mock.patch.object(engine, "unsendable_groups") as live_probe, \
+             mock.patch.object(gui.threading, "Thread", side_effect=immediate_thread):
+            app._check_group_perms()
+
+        live_probe.assert_not_called()
+        self.assertEqual(app.events.get_nowait(), ("group_perms", {"g1"}))
+
 
 class _FakeListbox:
     def __init__(self):

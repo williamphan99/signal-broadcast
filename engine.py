@@ -56,6 +56,7 @@ CONFIG_FILE = PROJECT_DIR / "config.toml"          # per-user (holds the number)
 CONFIG_EXAMPLE_FILE = PROJECT_DIR / "config.example.toml"  # tracked template
 GROUPS_FILE = PROJECT_DIR / "groups.txt"
 GROUPS_LOCK_FILE = PROJECT_DIR / "groups.lock"
+GROUP_PERMISSIONS_FILE = PROJECT_DIR / "group-permissions.json"
 MESSAGE_FILE = PROJECT_DIR / "message.txt"
 ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 
@@ -63,7 +64,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.21.2"
+APP_VERSION = "1.21.3"
 
 
 @dataclass(frozen=True)
@@ -493,12 +494,7 @@ def _read_group_entries_file(path: Path) -> list[GroupEntry]:
     return entries
 
 
-def _write_group_entries_file(path: Path, entries: list[GroupEntry]) -> None:
-    lines = []
-    for entry in entries:
-        row = f"{entry.group_id}\t{entry.name}"
-        lines.append(row if entry.enabled else f"# {row}")
-    body = _GROUPS_HEADER + "\n".join(lines) + ("\n" if lines else "")
+def _atomic_write_text(path: Path, body: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
@@ -506,6 +502,14 @@ def _write_group_entries_file(path: Path, entries: list[GroupEntry]) -> None:
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def _write_group_entries_file(path: Path, entries: list[GroupEntry]) -> None:
+    lines = []
+    for entry in entries:
+        row = f"{entry.group_id}\t{entry.name}"
+        lines.append(row if entry.enabled else f"# {row}")
+    _atomic_write_text(path, _GROUPS_HEADER + "\n".join(lines) + ("\n" if lines else ""))
 
 
 def read_groups(path: Path | None = None) -> list[tuple[str, str]]:
@@ -1151,8 +1155,8 @@ def pull_groups(account: str) -> int:
     if proc.returncode != 0:
         raise BroadcastError("Could not fetch groups:\n" + (proc.stderr or proc.stdout))
     groups = json.loads(proc.stdout or "[]")
+    blocked = _unsendable_from_groups(groups, account)
     global _GROUP_PERMISSION_CACHE
-    _GROUP_PERMISSION_CACHE = (account, _unsendable_from_groups(groups, account))
     with _groups_transaction():
         was_disabled = {e.group_id for e in _read_group_entries_file(GROUPS_FILE)
                         if not e.enabled}
@@ -1164,6 +1168,8 @@ def pull_groups(account: str) -> int:
                 if gid:
                     entries.append(GroupEntry(gid, name, gid not in was_disabled))
         _write_group_entries_file(GROUPS_FILE, entries)
+        _atomic_write_text(GROUP_PERMISSIONS_FILE, json.dumps(sorted(blocked)))
+        _GROUP_PERMISSION_CACHE = (account, blocked)
     return len(entries)
 
 
@@ -1187,6 +1193,28 @@ def cached_unsendable_groups(account: str) -> set[str]:
     """Permissions from this process's latest successful group snapshot."""
     cached_account, group_ids = _GROUP_PERMISSION_CACHE
     return set(group_ids) if cached_account == account else set()
+
+
+def stored_unsendable_groups(account: str) -> set[str] | None:
+    """Saved UI permission labels from the latest successful group snapshot.
+
+    The file contains group IDs already present in groups.txt, not messages, member
+    lists, or Signal keys. A missing or damaged file asks the caller to fetch afresh.
+    """
+    global _GROUP_PERMISSION_CACHE
+    cached_account, group_ids = _GROUP_PERMISSION_CACHE
+    if cached_account == account:
+        return set(group_ids)
+    with _groups_transaction():
+        try:
+            data = json.loads(GROUP_PERMISSIONS_FILE.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError):
+            return None
+        if not isinstance(data, list) or not all(isinstance(gid, str) for gid in data):
+            return None
+        stored = set(data)
+        _GROUP_PERMISSION_CACHE = (account, stored)
+        return set(stored)
 
 
 def unsendable_groups(account: str) -> set[str]:
@@ -2609,6 +2637,7 @@ def unlink() -> None:
 
 
 def _unlink_locked() -> None:
+    global _GROUP_PERMISSION_CACHE
     disable_schedule()
     LOCAL_PLIST.unlink(missing_ok=True)
     shutil.rmtree(DATA_DIR, ignore_errors=True)        # link keys + account.db cache
@@ -2619,9 +2648,10 @@ def _unlink_locked() -> None:
     # NOTES_FILE holds notes copied from the phone — the most personal thing here after
     # the number, so it goes with everything else. The photos they point at live inside
     # DATA_DIR, removed by the rmtree above.
-    for f in (GROUPS_FILE, MESSAGE_FILE, ATTACHMENTS_FILE, NOTES_FILE,
+    for f in (GROUPS_FILE, GROUP_PERMISSIONS_FILE, MESSAGE_FILE, ATTACHMENTS_FILE, NOTES_FILE,
               NOTES_CORRUPT_FILE, CONFIG_FILE):
         f.unlink(missing_ok=True)
+    _GROUP_PERMISSION_CACHE = ("", set())
     # Keep both empty lock inodes stable while and after the wipe. Deleting a locked
     # pathname would let another process create a new inode and bypass the held flock.
     _clear_dir(LOGS_DIR, keep={".gitkeep", SIGNAL_CLI_LOCK_FILE.name})

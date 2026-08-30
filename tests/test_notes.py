@@ -308,6 +308,7 @@ class StoringNotes(unittest.TestCase):
             "DATA_DIR": root / "signal-cli-data",
             "GROUPS_FILE": root / "groups.txt",
             "GROUPS_LOCK_FILE": root / "groups.lock",
+            "GROUP_PERMISSIONS_FILE": root / "group-permissions.json",
             "MESSAGE_FILE": root / "message.txt",
             "ATTACHMENTS_FILE": root / "attachments.txt",
             "LOCAL_PLIST": root / "schedule.plist",
@@ -319,6 +320,7 @@ class StoringNotes(unittest.TestCase):
             self.addCleanup(patcher.stop)
         engine.NOTES_FILE.write_text('[{"ts":1,"text":"private"}]', encoding="utf-8")
         engine.GROUPS_FILE.write_text("g1\tPrivate group\n", encoding="utf-8")
+        engine.GROUP_PERMISSIONS_FILE.write_text('["g1"]', encoding="utf-8")
 
         with mock.patch.object(engine, "disable_schedule"), \
              mock.patch.object(engine, "_delete_listed_attachments"), \
@@ -331,6 +333,8 @@ class StoringNotes(unittest.TestCase):
 
         self.assertFalse(engine.NOTES_FILE.exists())
         self.assertFalse(engine.GROUPS_FILE.exists())
+        self.assertFalse(engine.GROUP_PERMISSIONS_FILE.exists())
+        self.assertEqual(engine._GROUP_PERMISSION_CACHE, ("", set()))
         self.assertTrue(engine.NOTES_LOCK_FILE.exists())
         self.assertTrue(engine.SIGNAL_CLI_LOCK_FILE.exists())
         self.assertTrue(engine.GROUPS_LOCK_FILE.exists())
