@@ -10,6 +10,7 @@ guest, and guard the small platform-aware seams added for the Pixel/Termux port:
 
 Run with:  python3 -m unittest discover -s tests
 """
+import json
 import os
 import tempfile
 import unittest
@@ -19,6 +20,46 @@ from unittest import mock
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import engine  # noqa: E402
+
+
+class GroupSnapshotTests(unittest.TestCase):
+    def test_one_group_read_also_populates_the_permission_cache(self):
+        groups = [
+            {"id": "g1", "name": "One", "permissionSendMessage": "EVERY_MEMBER",
+             "members": [{"number": "+1", "isAdmin": False}]},
+            {"id": "g2", "name": "Two", "permissionSendMessage": "ONLY_ADMINS",
+             "members": [{"number": "+1", "isAdmin": False}]},
+        ]
+        proc = mock.Mock(returncode=0, stdout=json.dumps(groups), stderr="")
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(engine, "GROUPS_FILE", Path(directory) / "groups.txt"), \
+             mock.patch.object(engine, "signal_cli_bin", return_value="/bin/true"), \
+             mock.patch.object(engine.subprocess, "run", return_value=proc) as run:
+            count = engine.pull_groups("+1")
+
+        self.assertEqual(count, 2)
+        self.assertEqual(engine.cached_unsendable_groups("+1"), {"g2"})
+        self.assertEqual(engine.cached_unsendable_groups("+other"), set())
+        self.assertEqual(run.call_count, 1)
+
+    def test_stable_group_sync_stays_within_seven_process_launches(self):
+        calls = []
+
+        def fake_run(argv, **_kwargs):
+            calls.append(argv)
+            if "listGroups" in argv:
+                return mock.Mock(returncode=0, stdout='[{"id":"g1","name":"One"}]',
+                                 stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(engine, "GROUPS_FILE", Path(directory) / "groups.txt"), \
+             mock.patch.object(engine, "signal_cli_bin", return_value="/bin/true"), \
+             mock.patch.object(engine, "_sync_log"), \
+             mock.patch.object(engine.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(engine.sync_groups("+1"), 1)
+
+        self.assertEqual(len(calls), 7, "one nudge plus three receive/listGroups rounds")
 
 
 class PacingTests(unittest.TestCase):

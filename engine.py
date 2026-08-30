@@ -62,7 +62,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.19.5"
+APP_VERSION = "1.19.6"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -1081,6 +1081,8 @@ def pull_groups(account: str) -> int:
     if proc.returncode != 0:
         raise BroadcastError("Could not fetch groups:\n" + (proc.stderr or proc.stdout))
     groups = json.loads(proc.stdout or "[]")
+    global _GROUP_PERMISSION_CACHE
+    _GROUP_PERMISSION_CACHE = (account, _unsendable_from_groups(groups, account))
     was_disabled = {e.group_id for e in read_group_entries() if not e.enabled}
     lines = []
     for g in groups:
@@ -1092,6 +1094,28 @@ def pull_groups(account: str) -> int:
                 lines.append(f"# {row}" if gid in was_disabled else row)
     GROUPS_FILE.write_text(_GROUPS_HEADER + "\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
     return len(lines)
+
+
+_GROUP_PERMISSION_CACHE: tuple[str, set[str]] = ("", set())
+
+
+def _unsendable_from_groups(groups: list[dict], account: str) -> set[str]:
+    blocked: set[str] = set()
+    for group in groups:
+        gid = group.get("id")
+        if not gid or group.get("permissionSendMessage") != "ONLY_ADMINS":
+            continue
+        me = next((member for member in (group.get("members") or [])
+                   if member.get("number") == account), None)
+        if me is not None and not me.get("isAdmin"):
+            blocked.add(gid)
+    return blocked
+
+
+def cached_unsendable_groups(account: str) -> set[str]:
+    """Permissions from this process's latest successful group snapshot."""
+    cached_account, group_ids = _GROUP_PERMISSION_CACHE
+    return set(group_ids) if cached_account == account else set()
 
 
 def unsendable_groups(account: str) -> set[str]:
@@ -1111,15 +1135,7 @@ def unsendable_groups(account: str) -> set[str]:
         groups = json.loads(proc.stdout or "[]")
     except (subprocess.SubprocessError, OSError, ValueError):
         return set()
-    blocked: set[str] = set()
-    for g in groups:
-        gid = g.get("id")
-        if not gid or g.get("permissionSendMessage") != "ONLY_ADMINS":
-            continue
-        me = next((m for m in (g.get("members") or []) if m.get("number") == account), None)
-        if me is not None and not me.get("isAdmin"):
-            blocked.add(gid)  # confirmed non-admin in an admin-only group
-    return blocked
+    return _unsendable_from_groups(groups, account)
 
 
 # --------------------------------------------------------------------------- #

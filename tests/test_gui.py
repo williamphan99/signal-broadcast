@@ -114,5 +114,21 @@ class LinkStateTests(unittest.TestCase):
         app._finish_update.assert_called_once_with(result)
 
 
+class GroupRefreshTests(unittest.TestCase):
+    def test_refresh_can_reuse_snapshot_permissions_without_another_probe(self):
+        app = gui.App.__new__(gui.App)
+        app._render_groups = mock.Mock()
+        app._check_group_perms = mock.Mock()
+        entries = [engine.GroupEntry("g1", "One", True)]
+
+        with mock.patch.object(engine, "read_group_entries", return_value=entries), \
+             mock.patch.object(gui.tk, "BooleanVar", side_effect=lambda value: value,
+                               create=True):
+            app._populate_groups(check_permissions=False)
+
+        app._render_groups.assert_called_once_with()
+        app._check_group_perms.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1358,14 +1358,15 @@ class App(tk.Tk):
         self.groups_progress = ttk.Progressbar(tab, mode="indeterminate", length=280)
         self._populate_groups()
 
-    def _populate_groups(self) -> None:
+    def _populate_groups(self, *, check_permissions: bool = True) -> None:
         """Load the groups once: one persistent BooleanVar per group (so tick state
         survives search filtering), then draw them via _render_groups."""
         self.group_entries = engine.read_group_entries()
         self.group_vars: dict[str, tk.BooleanVar] = {
             e.group_id: tk.BooleanVar(value=e.enabled) for e in self.group_entries}
         self._render_groups()
-        self._check_group_perms()  # mark admin-only groups in the background
+        if check_permissions:
+            self._check_group_perms()  # mark admin-only groups in the background
 
     def _check_group_perms(self) -> None:
         """Find which groups are admin-only (can't post) off the UI thread, then
@@ -1375,7 +1376,7 @@ class App(tk.Tk):
 
         def work():
             try:
-                account = engine.detect_account() or engine.load_config().account
+                account = engine.load_config().account
                 with engine.signal_cli_operation("checking group permissions"):
                     ids = engine.unsendable_groups(account)
             except engine.BroadcastError:
@@ -1829,7 +1830,7 @@ class App(tk.Tk):
 
         def work():
             try:
-                number = engine.detect_account() or engine.load_config().account
+                number = engine.load_config().account
                 count = engine.sync_groups(number, on_log=lambda m: self.events.put(("refresh_status", m)))
                 self.events.put(("refresh_done", count))
             except engine.BroadcastError as exc:
@@ -1849,7 +1850,9 @@ class App(tk.Tk):
             # A sync drains the same queue notes arrive on, so it may have picked some up.
             if hasattr(self, "notes_list"):
                 self._render_notes()
-            self._populate_groups()
+            account = engine.load_config().account
+            self._unsendable_ids = engine.cached_unsendable_groups(account)
+            self._populate_groups(check_permissions=False)
             self._refresh_status()
         else:
             self.groups_sync_label.configure(text=result, foreground=PALETTE["error"])
