@@ -1313,7 +1313,7 @@ class App(tk.Tk):
         note = self._selected_note()
         if not note:
             return
-        engine.write_notes([n for n in self._notes if n.get("ts") != note.get("ts")])
+        engine.delete_note(note["ts"])
         self._render_notes()
         self.notes_status.configure(text="Note deleted from this Mac (your phone keeps it).",
                                     foreground=PALETTE["muted"])

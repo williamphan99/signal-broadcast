@@ -62,7 +62,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.19.4"
+APP_VERSION = "1.19.5"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -1137,11 +1137,25 @@ def unsendable_groups(account: str) -> set[str]:
 # stored, or logged — not the text, not the recipient.
 NOTES_FILE = PROJECT_DIR / "notes.json"
 NOTES_CORRUPT_FILE = PROJECT_DIR / "notes.corrupt.json"   # a file we couldn't parse
+NOTES_LOCK_FILE = PROJECT_DIR / "notes.lock"
 # Notes are written from two places at once: the group sync keeps what it sees from a
 # worker thread while the window can delete or store on the main one. Both do
 # read-modify-write, so without this a delete could resurrect a note, or a note landing
 # mid-sync could be dropped. Reentrant because store_notes() reads and writes under it.
 _NOTES_LOCK = threading.RLock()
+
+
+@contextmanager
+def _notes_transaction() -> Iterator[None]:
+    """Serialize a complete notes read/modify/write across threads and processes."""
+    with _NOTES_LOCK:
+        NOTES_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with NOTES_LOCK_FILE.open("a+") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
 NOTES_BURST_S = 10        # signal-cli's own idle cap for one notes drain
 NOTES_TIMEOUT_S = 180     # hard kill-switch; a note's photos have to download inside it
 NOTES_KEEP = 300          # most recent notes retained
@@ -1308,7 +1322,7 @@ def read_notes() -> list[dict]:
     would otherwise overwrite it, turning a recoverable file into a permanent loss of
     everything you'd collected. Notes can't be re-fetched — the server delivers each
     message to this device once — so they're unrecoverable if this drops them."""
-    with _NOTES_LOCK:
+    with _notes_transaction():
         return _read_notes_locked()
 
 
@@ -1337,14 +1351,15 @@ def write_notes(notes: list[dict]) -> None:
     A plain write truncates first, so a crash or a full disk mid-write leaves a
     half-written file, which read_notes can only treat as damaged. os.replace is atomic
     on the same filesystem: readers see either the old file or the new one."""
-    with _NOTES_LOCK:
-        NOTES_FILE.parent.mkdir(parents=True, exist_ok=True)
-        # Per-process temp name: the lock only orders threads inside ONE app. A second
-        # process writing at the same moment (a stray second window) would otherwise
-        # race on a shared temp path and one would rename a file the other just moved.
-        tmp = NOTES_FILE.with_name(f"{NOTES_FILE.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(prune_notes(notes), indent=1), encoding="utf-8")
-        os.replace(tmp, NOTES_FILE)
+    with _notes_transaction():
+        _write_notes_locked(notes)
+
+
+def _write_notes_locked(notes: list[dict]) -> None:
+    NOTES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = NOTES_FILE.with_name(f"{NOTES_FILE.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(prune_notes(notes), indent=1), encoding="utf-8")
+    os.replace(tmp, NOTES_FILE)
 
 
 def store_notes(found: list[dict]) -> int:
@@ -1354,10 +1369,17 @@ def store_notes(found: list[dict]) -> int:
     they're a lost update: the group sync's worker thread and the window can both be
     part-way through a read-modify-write at the same moment, and whoever writes last
     silently discards what the other did."""
-    with _NOTES_LOCK:
-        merged, new = merge_notes(read_notes(), found)
-        write_notes(merged)
+    with _notes_transaction():
+        merged, new = merge_notes(_read_notes_locked(), found)
+        _write_notes_locked(merged)
         return new
+
+
+def delete_note(timestamp: int) -> None:
+    """Delete one stored note without racing a receive in another process."""
+    with _notes_transaction():
+        kept = [note for note in _read_notes_locked() if note.get("ts") != timestamp]
+        _write_notes_locked(kept)
 
 
 def merge_notes(existing: list[dict], found: list[dict]) -> tuple[list[dict], int]:
@@ -2497,7 +2519,7 @@ def unlink() -> None:
     # NOTES_FILE holds notes copied from the phone — the most personal thing here after
     # the number, so it goes with everything else. The photos they point at live inside
     # DATA_DIR, removed by the rmtree above.
-    for f in (GROUPS_FILE, MESSAGE_FILE, ATTACHMENTS_FILE, NOTES_FILE,
+    for f in (GROUPS_FILE, MESSAGE_FILE, ATTACHMENTS_FILE, NOTES_FILE, NOTES_LOCK_FILE,
               NOTES_CORRUPT_FILE, CONFIG_FILE):
         f.unlink(missing_ok=True)
     _clear_dir(LOGS_DIR, keep={".gitkeep"})

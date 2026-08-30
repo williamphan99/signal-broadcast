@@ -14,6 +14,7 @@ Run with:  python3 -m unittest discover -s tests
 from __future__ import annotations
 
 import json
+import multiprocessing
 import sys
 import tempfile
 import unittest
@@ -22,6 +23,21 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import engine  # noqa: E402
+
+
+def _hold_notes_transaction(notes_file: str, lock_file: str, ready, release) -> None:
+    engine.NOTES_FILE = Path(notes_file)
+    engine.NOTES_LOCK_FILE = Path(lock_file)
+    with engine._notes_transaction():
+        ready.set()
+        release.wait(timeout=5)
+
+
+def _store_note_in_process(notes_file: str, lock_file: str, done) -> None:
+    engine.NOTES_FILE = Path(notes_file)
+    engine.NOTES_LOCK_FILE = Path(lock_file)
+    engine.store_notes([{"ts": 99, "text": "from another process"}])
+    done.set()
 
 ME_UUID = "ac8ef43b-0000-0000-0000-000000000001"
 ME_NUMBER = "+61400000000"
@@ -219,10 +235,13 @@ class StoringNotes(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self._real = engine.NOTES_FILE
         self._real_corrupt = engine.NOTES_CORRUPT_FILE
+        self._real_lock = engine.NOTES_LOCK_FILE
         engine.NOTES_FILE = Path(self.tmp.name) / "notes.json"
         engine.NOTES_CORRUPT_FILE = Path(self.tmp.name) / "notes.corrupt.json"
+        engine.NOTES_LOCK_FILE = Path(self.tmp.name) / "notes.lock"
         self.addCleanup(lambda: setattr(engine, "NOTES_FILE", self._real))
         self.addCleanup(lambda: setattr(engine, "NOTES_CORRUPT_FILE", self._real_corrupt))
+        self.addCleanup(lambda: setattr(engine, "NOTES_LOCK_FILE", self._real_lock))
 
     def test_missing_file_reads_as_no_notes(self):
         self.assertEqual(engine.read_notes(), [])
@@ -281,7 +300,30 @@ class StoringNotes(unittest.TestCase):
     def test_a_write_leaves_no_temp_file_behind(self):
         engine.write_notes([{"ts": 1, "text": "a"}])
         self.assertEqual(sorted(p.name for p in engine.NOTES_FILE.parent.iterdir()),
-                         ["notes.json"])
+                         ["notes.json", "notes.lock"])
+
+    def test_delete_removes_only_the_selected_note(self):
+        engine.write_notes([{"ts": 1, "text": "keep"}, {"ts": 2, "text": "delete"}])
+        engine.delete_note(2)
+        self.assertEqual([n["text"] for n in engine.read_notes()], ["keep"])
+
+    def test_a_second_process_waits_for_the_notes_transaction(self):
+        ctx = multiprocessing.get_context("spawn")
+        ready, release, done = ctx.Event(), ctx.Event(), ctx.Event()
+        holder = ctx.Process(target=_hold_notes_transaction, args=(
+            str(engine.NOTES_FILE), str(engine.NOTES_LOCK_FILE), ready, release))
+        writer = ctx.Process(target=_store_note_in_process, args=(
+            str(engine.NOTES_FILE), str(engine.NOTES_LOCK_FILE), done))
+        holder.start()
+        self.assertTrue(ready.wait(timeout=5))
+        writer.start()
+        self.assertFalse(done.wait(timeout=0.25), "writer must wait for the other process")
+        release.set()
+        holder.join(timeout=5)
+        writer.join(timeout=5)
+        self.assertEqual((holder.exitcode, writer.exitcode), (0, 0))
+        self.assertTrue(done.is_set())
+        self.assertEqual([n["text"] for n in engine.read_notes()], ["from another process"])
 
     def test_an_interrupted_write_cannot_destroy_the_previous_notes(self):
         """The rename is the commit point: readers see the old file or the new one,
@@ -307,8 +349,11 @@ class NotesSurviveTheGroupSync(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self._real = engine.NOTES_FILE
+        self._real_lock = engine.NOTES_LOCK_FILE
         engine.NOTES_FILE = Path(self.tmp.name) / "notes.json"
+        engine.NOTES_LOCK_FILE = Path(self.tmp.name) / "notes.lock"
         self.addCleanup(lambda: setattr(engine, "NOTES_FILE", self._real))
+        self.addCleanup(lambda: setattr(engine, "NOTES_LOCK_FILE", self._real_lock))
 
     def test_a_note_seen_during_a_sync_is_saved(self):
         engine._save_notes_seen_during(envelope(note("written mid-sync", ts=42)))
