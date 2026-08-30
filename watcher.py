@@ -71,7 +71,14 @@ class PowerWatcher:
             self._log(f"Unplugged — wiping in {self._grace:.0f}s unless power returns.")
         elif self._clock() >= self._grace_deadline:
             self._log("Grace elapsed — wiping now.")
-            self._wipe()
+            try:
+                self._wipe()
+            except Exception as exc:
+                # An active send/sync owns the safe wipe boundary. Stay awake and keep
+                # the elapsed deadline so the next poll retries instead of abandoning
+                # station-mode protection or partially deleting live state.
+                self._log(f"Wipe delayed — {exc}. Retrying.")
+                return
             self._battery_polls = 0                # reset silently; the wipe wasn't cancelled
             self._grace_deadline = None
             self._set_awake(False)
