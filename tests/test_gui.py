@@ -121,13 +121,76 @@ class GroupRefreshTests(unittest.TestCase):
         app._check_group_perms = mock.Mock()
         entries = [engine.GroupEntry("g1", "One", True)]
 
-        with mock.patch.object(engine, "read_group_entries", return_value=entries), \
-             mock.patch.object(gui.tk, "BooleanVar", side_effect=lambda value: value,
-                               create=True):
+        with mock.patch.object(engine, "read_group_entries", return_value=entries):
             app._populate_groups(check_permissions=False)
 
         app._render_groups.assert_called_once_with()
         app._check_group_perms.assert_not_called()
+
+
+class _FakeListbox:
+    def __init__(self):
+        self.items = []
+        self.selected = set()
+
+    def delete(self, _first, _last):
+        self.items.clear()
+        self.selected.clear()
+
+    def insert(self, _where, label):
+        self.items.append(label)
+
+    def selection_set(self, first, last=None):
+        last = first if last is None else last
+        self.selected.update(range(first, last + 1))
+
+    def selection_clear(self, first, last):
+        end = len(self.items) - 1 if last == "end" else last
+        self.selected.difference_update(range(first, end + 1))
+
+    def curselection(self):
+        return tuple(sorted(self.selected))
+
+
+class _Value:
+    def __init__(self, value=""):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+
+class _Label:
+    def configure(self, **_kwargs):
+        pass
+
+
+class LargeGroupRenderingTests(unittest.TestCase):
+    def test_five_thousand_groups_use_one_list_and_keep_selection_across_filters(self):
+        app = gui.App.__new__(gui.App)
+        app.groups_list = _FakeListbox()
+        app.group_search = _Value()
+        app.group_count_label = _Label()
+        app.group_entries = [engine.GroupEntry(f"g{i}", f"Group {i}", True)
+                             for i in range(5000)]
+        app._enabled_group_ids = {"g0", "g4999"}
+        app._visible_ids = []
+        app._group_render_job = None
+        app._unsendable_ids = set()
+
+        app._render_groups()
+        self.assertEqual(len(app.groups_list.items), 5000)
+        self.assertEqual(len(app.groups_list.selected), 2)
+
+        app.group_search.value = "4999"
+        app._render_groups()
+        self.assertEqual(app._visible_ids, ["g4999"])
+        self.assertEqual(app.groups_list.selected, {0})
+
+        app.group_search.value = ""
+        app._render_groups()
+        self.assertEqual(app._enabled_group_ids, {"g0", "g4999"})
+        self.assertEqual(len(app.groups_list.items), 5000)
 
 
 if __name__ == "__main__":

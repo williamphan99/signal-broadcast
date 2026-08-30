@@ -1312,34 +1312,34 @@ async function stopSend(){ await api('/api/stop',{method:'POST'}); $('#cStat').t
 
 // ---------------- groups ----------------
 let allGroups=[];
+let groupsById=new Map();
 async function loadGroups(){
   const r=await api('/api/groups'); if(r.__neterr)return;
-  allGroups=r.groups||[]; renderGroups();
+  allGroups=r.groups||[];
+  groupsById=new Map(allGroups.map(g=>[g.id,g]));
+  renderGroups();
   const ls=localStorage.getItem('sb_last_sync');
   $('#lastSync').textContent = ls ? ('Last synced '+ls) : 'Not synced yet on this phone';
   $('#grpSearch').classList.toggle('hidden', allGroups.length<8);
 }
-// Pull the current on-screen checkbox states back into allGroups, so re-rendering
-// (search filter, select-all) never loses selections that aren't saved yet.
-function syncShown(){ $$('#groups input').forEach(c=>{ const g=allGroups.find(x=>x.id===c.dataset.id); if(g)g.enabled=c.checked; }); }
 function renderGroups(){
   const q=($('#grpSearch').value||'').toLowerCase();
   const list=allGroups.filter(g=>!q||(g.name||'').toLowerCase().includes(q));
   const el=$('#groups');
   if(!allGroups.length){ el.innerHTML='<div class="empty">No groups yet.<br>Tap <b>Sync from phone</b> above.</div>'; }
   else if(!list.length){ el.innerHTML='<div class="empty">No groups match “'+esc(q)+'”</div>'; }
-  else{ el.innerHTML=list.map(g=>'<label class="grow"><input type="checkbox" data-id="'+esc(g.id)+'" '+(g.enabled?'checked':'')+' onchange="updCount()"><span>'+esc(g.name)+'</span></label>').join(''); }
+  else{ el.innerHTML=list.map(g=>'<label class="grow"><input type="checkbox" data-id="'+esc(g.id)+'" '+(g.enabled?'checked':'')+' onchange="setGroupEnabled(this)"><span>'+esc(g.name)+'</span></label>').join(''); }
   updCount();
 }
-function filterGroups(){ syncShown(); renderGroups(); }
+let groupFilterTimer=null;
+function filterGroups(){ clearTimeout(groupFilterTimer); groupFilterTimer=setTimeout(renderGroups,120); }
+function setGroupEnabled(box){ const group=groupsById.get(box.dataset.id); if(group)group.enabled=box.checked; updCount(); }
 function updCount(){
-  syncShown();
   const sel=allGroups.filter(g=>g.enabled).length;
   $('#grpCount').textContent = allGroups.length ? (sel+' of '+allGroups.length+' selected') : '';
 }
-function selectAll(v){ $$('#groups input').forEach(c=>c.checked=v); updCount(); }
+function selectAll(v){ $$('#groups input').forEach(c=>{ c.checked=v; const group=groupsById.get(c.dataset.id); if(group)group.enabled=v; }); updCount(); }
 async function saveGroups(){
-  syncShown();
   const enabled=allGroups.filter(g=>g.enabled).map(g=>g.id);
   const r=await api('/api/groups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
   if(r.__neterr){ toast('Couldn’t save','err'); return; }

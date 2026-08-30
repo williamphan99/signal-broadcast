@@ -1326,7 +1326,7 @@ class App(tk.Tk):
         ttk.Button(top, text="Select none", command=lambda: self._set_all_groups(False)).pack(side="right")
         ttk.Button(top, text="Select all", command=lambda: self._set_all_groups(True)).pack(side="right", padx=6)
         ttk.Label(tab, wraplength=600, justify="left", foreground=PALETTE["muted"], text=(
-            "Tick the groups to send to; unticked groups are skipped. Click "
+            "Select the groups to send to; unselected groups are skipped. Click "
             "“Save selection” to apply — your choices are kept even when you update "
             "the list from your phone.")
         ).pack(anchor="w", pady=(2, 6))
@@ -1337,7 +1337,7 @@ class App(tk.Tk):
         search_row.pack(fill="x", pady=(4, 0))
         ttk.Label(search_row, text="Search:").pack(side="left")
         self.group_search = tk.StringVar()
-        self.group_search.trace_add("write", lambda *_: self._render_groups())
+        self.group_search.trace_add("write", lambda *_: self._schedule_group_render())
         self.group_search_entry = ttk.Entry(search_row, textvariable=self.group_search)
         self.group_search_entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
         ttk.Button(search_row, text="Clear", width=6,
@@ -1345,7 +1345,14 @@ class App(tk.Tk):
 
         listwrap = ttk.Frame(tab)
         listwrap.pack(fill="both", expand=True, pady=(4, 8))
-        self.groups_inner = self._scrollable(listwrap)
+        self.groups_list = tk.Listbox(listwrap, selectmode="multiple", exportselection=False,
+                                     activestyle="none")
+        group_scroll = ttk.Scrollbar(listwrap, orient="vertical", command=self.groups_list.yview)
+        self.groups_list.configure(yscrollcommand=group_scroll.set)
+        self.groups_list.pack(side="left", fill="both", expand=True)
+        group_scroll.pack(side="right", fill="y")
+        self.groups_list.bind("<<ListboxSelect>>", self._on_group_selection)
+        self._group_render_job = None
 
         bottom = ttk.Frame(tab)
         bottom.pack(fill="x")
@@ -1362,8 +1369,8 @@ class App(tk.Tk):
         """Load the groups once: one persistent BooleanVar per group (so tick state
         survives search filtering), then draw them via _render_groups."""
         self.group_entries = engine.read_group_entries()
-        self.group_vars: dict[str, tk.BooleanVar] = {
-            e.group_id: tk.BooleanVar(value=e.enabled) for e in self.group_entries}
+        self._enabled_group_ids = {e.group_id for e in self.group_entries if e.enabled}
+        self._visible_ids = []
         self._render_groups()
         if check_permissions:
             self._check_group_perms()  # mark admin-only groups in the background
@@ -1384,40 +1391,66 @@ class App(tk.Tk):
             self.events.put(("group_perms", ids))
         threading.Thread(target=work, daemon=True).start()
 
+    def _schedule_group_render(self) -> None:
+        if self._group_render_job is not None:
+            self.after_cancel(self._group_render_job)
+        self._group_render_job = self.after(120, self._render_groups)
+
+    def _sync_visible_group_selection(self) -> None:
+        if getattr(self, "_rendering_groups", False):
+            return
+        selected = {int(index) for index in self.groups_list.curselection()}
+        for index, group_id in enumerate(getattr(self, "_visible_ids", [])):
+            if index in selected:
+                self._enabled_group_ids.add(group_id)
+            else:
+                self._enabled_group_ids.discard(group_id)
+
     def _render_groups(self) -> None:
-        """Draw the checkboxes for groups matching the search box, reusing the
-        existing vars so selections persist across filtering. Admin-only groups
-        (you can't post in them) are labelled and will be skipped at send time."""
-        for child in self.groups_inner.winfo_children():
-            child.destroy()
+        """Render every visible group in one native list widget."""
+        self._group_render_job = None
+        self._sync_visible_group_selection()
         query = self.group_search.get().strip().lower() if hasattr(self, "group_search") else ""
         blocked = getattr(self, "_unsendable_ids", set())
-        self._visible_ids: list[str] = []
+        self._visible_ids = []
+        self._rendering_groups = True
+        self.groups_list.delete(0, "end")
         for e in self.group_entries:
             if query and query not in e.name.lower():
                 continue
+            index = len(self._visible_ids)
             self._visible_ids.append(e.group_id)
             label = f"{e.name}   ·  admin-only (skipped)" if e.group_id in blocked else e.name
-            ttk.Checkbutton(self.groups_inner, text=label, variable=self.group_vars[e.group_id],
-                            command=self._update_group_count).pack(anchor="w", pady=1)
+            self.groups_list.insert("end", label)
+            if e.group_id in self._enabled_group_ids:
+                self.groups_list.selection_set(index)
+        self._rendering_groups = False
         if not self.group_entries:
-            ttk.Label(self.groups_inner, text="No groups yet — link your phone first.",
-                      foreground=PALETTE["muted"]).pack(anchor="w")
+            self.groups_list.insert("end", "No groups yet — link your phone first.")
         elif not self._visible_ids:
-            ttk.Label(self.groups_inner, text="No groups match your search.",
-                      foreground=PALETTE["muted"]).pack(anchor="w")
+            self.groups_list.insert("end", "No groups match your search.")
+        self._update_group_count()
+
+    def _on_group_selection(self, _event=None) -> None:
+        self._sync_visible_group_selection()
         self._update_group_count()
 
     def _set_all_groups(self, value: bool) -> None:
         """Select all / none — limited to the groups currently shown, so it respects
         an active search (with no search, that's every group)."""
-        for gid in (self._visible_ids or list(self.group_vars)):
-            self.group_vars[gid].set(value)
+        visible = getattr(self, "_visible_ids", [])
+        if value:
+            self._enabled_group_ids.update(visible)
+            if visible:
+                self.groups_list.selection_set(0, len(visible) - 1)
+        else:
+            self._enabled_group_ids.difference_update(visible)
+            self.groups_list.selection_clear(0, "end")
         self._update_group_count()
 
     def _update_group_count(self) -> None:
-        total = len(self.group_vars)
-        selected = sum(1 for v in self.group_vars.values() if v.get())
+        total = len(self.group_entries)
+        selected = len(self._enabled_group_ids)
         text = f"{selected} of {total} selected"
         shown = len(getattr(self, "_visible_ids", []))
         if shown != total:
@@ -1425,10 +1458,11 @@ class App(tk.Tk):
         self.group_count_label.configure(text=text)
 
     def _save_groups(self) -> None:
-        enabled = {gid for gid, var in self.group_vars.items() if var.get()}
+        self._sync_visible_group_selection()
+        enabled = set(self._enabled_group_ids)
         engine.write_group_selection(enabled)
         self._refresh_status()
-        messagebox.showinfo("Saved", f"{len(enabled)} of {len(self.group_vars)} "
+        messagebox.showinfo("Saved", f"{len(enabled)} of {len(self.group_entries)} "
                             "groups will receive the broadcast.")
 
     # --------------------------------------------------------------- schedule

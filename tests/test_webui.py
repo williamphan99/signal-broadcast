@@ -70,6 +70,12 @@ class WebUITests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertIn(b"Signal Broadcast", r.data)
 
+    def test_group_checkbox_updates_use_the_id_index(self):
+        page = self.c.get("/").get_data(as_text=True)
+        self.assertIn("groupsById=new Map", page)
+        self.assertIn("groupsById.get", page)
+        self.assertNotIn("allGroups.find", page)
+
     def test_state_linked(self):
         j = self.c.get("/api/state").get_json()
         self.assertTrue(j["linked"])
