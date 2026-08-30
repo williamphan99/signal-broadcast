@@ -297,6 +297,41 @@ class StoringNotes(unittest.TestCase):
         engine.write_notes([{"ts": 2, "text": "new"}])          # next write is unimpeded
         self.assertEqual([n["text"] for n in engine.read_notes()], ["new"])
 
+    def test_unlink_keeps_stable_lock_inodes_and_removes_personal_data(self):
+        root = Path(self.tmp.name)
+        logs = root / "logs"
+        paths = {
+            "LOGS_DIR": logs,
+            "SIGNAL_CLI_LOCK_FILE": logs / "sending.lock",
+            "SEND_LOCK_FILE": logs / "sending.lock",
+            "DATA_DIR": root / "signal-cli-data",
+            "GROUPS_FILE": root / "groups.txt",
+            "MESSAGE_FILE": root / "message.txt",
+            "ATTACHMENTS_FILE": root / "attachments.txt",
+            "LOCAL_PLIST": root / "schedule.plist",
+            "CONFIG_FILE": root / "config.toml",
+        }
+        patches = [mock.patch.object(engine, name, value) for name, value in paths.items()]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        engine.NOTES_FILE.write_text('[{"ts":1,"text":"private"}]', encoding="utf-8")
+        engine.GROUPS_FILE.write_text("g1\tPrivate group\n", encoding="utf-8")
+
+        with mock.patch.object(engine, "disable_schedule"), \
+             mock.patch.object(engine, "_delete_listed_attachments"), \
+             mock.patch.object(engine, "ensure_config"):
+            with engine.signal_cli_operation("syncing groups"):
+                with self.assertRaises(engine.BroadcastError):
+                    engine.unlink()
+            self.assertTrue(engine.NOTES_FILE.exists(), "a busy wipe must not partly erase")
+            engine.unlink()
+
+        self.assertFalse(engine.NOTES_FILE.exists())
+        self.assertFalse(engine.GROUPS_FILE.exists())
+        self.assertTrue(engine.NOTES_LOCK_FILE.exists())
+        self.assertTrue(engine.SIGNAL_CLI_LOCK_FILE.exists())
+
     def test_a_write_leaves_no_temp_file_behind(self):
         engine.write_notes([{"ts": 1, "text": "a"}])
         self.assertEqual(sorted(p.name for p in engine.NOTES_FILE.parent.iterdir()),

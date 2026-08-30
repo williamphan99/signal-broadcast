@@ -62,7 +62,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.20.2"
+APP_VERSION = "1.20.3"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -2525,6 +2525,12 @@ def unlink() -> None:
     image files, the schedule, and any logs. Leaves no personal data behind — use
     before handing the Mac to someone else. The phone (primary device) is untouched;
     to also drop this device from the phone, remove it under Signal → Linked Devices."""
+    with signal_cli_operation("unlinking"):
+        with _notes_transaction():
+            _unlink_locked()
+
+
+def _unlink_locked() -> None:
     disable_schedule()
     LOCAL_PLIST.unlink(missing_ok=True)
     shutil.rmtree(DATA_DIR, ignore_errors=True)        # link keys + account.db cache
@@ -2535,8 +2541,10 @@ def unlink() -> None:
     # NOTES_FILE holds notes copied from the phone — the most personal thing here after
     # the number, so it goes with everything else. The photos they point at live inside
     # DATA_DIR, removed by the rmtree above.
-    for f in (GROUPS_FILE, MESSAGE_FILE, ATTACHMENTS_FILE, NOTES_FILE, NOTES_LOCK_FILE,
+    for f in (GROUPS_FILE, MESSAGE_FILE, ATTACHMENTS_FILE, NOTES_FILE,
               NOTES_CORRUPT_FILE, CONFIG_FILE):
         f.unlink(missing_ok=True)
-    _clear_dir(LOGS_DIR, keep={".gitkeep"})
+    # Keep both empty lock inodes stable while and after the wipe. Deleting a locked
+    # pathname would let another process create a new inode and bypass the held flock.
+    _clear_dir(LOGS_DIR, keep={".gitkeep", SIGNAL_CLI_LOCK_FILE.name})
     ensure_config()
