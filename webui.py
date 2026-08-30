@@ -506,7 +506,6 @@ def create_app(state: _State | None = None) -> Flask:
         _linklog(f"detect_account -> {acct!r}")
         if acct:
             engine.save_account(acct)
-            _safe(lambda: engine.sync_groups(acct, on_log=lambda *_: None), None)
             with st.lock:
                 st.link_linked = True
                 # A fresh link supersedes any earlier "broken" verdict. Clearing it
@@ -525,7 +524,18 @@ def create_app(state: _State | None = None) -> Flask:
         deadline = time.time() + LINK_TOTAL_S
         try:
             while time.time() < deadline:
-                if st.link_linked or _one_link_attempt():
+                if st.link_linked:
+                    return
+                if _one_link_attempt():
+                    # Linking is complete once the account is saved. Group import is
+                    # useful but optional and can take minutes on a large backlog, so
+                    # run it independently after the UI is free to enter the app.
+                    account = engine.load_config().account
+                    threading.Thread(
+                        target=lambda: _safe(
+                            lambda: engine.sync_groups(account, on_log=lambda *_: None), None),
+                        daemon=True,
+                    ).start()
                     return
             with st.lock:
                 if not st.link_linked and not st.link_error:

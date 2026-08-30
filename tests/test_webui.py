@@ -11,6 +11,7 @@ import dataclasses
 import io
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -311,6 +312,32 @@ class WebUITests(unittest.TestCase):
                 time.sleep(0.05)
         self.assertTrue(s.get("linked"))
         self.assertTrue(s.get("uri", "").startswith("sgnl://linkdevice"))
+
+    def test_link_reports_success_while_initial_group_sync_is_still_running(self):
+        sync_started = threading.Event()
+        release_sync = threading.Event()
+
+        def slow_sync(_account, on_log=None):
+            sync_started.set()
+            release_sync.wait(timeout=5)
+            return 3
+
+        self.addCleanup(release_sync.set)
+        with mock.patch.object(engine, "is_linked", lambda: False), \
+             mock.patch.object(engine, "signal_cli_command",
+                               lambda *a: (["printf", "sgnl://linkdevice?uuid=x\n"], None)), \
+             mock.patch.object(webui, "_qr_png_b64", lambda uri: "QRB64"), \
+             mock.patch.object(engine, "detect_account", lambda: "+61400000000"), \
+             mock.patch.object(engine, "save_account", lambda n: None), \
+             mock.patch.object(engine, "load_config", return_value=_cfg()), \
+             mock.patch.object(engine, "sync_groups", slow_sync):
+            self.assertTrue(self.c.post("/api/link/start").get_json()["started"])
+            self.assertTrue(sync_started.wait(timeout=5))
+            s = self.c.get("/api/link").get_json()
+
+        self.assertTrue(s["linked"])
+        self.assertTrue(sync_started.is_set())
+        self.assertFalse(release_sync.is_set(), "link status must not wait for group sync")
 
     def test_link_fresh_starts_when_idle(self):
         # Tapping "Open Signal" calls /api/link/fresh; with no loop running it should kick
