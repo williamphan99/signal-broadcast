@@ -64,7 +64,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.21.3"
+APP_VERSION = "1.21.4"
 
 
 @dataclass(frozen=True)
@@ -167,7 +167,8 @@ SYNC_BURST_S = 5                 # one receive burst while draining the phone's 
 SYNC_MAX_S = 60                  # budget once no more progress is being made
 SYNC_HARD_CAP_S = 240            # absolute ceiling, even while a big backlog is still
                                  # actively downloading (deadline extends toward this)
-SYNC_STABLE_ROUNDS = 2           # stop once the group count holds steady this many rounds
+SYNC_STABLE_ROUNDS = 2           # active backlog: require three matching catalogs total
+SYNC_IDLE_STABLE_ROUNDS = 1      # quiet queue: two matching catalogs are enough
 SYNC_LIST_FAILURE_LIMIT = 3      # repeated catalog failures are an error, not a backlog
 SYNC_RENUDGE_EVERY = 3           # re-ask the phone for the groups sync every N rounds while
                                  # we still have none (the first nudge can be missed/delayed)
@@ -1024,6 +1025,7 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
     rounds = 0
     while time.monotonic() < deadline and time.monotonic() < hard_cap and stable < SYNC_STABLE_ROUNDS:
         rounds += 1
+        round_active = False
         # Re-nudge the phone periodically while we still have no groups. The group list
         # arrives as a sync message the PRIMARY pushes in response to sendSyncRequest,
         # and the phone can miss or delay the first nudge — which is exactly why a manual
@@ -1067,6 +1069,7 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
                 # busy. That's progress, not a connection failure. Give it more total
                 # time and fall through to listGroups: the group sync may already be in.
                 connected = True
+                round_active = True
                 deadline = min(hard_cap, time.monotonic() + SYNC_MAX_S)
                 _sync_log(f"receive busy-timeout ({recv_timeout}s), still downloading: {partial[:150]!r}")
             else:
@@ -1082,6 +1085,7 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
                 continue
         else:
             _save_notes_seen_during(recv.stdout or "")
+            round_active = bool((recv.stdout or "").strip())
             out = ((recv.stderr or "") + (recv.stdout or "")).strip()
             if recv.returncode != 0:
                 _sync_log(f"receive rc={recv.returncode}: {out[:200]}")
@@ -1113,6 +1117,8 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
         # draining until the cap, since the phone's first sync can be slow.
         stable = stable + 1 if (count == last and count > 0) else 0
         last = count
+        if stable >= (SYNC_STABLE_ROUNDS if round_active else SYNC_IDLE_STABLE_ROUNDS):
+            break
     _sync_log(f"--- sync end: last={last}, connected={connected}, last_error={last_error[:120]!r} ---")
     if last < 0:
         if last_list_error:

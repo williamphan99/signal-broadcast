@@ -77,7 +77,7 @@ class GroupSnapshotTests(unittest.TestCase):
             engine._GROUP_PERMISSION_CACHE = ("", set())
             self.assertEqual(engine.stored_unsendable_groups("+1"), {"g1"})
 
-    def test_stable_group_sync_stays_within_seven_process_launches(self):
+    def test_idle_group_sync_stays_within_five_process_launches(self):
         calls = []
 
         def fake_run(argv, **_kwargs):
@@ -96,7 +96,7 @@ class GroupSnapshotTests(unittest.TestCase):
              mock.patch.object(engine.subprocess, "run", side_effect=fake_run):
             self.assertEqual(engine.sync_groups("+1"), 1)
 
-        self.assertEqual(len(calls), 7, "one nudge plus three receive/listGroups rounds")
+        self.assertEqual(len(calls), 5, "one nudge plus two quiet receive/listGroups rounds")
 
 
 class SignalOperationProbeTests(unittest.TestCase):
@@ -406,7 +406,7 @@ class SyncGroupsTests(unittest.TestCase):
         self.assertNotIn("large backlog", message)
 
     def test_success_returns_count(self):
-        # Three stable reads settle the loop and return the count.
+        # Two stable reads settle a quiet queue and return the count.
         self.assertEqual(self._sync(self._Recv(), [5, 5, 5]), 5)
 
     def test_transient_error_then_success(self):
