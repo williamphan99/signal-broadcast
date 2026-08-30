@@ -62,7 +62,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.20.4"
+APP_VERSION = "1.20.5"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -842,13 +842,13 @@ def is_linked() -> bool:
     return data.exists() and any(data.iterdir())
 
 
-def link_is_broken() -> bool:
-    """Return a positive broken-link verdict, or unknown/False while Signal is busy."""
+def link_is_broken() -> bool | None:
+    """Return True/False when checked, or None when another operation owns Signal."""
     try:
         with signal_cli_operation("checking the link"):
             return _link_is_broken_unlocked()
     except BroadcastError:
-        return False
+        return None
 
 
 def _link_is_broken_unlocked() -> bool:

@@ -522,12 +522,12 @@ class App(tk.Tk):
             pass
 
         if os.environ.get("SB_SKIP_LINK") or engine.is_linked():
-            self.show_main()
             # is_linked() only checks that link FILES exist — they outlive a valid
             # link (a link that died mid-provision, or this Mac removed from the
             # phone's Linked Devices). Verify with signal-cli off the UI thread and
             # fall back to the link screen if the account isn't actually registered.
             threading.Thread(target=self._verify_link, daemon=True).start()
+            self.show_main()
         else:
             self.show_link()
 
@@ -597,8 +597,15 @@ class App(tk.Tk):
         """Worker: if signal-cli positively reports no registered account behind the
         on-disk link files, tell the UI to route back to the link screen. Without this
         a broken link shows a normal main screen where every sync/send just fails."""
-        if engine.link_is_broken():
+        verdict = engine.link_is_broken()
+        if verdict is True:
             self.events.put(("relink_needed", None))
+        elif verdict is None:
+            self.events.put(("verify_link_retry", None))
+
+    def _retry_link_verification(self) -> None:
+        if self._screen == "main":
+            threading.Thread(target=self._verify_link, daemon=True).start()
 
     def show_link(self, notice: str = "") -> None:
         self._screen = "link"
@@ -1373,7 +1380,7 @@ class App(tk.Tk):
         self._visible_ids = []
         self._render_groups()
         if check_permissions:
-            self._check_group_perms()  # mark admin-only groups in the background
+            self.after(250, self._check_group_perms)
 
     def _check_group_perms(self) -> None:
         """Find which groups are admin-only (can't post) off the UI thread, then
@@ -1990,7 +1997,7 @@ class App(tk.Tk):
     # the work they'd report on belongs to a screen that no longer exists.
     _MAIN_SCREEN_EVENTS = frozenset({
         "log", "group_start", "progress", "send_done",
-        "refresh_status", "refresh_done", "group_perms", "notes_done",
+        "refresh_status", "refresh_done", "group_perms", "notes_done", "verify_link_retry",
     })
 
     def _handle(self, kind: str, payload) -> None:
@@ -2026,6 +2033,8 @@ class App(tk.Tk):
                     "This Mac's Signal link is no longer valid — it was removed from "
                     "your phone's Linked Devices, or an earlier link didn't finish. "
                     "Link again to continue."))
+        elif kind == "verify_link_retry":
+            self.after(1000, self._retry_link_verification)
         elif kind == "log":
             m = payload
             low = m.lower()

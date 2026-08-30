@@ -188,9 +188,7 @@ class PlatformGuardTests(unittest.TestCase):
 
 
 class LinkIsBrokenTests(unittest.TestCase):
-    """link_is_broken() must say True ONLY on positive evidence (files on disk but
-    signal-cli reports zero accounts); every error path must read as 'not broken' so
-    a transient problem never bounces a healthy install to the link screen."""
+    """Broken is positive evidence; lease contention is explicitly unknown."""
 
     @staticmethod
     def _completed(rc: int, stdout: str):
@@ -199,7 +197,7 @@ class LinkIsBrokenTests(unittest.TestCase):
         proc.stdout = stdout
         return proc
 
-    def _run(self, is_linked: bool, rc: int, stdout: str) -> bool:
+    def _run(self, is_linked: bool, rc: int, stdout: str) -> bool | None:
         with mock.patch.object(engine, "is_linked", lambda: is_linked), \
              mock.patch.object(engine, "signal_cli_bin", lambda: "/bin/true"), \
              mock.patch.object(engine.subprocess, "run",
@@ -222,6 +220,11 @@ class LinkIsBrokenTests(unittest.TestCase):
 
     def test_bad_json_is_not_broken(self):
         self.assertFalse(self._run(True, 0, "not json"))
+
+    def test_busy_signal_operation_is_unknown(self):
+        with mock.patch.object(engine, "signal_cli_operation",
+                               side_effect=engine.BroadcastError("busy")):
+            self.assertIsNone(engine.link_is_broken())
 
 
 class SyncGroupsTests(unittest.TestCase):

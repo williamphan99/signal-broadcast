@@ -53,6 +53,13 @@ class _FinishedLinkProcess:
 
 
 class LinkStateTests(unittest.TestCase):
+    def test_busy_link_health_check_is_retried(self):
+        app = gui.App.__new__(gui.App)
+        app.events = queue.Queue()
+        with mock.patch.object(engine, "link_is_broken", return_value=None):
+            app._verify_link()
+        self.assertEqual(app.events.get_nowait(), ("verify_link_retry", None))
+
     def test_link_worker_uses_the_shared_signal_operation_lease(self):
         app = gui.App.__new__(gui.App)
         app.events = queue.Queue()

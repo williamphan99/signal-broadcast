@@ -45,6 +45,7 @@ LINK_TOTAL_S = 900         # keep issuing fresh codes for up to 15 min (single-p
 # user then has to act on, so a few minutes of staleness costs nothing; a failed run
 # forces an immediate re-check anyway.
 LINK_CHECK_TTL_S = 300
+LINK_CHECK_BUSY_RETRY_S = 1
 
 
 # --------------------------------------------------------------------------- #
@@ -135,10 +136,14 @@ def create_app(state: _State | None = None) -> Flask:
             st.link_checking = True
 
         def work() -> None:
-            broken = _safe(engine.link_is_broken, False)
+            broken = _safe(engine.link_is_broken, None)
             with st.lock:
-                st.link_broken = broken
-                st.link_checked_at = time.monotonic()
+                if broken is not None:
+                    st.link_broken = broken
+                    st.link_checked_at = time.monotonic()
+                else:
+                    st.link_checked_at = (time.monotonic() - LINK_CHECK_TTL_S
+                                          + LINK_CHECK_BUSY_RETRY_S)
                 st.link_checking = False
 
         threading.Thread(target=work, daemon=True).start()
