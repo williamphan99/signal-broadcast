@@ -64,7 +64,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.21.6"
+APP_VERSION = "1.21.7"
 
 
 @dataclass(frozen=True)
@@ -1177,7 +1177,10 @@ def pull_groups(account: str) -> int:
                 if gid:
                     entries.append(GroupEntry(gid, name, gid not in was_disabled))
         _write_group_entries_file(GROUPS_FILE, entries)
-        _atomic_write_text(GROUP_PERMISSIONS_FILE, json.dumps(sorted(blocked)))
+        try:
+            _atomic_write_text(GROUP_PERMISSIONS_FILE, json.dumps(sorted(blocked)))
+        except OSError:
+            GROUP_PERMISSIONS_FILE.unlink(missing_ok=True)
         _GROUP_PERMISSION_CACHE = (account, blocked)
     return len(entries)
 

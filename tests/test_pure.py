@@ -77,6 +77,29 @@ class GroupSnapshotTests(unittest.TestCase):
             engine._GROUP_PERMISSION_CACHE = ("", set())
             self.assertEqual(engine.stored_unsendable_groups("+1"), {"g1"})
 
+    def test_permission_cache_write_failure_does_not_fail_group_sync(self):
+        groups = [{"id": "g1", "name": "One"}]
+        proc = mock.Mock(returncode=0, stdout=json.dumps(groups), stderr="")
+        with tempfile.TemporaryDirectory() as directory:
+            group_file = Path(directory) / "groups.txt"
+            permission_file = Path(directory) / "permissions.json"
+            original_write = engine._atomic_write_text
+
+            def write(path, body):
+                if path == permission_file:
+                    raise OSError("disk full")
+                return original_write(path, body)
+
+            with mock.patch.object(engine, "GROUPS_FILE", group_file), \
+                 mock.patch.object(engine, "GROUPS_LOCK_FILE", Path(directory) / "groups.lock"), \
+                 mock.patch.object(engine, "GROUP_PERMISSIONS_FILE", permission_file), \
+                 mock.patch.object(engine, "signal_cli_bin", return_value="/bin/true"), \
+                 mock.patch.object(engine.subprocess, "run", return_value=proc), \
+                 mock.patch.object(engine, "_atomic_write_text", side_effect=write):
+                self.assertEqual(engine.pull_groups("+1"), 1)
+            self.assertTrue(group_file.exists())
+            self.assertFalse(permission_file.exists())
+
     def test_idle_group_sync_stays_within_five_process_launches(self):
         calls = []
 
