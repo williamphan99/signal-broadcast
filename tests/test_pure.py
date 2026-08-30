@@ -76,6 +76,36 @@ class SignalOperationProbeTests(unittest.TestCase):
             self.assertTrue(engine.signal_cli_operation_busy())
 
 
+class AppUpdateTests(unittest.TestCase):
+    @staticmethod
+    def _proc(returncode=0, stdout="", stderr=""):
+        return mock.Mock(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def test_setup_change_is_reported_after_pull(self):
+        runs = [
+            self._proc(stdout="old\n"),
+            self._proc(stdout="Updating old..new\n"),
+            self._proc(stdout="new\n"),
+            self._proc(stdout="Setup.command\n"),
+        ]
+        with mock.patch.object(engine.subprocess, "run", side_effect=runs):
+            result = engine.git_pull()
+        self.assertTrue(result.changed)
+        self.assertTrue(result.needs_setup)
+
+    def test_code_only_update_can_restart_directly(self):
+        runs = [
+            self._proc(stdout="old\n"),
+            self._proc(stdout="Updating old..new\n"),
+            self._proc(stdout="new\n"),
+            self._proc(stdout=""),
+        ]
+        with mock.patch.object(engine.subprocess, "run", side_effect=runs):
+            result = engine.git_pull()
+        self.assertTrue(result.changed)
+        self.assertFalse(result.needs_setup)
+
+
 class PacingTests(unittest.TestCase):
     def test_never_below_floor(self):
         # Even a zero base with a big negative jitter draw can't go under the floor.

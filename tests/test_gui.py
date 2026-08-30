@@ -113,7 +113,7 @@ class LinkStateTests(unittest.TestCase):
         app = gui.App.__new__(gui.App)
         app._screen = "link"
         app._finish_update = mock.Mock()
-        result = (False, "Already current")
+        result = engine.UpdateResult(False, "Already current")
 
         app._handle("update_done", result)
 
@@ -167,6 +167,21 @@ class UpdateSafetyTests(unittest.TestCase):
 
         execv.assert_not_called()
         app.update_btn.configure.assert_called_once_with(state="normal", text="Restart update")
+
+    def test_dependency_update_requires_setup_instead_of_restart(self):
+        app = gui.App.__new__(gui.App)
+        app._updating = True
+        app._update_ready = False
+        app.update_btn = mock.Mock()
+        result = engine.UpdateResult(True, "pulled", needs_setup=True)
+
+        with mock.patch.object(gui.messagebox, "showinfo", create=True) as showinfo, \
+             mock.patch.object(gui.messagebox, "askyesno", create=True) as askyesno:
+            app._finish_update(result)
+
+        askyesno.assert_not_called()
+        self.assertFalse(app._update_ready)
+        self.assertIn("Setup.command", showinfo.call_args.args[1])
 
 
 class WipeOnQuitTests(unittest.TestCase):

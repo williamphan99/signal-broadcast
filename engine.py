@@ -62,24 +62,56 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.21.0"
+APP_VERSION = "1.21.1"
 
 
-def git_pull() -> tuple[bool, str]:
+@dataclass(frozen=True)
+class UpdateResult:
+    changed: bool
+    message: str
+    needs_setup: bool = False
+
+
+UPDATE_SETUP_FILES = ("Setup.command", "scripts/make-dock-app.sh")
+
+
+def _git_head() -> str | None:
+    try:
+        proc = subprocess.run(["git", "-C", str(PROJECT_DIR), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, errors="replace", timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def git_pull() -> UpdateResult:
     """Update the app in place: a fast-forward-only `git pull` in the project folder.
-    Returns (changed, message) — changed is False when already up to date or on any
-    error, so the caller only restarts when there's actually new code. Never raises."""
+    Reports whether code changed and whether the Mac setup script must run before a
+    restart. Errors are returned to the UI rather than raised."""
+    before = _git_head()
     try:
         proc = subprocess.run(["git", "-C", str(PROJECT_DIR), "pull", "--ff-only"],
                               capture_output=True, text=True, errors="replace", timeout=60)
     except (OSError, subprocess.SubprocessError) as exc:
-        return False, f"Couldn't run git: {exc}"
+        return UpdateResult(False, f"Couldn't run git: {exc}")
     out = (proc.stdout + proc.stderr).strip()
     if proc.returncode != 0:
-        return False, out or "git pull failed."
-    if "Already up to date" in out:
-        return False, "You're already on the latest version."
-    return True, out or "Updated."
+        return UpdateResult(False, out or "git pull failed.")
+    after = _git_head()
+    changed = before != after if before and after else "Already up to date" not in out
+    if not changed:
+        return UpdateResult(False, "You're already on the latest version.")
+    needs_setup = False
+    if before and after:
+        try:
+            changed_files = subprocess.run(
+                ["git", "-C", str(PROJECT_DIR), "diff", "--name-only", before, after, "--",
+                 *UPDATE_SETUP_FILES],
+                capture_output=True, text=True, errors="replace", timeout=10)
+            needs_setup = changed_files.returncode == 0 and bool(changed_files.stdout.strip())
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return UpdateResult(True, out or "Updated.", needs_setup)
 
 
 def app_version() -> str:

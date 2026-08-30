@@ -1976,12 +1976,19 @@ class App(tk.Tk):
             "Signal is busy in this app or the background scheduler. Wait for it to "
             "finish, then try again.")
 
-    def _finish_update(self, result: tuple[bool, str]) -> None:
-        changed, message = result
+    def _finish_update(self, result: engine.UpdateResult) -> None:
+        changed, message = result.changed, result.message
         self._updating = False
         self.update_btn.configure(state="normal", text="Update")
         if not changed:
             messagebox.showinfo("Update", message)
+            return
+        if result.needs_setup:
+            messagebox.showinfo(
+                "Setup required",
+                "The update changed a Mac dependency. Close this app, then double-click "
+                "Setup.command in the Signal Broadcast folder. Your Signal link and "
+                "settings will be kept.")
             return
         # Don't show the raw git output — just confirm and offer the restart.
         self._update_ready = True
