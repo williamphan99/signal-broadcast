@@ -634,6 +634,12 @@ class App(tk.Tk):
         self.link_retry = ttk.Button(btns, text="Start linking", command=self._start_link)
         self.link_retry.pack(side="left", padx=4)
         ttk.Button(btns, text="Quit", command=self.destroy).pack(side="left", padx=4)
+        update_row = ttk.Frame(self.container)
+        update_row.pack(fill="x", pady=(14, 0))
+        self.update_btn = ttk.Button(update_row, text="Update", command=self._check_update)
+        self.update_btn.pack(side="right")
+        ttk.Label(update_row, text=f"v{engine.app_version()}", font=("", 10),
+                  foreground=PALETTE["muted"]).pack(side="right", padx=(0, 12))
         # No auto-start: linking only begins when the button is clicked, so a wipe
         # leaves nothing behind (signal-cli creates files the moment 'link' runs).
         ttk.Label(self.container, wraplength=620, justify="left", foreground=PALETTE["muted"],
@@ -733,9 +739,6 @@ class App(tk.Tk):
                     "The link didn't finish registering. On your phone, remove any "
                     "'broadcast-laptop' entry under Signal → Linked Devices, then scan again.")
             engine.save_account(number)
-            count = engine.sync_groups(number, on_log=lambda m: self.events.put(("link_status", m)))
-            self._linklog(f"sync_groups -> {count}")
-            self.events.put(("link_status", f"Ready — found {count} groups."))
             self.events.put(("linked_done", None))
         except Exception as exc:
             self._linklog(f"link_error: {exc}")
@@ -1942,7 +1945,7 @@ class App(tk.Tk):
     # the work they'd report on belongs to a screen that no longer exists.
     _MAIN_SCREEN_EVENTS = frozenset({
         "log", "group_start", "progress", "send_done",
-        "refresh_status", "refresh_done", "update_done", "group_perms", "notes_done",
+        "refresh_status", "refresh_done", "group_perms", "notes_done",
     })
 
     def _handle(self, kind: str, payload) -> None:
@@ -1969,6 +1972,7 @@ class App(tk.Tk):
         elif kind == "linked_done":
             self._stop_link_progress()
             self.show_main()
+            self._refresh_groups()
         elif kind == "relink_needed":
             # The on-disk link is dead (removed from the phone, or a link that never
             # finished). The main screen would be a dead end — route back to linking.
