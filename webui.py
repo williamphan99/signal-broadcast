@@ -466,25 +466,25 @@ def create_app(state: _State | None = None) -> Flask:
 
         def _reader():  # grab the sgnl:// URI as soon as signal-cli prints it
             assert proc.stdout is not None
-            have_uri = False
-            for line in proc.stdout:
-                line = line.strip()
-                if line.startswith("sgnl://linkdevice") or line.startswith("tsdevice:"):
-                    have_uri = True
-                    _linklog("URI generated")
-                    with st.lock:
-                        st.link_uri = line
-                        st.link_uri_ts = time.time()
-                        st.link_qr = _qr_png_b64(line)
-                        st.link_scanned = False  # fresh code on screen → back to "waiting to scan"
-                elif line:
-                    _linklog("out: " + line[:160])  # non-URI lines (scan/associate/errors)
-                    # signal-cli is silent after printing the QR until the phone scans it, so a
-                    # post-URI line usually means provisioning began — UNLESS it's an error line
-                    # (an expiring code prints "Connection closed!"), which is NOT a scan.
-                    if have_uri and not any(w in line.lower() for w in _ERR_WORDS):
+            try:
+                have_uri = False
+                for line in proc.stdout:
+                    line = line.strip()
+                    if line.startswith("sgnl://linkdevice") or line.startswith("tsdevice:"):
+                        have_uri = True
+                        _linklog("URI generated")
                         with st.lock:
-                            st.link_scanned = True
+                            st.link_uri = line
+                            st.link_uri_ts = time.time()
+                            st.link_qr = _qr_png_b64(line)
+                            st.link_scanned = False
+                    elif line:
+                        _linklog("out: " + line[:160])
+                        if have_uri and not any(w in line.lower() for w in _ERR_WORDS):
+                            with st.lock:
+                                st.link_scanned = True
+            finally:
+                proc.stdout.close()
         rt = threading.Thread(target=_reader, daemon=True)
         rt.start()
 

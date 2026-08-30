@@ -336,10 +336,15 @@ class WebUITests(unittest.TestCase):
              mock.patch.object(engine, "detect_account", lambda: "+61400000000"), \
              mock.patch.object(engine, "save_account", lambda n: None), \
              mock.patch.object(engine, "load_config", return_value=_cfg()), \
-             mock.patch.object(engine, "sync_groups", slow_sync):
+            mock.patch.object(engine, "sync_groups", slow_sync):
             self.assertTrue(self.c.post("/api/link/start").get_json()["started"])
+            end = time.time() + 5
+            while True:
+                s = self.c.get("/api/link").get_json()
+                if s["linked"] or time.time() >= end:
+                    break
+                time.sleep(0.01)
             self.assertTrue(sync_started.wait(timeout=5))
-            s = self.c.get("/api/link").get_json()
 
         self.assertTrue(s["linked"])
         self.assertTrue(sync_started.is_set())
@@ -353,7 +358,18 @@ class WebUITests(unittest.TestCase):
              mock.patch.object(engine, "signal_cli_command",
                                lambda *a: (["sleep", "30"], None)):
             j = self.c.post("/api/link/fresh").get_json()
+            end = time.time() + 5
+            while self.state.link_proc is None and time.time() < end:
+                time.sleep(0.01)
+            with self.state.lock:
+                self.state.link_linked = True
+                proc = self.state.link_proc
+            if proc is not None:
+                proc.terminate()
+            while self.state.link_running and time.time() < end:
+                time.sleep(0.01)
         self.assertTrue(j.get("started") or j.get("ok"))
+        self.assertFalse(self.state.link_running, "test must release the shared Signal lease")
 
     def test_link_status_reports_code_age(self):
         # The page opens Signal only while a code is young (Chrome drops the sgnl:// launch
