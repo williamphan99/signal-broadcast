@@ -1397,7 +1397,7 @@ class App(tk.Tk):
         self._group_render_job = self.after(120, self._render_groups)
 
     def _sync_visible_group_selection(self) -> None:
-        if getattr(self, "_rendering_groups", False):
+        if self.__dict__.get("_rendering_groups", False):
             return
         selected = {int(index) for index in self.groups_list.curselection()}
         for index, group_id in enumerate(getattr(self, "_visible_ids", [])):
