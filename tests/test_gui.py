@@ -120,6 +120,55 @@ class LinkStateTests(unittest.TestCase):
         app._finish_update.assert_called_once_with(result)
 
 
+class UpdateSafetyTests(unittest.TestCase):
+    def test_unplugged_station_prompt_still_offers_update(self):
+        app = gui.App.__new__(gui.App)
+        app.container = mock.Mock()
+        app.destroy = mock.Mock()
+        app._disarm_from_prompt = mock.Mock()
+        app._check_update = mock.Mock()
+        app.after = mock.Mock()
+        buttons = [mock.Mock(), mock.Mock(), mock.Mock()]
+
+        with mock.patch.object(gui.ttk, "Frame", return_value=mock.Mock(), create=True), \
+             mock.patch.object(gui.ttk, "Label", return_value=mock.Mock(), create=True), \
+             mock.patch.object(gui.ttk, "Button", side_effect=buttons, create=True) as button:
+            app._show_plug_in_prompt()
+
+        self.assertTrue(any(call.kwargs.get("text") == "Update" for call in button.call_args_list))
+        self.assertIs(app.update_btn, buttons[2])
+        app.update_btn.pack.assert_called_once()
+
+    def test_active_broadcast_blocks_update_before_git_pull(self):
+        app = gui.App.__new__(gui.App)
+        app._update_ready = False
+        app._sending = True
+        app._linking = app._refreshing = app._checking_notes = False
+        app.update_btn = mock.Mock()
+        app.events = queue.Queue()
+
+        with mock.patch.object(gui.messagebox, "showinfo", create=True) as showinfo, \
+             mock.patch.object(engine, "git_pull") as git_pull:
+            app._check_update()
+
+        git_pull.assert_not_called()
+        app.update_btn.configure.assert_not_called()
+        self.assertIn("broadcast", showinfo.call_args.args[1])
+
+    def test_restart_waits_for_background_signal_activity(self):
+        app = gui.App.__new__(gui.App)
+        app._linking = app._sending = app._refreshing = app._checking_notes = False
+        app.update_btn = mock.Mock()
+
+        with mock.patch.object(engine, "signal_cli_operation_busy", return_value=True), \
+             mock.patch.object(gui.messagebox, "showinfo", create=True), \
+             mock.patch.object(gui.os, "execv") as execv:
+            app._restart()
+
+        execv.assert_not_called()
+        app.update_btn.configure.assert_called_once_with(state="normal", text="Restart update")
+
+
 class WipeOnQuitTests(unittest.TestCase):
     def test_busy_wipe_keeps_the_mac_app_open(self):
         app = gui.App.__new__(gui.App)

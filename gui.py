@@ -508,6 +508,9 @@ class App(tk.Tk):
         self._screen = ""
         self._awaiting_power = False  # True only while showing the "Plug in" prompt
         self._refreshing = False      # guard: one "Update list from phone" at a time
+        self._linking = False
+        self._updating = False
+        self._update_ready = False
 
         self.container = ttk.Frame(self, padding=16)
         self.container.pack(fill="both", expand=True)
@@ -644,7 +647,11 @@ class App(tk.Tk):
         ).pack(anchor="w", pady=(16, 0))
 
     def _start_link(self) -> None:
+        if getattr(self, "_updating", False):
+            return
+        self._linking = True
         self.link_retry.configure(state="disabled")
+        self.update_btn.configure(state="disabled")
         self.link_status.configure(text="Starting…", foreground=PALETTE["muted"])
         self.link_progress.pack(after=self.link_status, pady=(0, 10))
         self.link_progress.start()
@@ -772,6 +779,8 @@ class App(tk.Tk):
         ttk.Button(btns, text="Quit", command=self.destroy).pack(side="left")
         ttk.Button(btns, text="Disarm station mode",
                    command=self._disarm_from_prompt).pack(side="left", padx=6)
+        self.update_btn = ttk.Button(btns, text="Update", command=self._check_update)
+        self.update_btn.pack(side="left", padx=6)
         ttk.Label(self.container, wraplength=620, justify="left", foreground=PALETTE["muted"], text=(
             "No charger handy? Disarming turns off station mode so you can link on "
             "battery. Nothing is stored on this Mac right now.")
@@ -1212,6 +1221,10 @@ class App(tk.Tk):
             self.notes_status.configure(
                 text="Groups are syncing — try again when that finishes.",
                 foreground=PALETTE["muted"])
+            return
+        if getattr(self, "_updating", False):
+            self.notes_status.configure(text="App update in progress.",
+                                        foreground=PALETTE["muted"])
             return
         try:
             account = engine.load_config().account
@@ -1811,6 +1824,9 @@ class App(tk.Tk):
         if getattr(self, "_sending", False):
             self._log("A send is already running — wait for it to finish or press Stop.", "muted")
             return
+        if getattr(self, "_updating", False):
+            messagebox.showinfo("Update in progress", "Wait for the app update to finish.")
+            return
         self._sending = True
         self.stop_event.clear()
         self.failed_results = []
@@ -1852,6 +1868,10 @@ class App(tk.Tk):
     # ----------------------------------------------------------- misc actions
     def _refresh_groups(self) -> None:
         if self._refreshing:                 # one sync at a time — re-clicks are ignored
+            return
+        if getattr(self, "_updating", False):
+            self.groups_sync_label.configure(text="App update in progress.",
+                                             foreground=PALETTE["muted"])
             return
         # Same account, one signal-cli operation at a time — see _fetch_notes.
         if getattr(self, "_checking_notes", False):
@@ -1919,25 +1939,66 @@ class App(tk.Tk):
     def _check_update(self) -> None:
         """Update the app: git pull in the project folder, then relaunch if there was
         anything new. Runs the pull off the UI thread so the window stays responsive."""
+        if getattr(self, "_update_ready", False):
+            self._restart()
+            return
+        activity = self._activity_for_update()
+        if activity:
+            messagebox.showinfo("Can't update yet", f"Wait for {activity} to finish, then try again.")
+            return
+        self._updating = True
         self.update_btn.configure(state="disabled", text="Updating…")
 
         def work():
-            self.events.put(("update_done", engine.git_pull()))
+            if engine.signal_cli_operation_busy():
+                self.events.put(("update_blocked", None))
+            else:
+                self.events.put(("update_done", engine.git_pull()))
         threading.Thread(target=work, daemon=True).start()
+
+    def _activity_for_update(self) -> str | None:
+        """Describe GUI work that an update must not interrupt."""
+        if getattr(self, "_linking", False):
+            return "linking"
+        if getattr(self, "_sending", False):
+            return "the broadcast"
+        if getattr(self, "_refreshing", False):
+            return "the group update"
+        if getattr(self, "_checking_notes", False):
+            return "the notes check"
+        return None
+
+    def _update_blocked(self) -> None:
+        self._updating = False
+        self.update_btn.configure(state="normal", text="Update")
+        messagebox.showinfo(
+            "Can't update yet",
+            "Signal is busy in this app or the background scheduler. Wait for it to "
+            "finish, then try again.")
 
     def _finish_update(self, result: tuple[bool, str]) -> None:
         changed, message = result
+        self._updating = False
         self.update_btn.configure(state="normal", text="Update")
         if not changed:
             messagebox.showinfo("Update", message)
             return
         # Don't show the raw git output — just confirm and offer the restart.
+        self._update_ready = True
         if messagebox.askyesno("Update installed",
                 "A new version was downloaded.\n\nRestart now to use the new version?"):
             self._restart()
 
     def _restart(self) -> None:
         """Relaunch the app on the freshly-pulled code, replacing this process."""
+        activity = self._activity_for_update()
+        if activity or engine.signal_cli_operation_busy():
+            self.update_btn.configure(state="normal", text="Restart update")
+            messagebox.showinfo(
+                "Restart postponed",
+                "The update is installed, but Signal is busy. Wait for the current "
+                "activity to finish, then click Restart update.")
+            return
         gui_path = str(Path(__file__).resolve())
         try:
             os.execv(sys.executable, [sys.executable, gui_path])
@@ -2012,15 +2073,20 @@ class App(tk.Tk):
                 self.link_status.configure(text="Couldn't render the QR code — try again.",
                                            foreground=PALETTE["error"])
                 self.link_retry.configure(state="normal", text="Try again")
+                self._linking = False
+                self.update_btn.configure(state="normal")
                 return
             self.qr_label.configure(image=self._qr_img, text="")
         elif kind == "link_status":
             self.link_status.configure(text=payload)
         elif kind == "link_error":
+            self._linking = False
             self._stop_link_progress()
             self.link_status.configure(text=payload, foreground=PALETTE["error"])
             self.link_retry.configure(state="normal", text="Try again")
+            self.update_btn.configure(state="normal")
         elif kind == "linked_done":
+            self._linking = False
             self._stop_link_progress()
             self.show_main()
             self._refresh_groups()
@@ -2077,6 +2143,8 @@ class App(tk.Tk):
             self._finish_notes(payload)
         elif kind == "update_done":
             self._finish_update(payload)
+        elif kind == "update_blocked":
+            self._update_blocked()
         elif kind == "group_perms":
             self._unsendable_ids = payload
             if hasattr(self, "group_search"):

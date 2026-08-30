@@ -62,6 +62,20 @@ class GroupSnapshotTests(unittest.TestCase):
         self.assertEqual(len(calls), 7, "one nudge plus three receive/listGroups rounds")
 
 
+class SignalOperationProbeTests(unittest.TestCase):
+    def test_free_signal_lease_is_not_busy(self):
+        @mock.patch.object(engine, "signal_cli_operation")
+        def run(operation):
+            operation.return_value.__enter__.return_value = None
+            self.assertFalse(engine.signal_cli_operation_busy())
+        run()
+
+    def test_owned_signal_lease_is_busy(self):
+        with mock.patch.object(engine, "signal_cli_operation",
+                               side_effect=engine.BroadcastError("busy")):
+            self.assertTrue(engine.signal_cli_operation_busy())
+
+
 class PacingTests(unittest.TestCase):
     def test_never_below_floor(self):
         # Even a zero base with a big negative jitter draw can't go under the floor.
