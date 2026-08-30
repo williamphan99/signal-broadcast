@@ -526,7 +526,9 @@ def create_app(state: _State | None = None) -> Flask:
             while time.time() < deadline:
                 if st.link_linked:
                     return
-                if _one_link_attempt():
+                with engine.signal_cli_operation("linking"):
+                    linked = _one_link_attempt()
+                if linked:
                     # Linking is complete once the account is saved. Group import is
                     # useful but optional and can take minutes on a large backlog, so
                     # run it independently after the UI is free to enter the app.

@@ -652,7 +652,14 @@ class App(tk.Tk):
         self.link_status.configure(text="Starting…", foreground=PALETTE["muted"])
         self.link_progress.pack(after=self.link_status, pady=(0, 10))
         self.link_progress.start()
-        threading.Thread(target=self._link_worker, daemon=True).start()
+        threading.Thread(target=self._link_worker_serialized, daemon=True).start()
+
+    def _link_worker_serialized(self) -> None:
+        try:
+            with engine.signal_cli_operation("linking"):
+                self._link_worker()
+        except engine.BroadcastError as exc:
+            self.events.put(("link_error", str(exc)))
 
     def _stop_link_progress(self) -> None:
         if self.link_progress.winfo_exists():
@@ -1369,7 +1376,8 @@ class App(tk.Tk):
         def work():
             try:
                 account = engine.detect_account() or engine.load_config().account
-                ids = engine.unsendable_groups(account)
+                with engine.signal_cli_operation("checking group permissions"):
+                    ids = engine.unsendable_groups(account)
             except engine.BroadcastError:
                 ids = set()
             self.events.put(("group_perms", ids))

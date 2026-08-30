@@ -159,6 +159,20 @@ class SendPathTests(unittest.TestCase):
         with engine.send_lock():
             pass
 
+    def test_shared_operation_lock_blocks_sync_and_notes_during_a_send(self):
+        with engine.send_lock():
+            with self.assertRaises(engine.BroadcastError):
+                engine.sync_groups("+test")
+            with self.assertRaises(engine.BroadcastError):
+                engine.fetch_notes("+test")
+
+    def test_shared_operation_lock_is_released_after_an_exception(self):
+        with self.assertRaises(RuntimeError):
+            with engine.signal_cli_operation("testing"):
+                raise RuntimeError("boom")
+        with engine.signal_cli_operation("testing again"):
+            pass
+
     def test_progress_recorded_and_cleared_on_normal_finish(self):
         FakeDaemon.plan = {"g1": [(True, False, "")], "g2": [(True, False, "")]}
         self._run([("g1", "G1"), ("g2", "G2")])

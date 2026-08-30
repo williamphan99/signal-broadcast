@@ -5,6 +5,7 @@ import queue
 import sys
 import types
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -52,6 +53,23 @@ class _FinishedLinkProcess:
 
 
 class LinkStateTests(unittest.TestCase):
+    def test_link_worker_uses_the_shared_signal_operation_lease(self):
+        app = gui.App.__new__(gui.App)
+        app.events = queue.Queue()
+        app._link_worker = mock.Mock()
+        operations = []
+
+        @contextmanager
+        def lease(operation):
+            operations.append(operation)
+            yield
+
+        with mock.patch.object(engine, "signal_cli_operation", lease):
+            app._link_worker_serialized()
+
+        self.assertEqual(operations, ["linking"])
+        app._link_worker.assert_called_once_with()
+
     def test_successful_link_is_not_held_hostage_by_group_sync(self):
         app = gui.App.__new__(gui.App)
         app.events = queue.Queue()

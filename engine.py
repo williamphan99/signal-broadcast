@@ -46,7 +46,11 @@ DATA_DIR = PROJECT_DIR / "signal-cli-data"
 LOGS_DIR = PROJECT_DIR / "logs"
 LAST_RUN_FILE = LOGS_DIR / "last-run.txt"
 LAST_SEND_FILE = LOGS_DIR / "last-send.json"  # counts-only summary for the UI
-SEND_LOCK_FILE = LOGS_DIR / "sending.lock"    # exclusive: one broadcast at a time
+# Keep the historical filename so an older scheduler and a newly updated GUI still
+# coordinate during a rolling restart. The lock now covers every signal-cli operation,
+# not only sends.
+SIGNAL_CLI_LOCK_FILE = LOGS_DIR / "sending.lock"
+SEND_LOCK_FILE = SIGNAL_CLI_LOCK_FILE          # compatibility for callers/tests
 RUN_PROGRESS_FILE = LOGS_DIR / "run-progress.json"  # in-flight run, for crash resume
 CONFIG_FILE = PROJECT_DIR / "config.toml"          # per-user (holds the number); gitignored
 CONFIG_EXAMPLE_FILE = PROJECT_DIR / "config.example.toml"  # tracked template
@@ -58,7 +62,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.19.2"
+APP_VERSION = "1.19.3"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -508,27 +512,39 @@ def stamp_run() -> None:
                              encoding="utf-8")
 
 
+_SIGNAL_CLI_THREAD_LOCK = threading.Lock()
+
+
 @contextmanager
-def send_lock() -> Iterator[None]:
-    """Hold an exclusive lock for the duration of a broadcast so two senders can't
-    run at once — a second app window, or the scheduler firing while the app is
-    mid-send. Two concurrent senders would fight over signal-cli's account lock and
-    both stall. Uses flock, which the OS releases automatically if the process dies,
-    so a crashed run never leaves the lock stuck. Raises BroadcastError if a send is
-    already running."""
+def signal_cli_operation(operation: str) -> Iterator[None]:
+    """Non-blocking account lease shared by every signal-cli operation.
+
+    signal-cli itself permits only one process to use an account data directory. The
+    process-local lock covers threads in one GUI/web process; flock covers other app
+    windows and the scheduler. The historical lock path is retained so older running
+    versions also stay out of the way.
+    """
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    fh = open(SEND_LOCK_FILE, "w")
+    if not _SIGNAL_CLI_THREAD_LOCK.acquire(blocking=False):
+        raise BroadcastError(
+            f"Signal is busy with another operation. Wait for it to finish, then try {operation} again.")
+    try:
+        fh = open(SIGNAL_CLI_LOCK_FILE, "a+")
+    except OSError:
+        _SIGNAL_CLI_THREAD_LOCK.release()
+        raise
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        fh.close()  # not holding the lock — don't leak the descriptor
-        raise BroadcastError("A send is already in progress (this app or the "
-                             "scheduler). Wait for it to finish, or Stop it first.")
-    # We hold the lock now; the unlock/close belongs in a finally that only runs
-    # on this path (so it never touches an already-closed fd from the branch above).
+        fh.close()
+        _SIGNAL_CLI_THREAD_LOCK.release()
+        raise BroadcastError(
+            f"Signal is busy with another operation. Wait for it to finish, then try {operation} again.")
     try:
         try:
-            fh.write(str(os.getpid()))
+            fh.seek(0)
+            fh.truncate()
+            fh.write(f"{os.getpid()}\t{operation}")
             fh.flush()
         except OSError:
             pass
@@ -539,6 +555,14 @@ def send_lock() -> Iterator[None]:
         except OSError:
             pass
         fh.close()
+        _SIGNAL_CLI_THREAD_LOCK.release()
+
+
+@contextmanager
+def send_lock() -> Iterator[None]:
+    """Compatibility name for the account lease used by broadcasts."""
+    with signal_cli_operation("sending"):
+        yield
 
 
 def _reap_orphan_signal_cli(on_log: LogFn = lambda *_: None) -> int:
@@ -818,6 +842,15 @@ def is_linked() -> bool:
 
 
 def link_is_broken() -> bool:
+    """Return a positive broken-link verdict, or unknown/False while Signal is busy."""
+    try:
+        with signal_cli_operation("checking the link"):
+            return _link_is_broken_unlocked()
+    except BroadcastError:
+        return False
+
+
+def _link_is_broken_unlocked() -> bool:
     """True only when link files exist on disk but signal-cli POSITIVELY reports no
     registered account — a link that died mid-provision, or this device was removed
     from the phone's Linked Devices. In that state every receive/listGroups/send
@@ -883,6 +916,12 @@ def _sync_log(msg: str) -> None:
 
 
 def sync_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
+    """Synchronise groups while exclusively owning the Signal account directory."""
+    with signal_cli_operation("syncing groups"):
+        return _sync_groups_unlocked(account, on_log)
+
+
+def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
     """Drain the phone's contacts/groups sync and (over)write groups.txt. A large
     account's groups arrive over several seconds, so nudge the phone then receive
     in short bursts until the count stops growing (or SYNC_MAX_S). Reports a running
@@ -1322,7 +1361,7 @@ def fetch_notes(account: str, on_log: LogFn = lambda *_: None) -> dict:
     today."""
     binary = signal_cli_bin()
     started = time.monotonic()
-    with send_lock():
+    with signal_cli_operation("checking notes"):
         try:
             proc = subprocess.run(
                 _cli(binary, "--config", str(DATA_DIR), "-a", account, "-o", "json",
