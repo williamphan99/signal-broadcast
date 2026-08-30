@@ -536,6 +536,13 @@ class App(tk.Tk):
 
     # ----------------------------------------------------------------- utils
     def _clear(self) -> None:
+        render_job = self.__dict__.get("_group_render_job")
+        if render_job is not None:
+            try:
+                self.after_cancel(render_job)
+            except tk.TclError:
+                pass
+            self._group_render_job = None
         for child in self.container.winfo_children():
             child.destroy()
 
@@ -573,24 +580,6 @@ class App(tk.Tk):
         self.log_box.configure(state="normal")
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
-
-    def _scrollable(self, parent) -> ttk.Frame:
-        """A vertically scrollable frame (Canvas + inner ttk.Frame). Returns the
-        inner frame to pack children into."""
-        bg = ttk.Style().lookup("TFrame", "background")
-        canvas = tk.Canvas(parent, highlightthickness=0, **({"background": bg} if bg else {}))
-        sb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
-        inner = ttk.Frame(canvas)
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        win = canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
-        canvas.configure(yscrollcommand=sb.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        wheel = lambda e: canvas.yview_scroll(int(-1 * e.delta), "units")  # noqa: E731
-        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", wheel))
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
-        return inner
 
     # ------------------------------------------------------------ link screen
     def _verify_link(self) -> None:
@@ -1373,8 +1362,7 @@ class App(tk.Tk):
         self._populate_groups()
 
     def _populate_groups(self, *, check_permissions: bool = True) -> None:
-        """Load the groups once: one persistent BooleanVar per group (so tick state
-        survives search filtering), then draw them via _render_groups."""
+        """Load groups and keep selection keyed by id across search filtering."""
         self.group_entries = engine.read_group_entries()
         self._enabled_group_ids = {e.group_id for e in self.group_entries if e.enabled}
         self._visible_ids = []
@@ -1421,15 +1409,24 @@ class App(tk.Tk):
         self._visible_ids = []
         self._rendering_groups = True
         self.groups_list.delete(0, "end")
+        labels = []
         for e in self.group_entries:
             if query and query not in e.name.lower():
                 continue
-            index = len(self._visible_ids)
             self._visible_ids.append(e.group_id)
-            label = f"{e.name}   ·  admin-only (skipped)" if e.group_id in blocked else e.name
-            self.groups_list.insert("end", label)
-            if e.group_id in self._enabled_group_ids:
-                self.groups_list.selection_set(index)
+            labels.append(f"{e.name}   ·  admin-only (skipped)"
+                          if e.group_id in blocked else e.name)
+        if labels:
+            self.groups_list.insert("end", *labels)
+        range_start = None
+        for index in range(len(self._visible_ids) + 1):
+            enabled = (index < len(self._visible_ids)
+                       and self._visible_ids[index] in self._enabled_group_ids)
+            if enabled and range_start is None:
+                range_start = index
+            elif not enabled and range_start is not None:
+                self.groups_list.selection_set(range_start, index - 1)
+                range_start = None
         self._rendering_groups = False
         if not self.group_entries:
             self.groups_list.insert("end", "No groups yet — link your phone first.")

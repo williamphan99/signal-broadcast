@@ -12,9 +12,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import engine  # noqa: E402
 
-# The project test interpreter intentionally has no Tk framework. The state methods
-# below do not create widgets, so a tiny import shim is enough to load gui.py without
-# opening a window or requiring a display.
+# Some supported test interpreters have no Tk framework. These state methods do not
+# create widgets, so a tiny import shim loads gui.py without opening a window.
 try:
     import tkinter  # noqa: F401
 except (ImportError, ModuleNotFoundError):
@@ -122,6 +121,18 @@ class LinkStateTests(unittest.TestCase):
 
 
 class GroupRefreshTests(unittest.TestCase):
+    def test_screen_clear_cancels_a_pending_group_filter(self):
+        app = gui.App.__new__(gui.App)
+        app._group_render_job = "job-1"
+        app.after_cancel = mock.Mock()
+        app.container = mock.Mock()
+        app.container.winfo_children.return_value = []
+
+        app._clear()
+
+        app.after_cancel.assert_called_once_with("job-1")
+        self.assertIsNone(app._group_render_job)
+
     def test_refresh_can_reuse_snapshot_permissions_without_another_probe(self):
         app = gui.App.__new__(gui.App)
         app._render_groups = mock.Mock()
@@ -139,15 +150,19 @@ class _FakeListbox:
     def __init__(self):
         self.items = []
         self.selected = set()
+        self.insert_calls = 0
+        self.selection_calls = 0
 
     def delete(self, _first, _last):
         self.items.clear()
         self.selected.clear()
 
-    def insert(self, _where, label):
-        self.items.append(label)
+    def insert(self, _where, *labels):
+        self.insert_calls += 1
+        self.items.extend(labels)
 
     def selection_set(self, first, last=None):
+        self.selection_calls += 1
         last = first if last is None else last
         self.selected.update(range(first, last + 1))
 
@@ -188,6 +203,8 @@ class LargeGroupRenderingTests(unittest.TestCase):
         app._render_groups()
         self.assertEqual(len(app.groups_list.items), 5000)
         self.assertEqual(len(app.groups_list.selected), 2)
+        self.assertEqual(app.groups_list.insert_calls, 1)
+        self.assertEqual(app.groups_list.selection_calls, 2)
 
         app.group_search.value = "4999"
         app._render_groups()

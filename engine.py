@@ -62,7 +62,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.20.6"
+APP_VERSION = "1.20.7"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -1163,7 +1163,7 @@ NOTES_LOCK_FILE = PROJECT_DIR / "notes.lock"
 # Notes are written from two places at once: the group sync keeps what it sees from a
 # worker thread while the window can delete or store on the main one. Both do
 # read-modify-write, so without this a delete could resurrect a note, or a note landing
-# mid-sync could be dropped. Reentrant because store_notes() reads and writes under it.
+# mid-sync could be dropped. The matching file lock extends that boundary to processes.
 _NOTES_LOCK = threading.RLock()
 
 

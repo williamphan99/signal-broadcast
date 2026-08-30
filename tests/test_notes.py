@@ -33,9 +33,10 @@ def _hold_notes_transaction(notes_file: str, lock_file: str, ready, release) -> 
         release.wait(timeout=5)
 
 
-def _store_note_in_process(notes_file: str, lock_file: str, done) -> None:
+def _store_note_in_process(notes_file: str, lock_file: str, attempting, done) -> None:
     engine.NOTES_FILE = Path(notes_file)
     engine.NOTES_LOCK_FILE = Path(lock_file)
+    attempting.set()
     engine.store_notes([{"ts": 99, "text": "from another process"}])
     done.set()
 
@@ -344,18 +345,25 @@ class StoringNotes(unittest.TestCase):
 
     def test_a_second_process_waits_for_the_notes_transaction(self):
         ctx = multiprocessing.get_context("spawn")
-        ready, release, done = ctx.Event(), ctx.Event(), ctx.Event()
+        ready, release = ctx.Event(), ctx.Event()
+        attempting, done = ctx.Event(), ctx.Event()
         holder = ctx.Process(target=_hold_notes_transaction, args=(
             str(engine.NOTES_FILE), str(engine.NOTES_LOCK_FILE), ready, release))
         writer = ctx.Process(target=_store_note_in_process, args=(
-            str(engine.NOTES_FILE), str(engine.NOTES_LOCK_FILE), done))
-        holder.start()
-        self.assertTrue(ready.wait(timeout=5))
-        writer.start()
-        self.assertFalse(done.wait(timeout=0.25), "writer must wait for the other process")
-        release.set()
-        holder.join(timeout=5)
-        writer.join(timeout=5)
+            str(engine.NOTES_FILE), str(engine.NOTES_LOCK_FILE), attempting, done))
+        try:
+            holder.start()
+            self.assertTrue(ready.wait(timeout=5))
+            writer.start()
+            self.assertTrue(attempting.wait(timeout=5))
+            self.assertFalse(done.wait(timeout=0.25), "writer must wait for the other process")
+        finally:
+            release.set()
+            for process in (holder, writer):
+                process.join(timeout=5)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
         self.assertEqual((holder.exitcode, writer.exitcode), (0, 0))
         self.assertTrue(done.is_set())
         self.assertEqual([n["text"] for n in engine.read_notes()], ["from another process"])
