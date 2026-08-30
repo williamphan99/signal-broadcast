@@ -357,6 +357,9 @@ def create_app(state: _State | None = None) -> Flask:
 
     @app.post("/api/groups")
     def api_groups_save():
+        with st.lock:
+            if st.refresh_running:
+                return jsonify(error="Wait for the group sync to finish."), 409
         data = request.get_json(force=True, silent=True) or {}
         engine.write_group_selection(set(data.get("enabled", [])))
         return jsonify(ok=True)
@@ -1352,6 +1355,7 @@ async function saveGroups(){
   const enabled=allGroups.filter(g=>g.enabled).map(g=>g.id);
   const r=await api('/api/groups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
   if(r.__neterr){ toast('Couldn’t save','err'); return; }
+  if(r.error){ toast(r.error,'err'); return; }
   toast('Saved '+enabled.length+' group'+(enabled.length===1?'':'s'),'ok');
   refreshState();
 }

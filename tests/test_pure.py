@@ -11,6 +11,7 @@ guest, and guard the small platform-aware seams added for the Pixel/Termux port:
 Run with:  python3 -m unittest discover -s tests
 """
 import json
+import multiprocessing
 import os
 import tempfile
 import unittest
@@ -20,6 +21,22 @@ from unittest import mock
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import engine  # noqa: E402
+
+
+def _hold_group_transaction(groups_file, lock_file, ready, release):
+    engine.GROUPS_FILE = Path(groups_file)
+    engine.GROUPS_LOCK_FILE = Path(lock_file)
+    with engine._groups_transaction():
+        ready.set()
+        release.wait(timeout=5)
+
+
+def _write_group_selection_process(groups_file, lock_file, attempting, done):
+    engine.GROUPS_FILE = Path(groups_file)
+    engine.GROUPS_LOCK_FILE = Path(lock_file)
+    attempting.set()
+    engine.write_group_selection({"g1"})
+    done.set()
 
 
 class GroupSnapshotTests(unittest.TestCase):
@@ -33,6 +50,7 @@ class GroupSnapshotTests(unittest.TestCase):
         proc = mock.Mock(returncode=0, stdout=json.dumps(groups), stderr="")
         with tempfile.TemporaryDirectory() as directory, \
              mock.patch.object(engine, "GROUPS_FILE", Path(directory) / "groups.txt"), \
+             mock.patch.object(engine, "GROUPS_LOCK_FILE", Path(directory) / "groups.lock"), \
              mock.patch.object(engine, "signal_cli_bin", return_value="/bin/true"), \
              mock.patch.object(engine.subprocess, "run", return_value=proc) as run:
             count = engine.pull_groups("+1")
@@ -54,6 +72,7 @@ class GroupSnapshotTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory, \
              mock.patch.object(engine, "GROUPS_FILE", Path(directory) / "groups.txt"), \
+             mock.patch.object(engine, "GROUPS_LOCK_FILE", Path(directory) / "groups.lock"), \
              mock.patch.object(engine, "signal_cli_bin", return_value="/bin/true"), \
              mock.patch.object(engine, "_sync_log"), \
              mock.patch.object(engine.subprocess, "run", side_effect=fake_run):
@@ -74,6 +93,64 @@ class SignalOperationProbeTests(unittest.TestCase):
         with mock.patch.object(engine, "signal_cli_operation",
                                side_effect=engine.BroadcastError("busy")):
             self.assertTrue(engine.signal_cli_operation_busy())
+
+
+class GroupFileTransactionTests(unittest.TestCase):
+    def test_interrupted_selection_write_keeps_the_previous_catalog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            groups = Path(directory) / "groups.txt"
+            lock = Path(directory) / "groups.lock"
+            groups.write_text("g1\tOne\ng2\tTwo\n", encoding="utf-8")
+            original = groups.read_text(encoding="utf-8")
+            with mock.patch.object(engine, "GROUPS_FILE", groups), \
+                 mock.patch.object(engine, "GROUPS_LOCK_FILE", lock), \
+                 mock.patch("os.replace", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    engine.write_group_selection({"g1"})
+            self.assertEqual(groups.read_text(encoding="utf-8"), original)
+            self.assertFalse(any(groups.parent.glob("groups.txt.*.tmp")))
+
+    def test_fifty_thousand_groups_round_trip_without_losing_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            groups = Path(directory) / "groups.txt"
+            lock = Path(directory) / "groups.lock"
+            groups.write_text("".join(f"g{i}\tGroup {i}\n" for i in range(50_000)),
+                              encoding="utf-8")
+            enabled = {f"g{i}" for i in range(0, 50_000, 2)}
+            with mock.patch.object(engine, "GROUPS_FILE", groups), \
+                 mock.patch.object(engine, "GROUPS_LOCK_FILE", lock):
+                engine.write_group_selection(enabled)
+                entries = engine.read_group_entries()
+            self.assertEqual(len(entries), 50_000)
+            self.assertEqual(sum(entry.enabled for entry in entries), 25_000)
+
+    def test_a_second_process_waits_for_the_group_transaction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            groups = Path(directory) / "groups.txt"
+            lock = Path(directory) / "groups.lock"
+            groups.write_text("g1\tOne\ng2\tTwo\n", encoding="utf-8")
+            ctx = multiprocessing.get_context("spawn")
+            ready, release = ctx.Event(), ctx.Event()
+            attempting, done = ctx.Event(), ctx.Event()
+            holder = ctx.Process(target=_hold_group_transaction,
+                                 args=(str(groups), str(lock), ready, release))
+            writer = ctx.Process(target=_write_group_selection_process,
+                                 args=(str(groups), str(lock), attempting, done))
+            try:
+                holder.start()
+                self.assertTrue(ready.wait(timeout=5))
+                writer.start()
+                self.assertTrue(attempting.wait(timeout=5))
+                self.assertFalse(done.wait(timeout=0.25))
+            finally:
+                release.set()
+                for process in (holder, writer):
+                    process.join(timeout=5)
+                    if process.is_alive():
+                        process.terminate()
+                        process.join(timeout=5)
+            self.assertEqual((holder.exitcode, writer.exitcode), (0, 0))
+            self.assertTrue(done.is_set())
 
 
 class AppUpdateTests(unittest.TestCase):

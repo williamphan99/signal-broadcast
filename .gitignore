@@ -5,6 +5,8 @@ signal-cli-data/
 # commit. config.toml is created from config.example.toml on first run.
 config.toml
 groups.txt
+groups.txt.*.tmp
+groups.lock
 message.txt
 attachments.txt
 

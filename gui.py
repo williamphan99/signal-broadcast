@@ -1365,7 +1365,8 @@ class App(tk.Tk):
 
         bottom = ttk.Frame(tab)
         bottom.pack(fill="x")
-        ttk.Button(bottom, text="Save selection", command=self._save_groups).pack(side="left")
+        self.save_groups_btn = ttk.Button(bottom, text="Save selection", command=self._save_groups)
+        self.save_groups_btn.pack(side="left")
         self.refresh_btn = ttk.Button(bottom, text="Update list from phone", command=self._refresh_groups)
         self.refresh_btn.pack(side="right")
         self.groups_sync_label = ttk.Label(tab, text="", foreground=PALETTE["muted"])
@@ -1881,6 +1882,7 @@ class App(tk.Tk):
             return
         self._refreshing = True
         self.refresh_btn.configure(state="disabled")
+        self.save_groups_btn.configure(state="disabled")
         self.groups_progress.pack(anchor="w", pady=(4, 0))
         self.groups_progress.start()
         self.groups_sync_label.configure(text="Syncing…", foreground=PALETTE["muted"])
@@ -1899,6 +1901,7 @@ class App(tk.Tk):
     def _finish_refresh(self, result) -> None:
         self._refreshing = False
         self.refresh_btn.configure(state="normal")
+        self.save_groups_btn.configure(state="normal")
         self.groups_progress.stop()
         self.groups_progress.pack_forget()
         if isinstance(result, int):

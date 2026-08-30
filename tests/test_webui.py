@@ -76,6 +76,15 @@ class WebUITests(unittest.TestCase):
         self.assertIn("groupsById.get", page)
         self.assertNotIn("allGroups.find", page)
 
+    def test_group_selection_save_waits_for_active_sync(self):
+        with self.state.lock:
+            self.state.refresh_running = True
+        with mock.patch.object(engine, "write_group_selection") as write:
+            response = self.c.post("/api/groups", json={"enabled": ["g1"]})
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("sync", response.get_json()["error"].lower())
+        write.assert_not_called()
+
     def test_state_linked(self):
         j = self.c.get("/api/state").get_json()
         self.assertTrue(j["linked"])

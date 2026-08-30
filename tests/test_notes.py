@@ -307,6 +307,7 @@ class StoringNotes(unittest.TestCase):
             "SEND_LOCK_FILE": logs / "sending.lock",
             "DATA_DIR": root / "signal-cli-data",
             "GROUPS_FILE": root / "groups.txt",
+            "GROUPS_LOCK_FILE": root / "groups.lock",
             "MESSAGE_FILE": root / "message.txt",
             "ATTACHMENTS_FILE": root / "attachments.txt",
             "LOCAL_PLIST": root / "schedule.plist",
@@ -332,6 +333,7 @@ class StoringNotes(unittest.TestCase):
         self.assertFalse(engine.GROUPS_FILE.exists())
         self.assertTrue(engine.NOTES_LOCK_FILE.exists())
         self.assertTrue(engine.SIGNAL_CLI_LOCK_FILE.exists())
+        self.assertTrue(engine.GROUPS_LOCK_FILE.exists())
 
     def test_a_write_leaves_no_temp_file_behind(self):
         engine.write_notes([{"ts": 1, "text": "a"}])

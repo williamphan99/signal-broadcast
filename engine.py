@@ -55,6 +55,7 @@ RUN_PROGRESS_FILE = LOGS_DIR / "run-progress.json"  # in-flight run, for crash r
 CONFIG_FILE = PROJECT_DIR / "config.toml"          # per-user (holds the number); gitignored
 CONFIG_EXAMPLE_FILE = PROJECT_DIR / "config.example.toml"  # tracked template
 GROUPS_FILE = PROJECT_DIR / "groups.txt"
+GROUPS_LOCK_FILE = PROJECT_DIR / "groups.lock"
 MESSAGE_FILE = PROJECT_DIR / "message.txt"
 ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 
@@ -62,7 +63,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.21.1"
+APP_VERSION = "1.21.2"
 
 
 @dataclass(frozen=True)
@@ -456,35 +457,23 @@ def write_attachments(paths: list[str], path: Path = ATTACHMENTS_FILE) -> None:
     path.write_text(header + body, encoding="utf-8")
 
 
-def read_groups(path: Path = GROUPS_FILE) -> list[tuple[str, str]]:
-    """Lines of '<base64-id>\\t<name>'. Blanks and # comments ignored, so a group
-    can be skipped by commenting it out. Name is cosmetic (shown in the report)."""
-    if not path.exists():
-        raise BroadcastError("No groups yet — link your phone and pull groups first.")
-    groups: list[tuple[str, str]] = []
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        gid, _, name = line.partition("\t")
-        gid = gid.strip()
-        if gid:
-            groups.append((gid, name.strip() or gid))
-    if not groups:
-        raise BroadcastError("No groups yet — link your phone and pull groups first.")
-    return groups
+_GROUPS_LOCK = threading.RLock()
 
 
-def count_groups(path: Path = GROUPS_FILE) -> int:
-    try:
-        return len(read_groups(path))
-    except BroadcastError:
-        return 0
+@contextmanager
+def _groups_transaction() -> Iterator[None]:
+    """Serialize group catalog read-modify-write operations across app processes."""
+    with _GROUPS_LOCK:
+        GROUPS_LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with GROUPS_LOCK_FILE.open("a+") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
 
 
-def read_group_entries(path: Path = GROUPS_FILE) -> list[GroupEntry]:
-    """Every group in groups.txt with its enabled/excluded state — including the
-    commented-out ones, so the UI can show all groups with tick boxes."""
+def _read_group_entries_file(path: Path) -> list[GroupEntry]:
     if not path.exists():
         return []
     entries: list[GroupEntry] = []
@@ -494,7 +483,6 @@ def read_group_entries(path: Path = GROUPS_FILE) -> list[GroupEntry]:
             continue
         commented = s.startswith("#")
         body = s[1:].strip() if commented else s
-        # A real group line has a tab and a space-free id; header comments don't.
         if "\t" not in body:
             continue
         gid, _, name = body.partition("\t")
@@ -505,13 +493,54 @@ def read_group_entries(path: Path = GROUPS_FILE) -> list[GroupEntry]:
     return entries
 
 
+def _write_group_entries_file(path: Path, entries: list[GroupEntry]) -> None:
+    lines = []
+    for entry in entries:
+        row = f"{entry.group_id}\t{entry.name}"
+        lines.append(row if entry.enabled else f"# {row}")
+    body = _GROUPS_HEADER + "\n".join(lines) + ("\n" if lines else "")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(body, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def read_groups(path: Path | None = None) -> list[tuple[str, str]]:
+    """Lines of '<base64-id>\\t<name>'. Blanks and # comments ignored, so a group
+    can be skipped by commenting it out. Name is cosmetic (shown in the report)."""
+    groups = [(entry.group_id, entry.name) for entry in read_group_entries(path)
+              if entry.enabled]
+    if not groups:
+        raise BroadcastError("No groups yet — link your phone and pull groups first.")
+    return groups
+
+
+def count_groups(path: Path | None = None) -> int:
+    try:
+        return len(read_groups(path))
+    except BroadcastError:
+        return 0
+
+
+def read_group_entries(path: Path | None = None) -> list[GroupEntry]:
+    """Every group in groups.txt with its enabled/excluded state — including the
+    commented-out ones, so the UI can show all groups with tick boxes."""
+    target = path or GROUPS_FILE
+    if target != GROUPS_FILE:
+        return _read_group_entries_file(target)
+    with _groups_transaction():
+        return _read_group_entries_file(target)
+
+
 def write_group_selection(enabled_ids: set[str]) -> None:
     """Rewrite groups.txt, commenting out any group not in enabled_ids."""
-    lines = []
-    for e in read_group_entries():
-        row = f"{e.group_id}\t{e.name}"
-        lines.append(row if e.group_id in enabled_ids else f"# {row}")
-    GROUPS_FILE.write_text(_GROUPS_HEADER + "\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    with _groups_transaction():
+        entries = _read_group_entries_file(GROUPS_FILE)
+        selected = [GroupEntry(e.group_id, e.name, e.group_id in enabled_ids) for e in entries]
+        _write_group_entries_file(GROUPS_FILE, selected)
 
 
 # --------------------------------------------------------------------------- #
@@ -1124,17 +1153,18 @@ def pull_groups(account: str) -> int:
     groups = json.loads(proc.stdout or "[]")
     global _GROUP_PERMISSION_CACHE
     _GROUP_PERMISSION_CACHE = (account, _unsendable_from_groups(groups, account))
-    was_disabled = {e.group_id for e in read_group_entries() if not e.enabled}
-    lines = []
-    for g in groups:
-        if g.get("isMember", True) and not g.get("isBlocked", False):
-            gid = g.get("id", "")
-            name = (g.get("name") or "(no name)").replace("\t", " ").replace("\n", " ")
-            if gid:
-                row = f"{gid}\t{name}"
-                lines.append(f"# {row}" if gid in was_disabled else row)
-    GROUPS_FILE.write_text(_GROUPS_HEADER + "\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-    return len(lines)
+    with _groups_transaction():
+        was_disabled = {e.group_id for e in _read_group_entries_file(GROUPS_FILE)
+                        if not e.enabled}
+        entries = []
+        for group in groups:
+            if group.get("isMember", True) and not group.get("isBlocked", False):
+                gid = group.get("id", "")
+                name = (group.get("name") or "(no name)").replace("\t", " ").replace("\n", " ")
+                if gid:
+                    entries.append(GroupEntry(gid, name, gid not in was_disabled))
+        _write_group_entries_file(GROUPS_FILE, entries)
+    return len(entries)
 
 
 _GROUP_PERMISSION_CACHE: tuple[str, set[str]] = ("", set())
@@ -2574,7 +2604,8 @@ def unlink() -> None:
     to also drop this device from the phone, remove it under Signal → Linked Devices."""
     with signal_cli_operation("unlinking"):
         with _notes_transaction():
-            _unlink_locked()
+            with _groups_transaction():
+                _unlink_locked()
 
 
 def _unlink_locked() -> None:
