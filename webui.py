@@ -368,17 +368,22 @@ def create_app(state: _State | None = None) -> Flask:
             with st.lock:
                 st.refresh_running = False
 
+    def _start_refresh(account: str) -> bool:
+        with st.lock:
+            if st.refresh_running:
+                return False
+            st.reset_refresh()
+            st.refresh_running = True
+        threading.Thread(target=_run_refresh, args=(account,), daemon=True).start()
+        return True
+
     @app.post("/api/groups/refresh")
     def api_groups_refresh():
         acct = _linked_account()
         if not acct:
             return jsonify(error="Not linked yet."), 400
-        with st.lock:
-            if st.refresh_running:
-                return jsonify(running=True)
-            st.reset_refresh()
-            st.refresh_running = True
-        threading.Thread(target=_run_refresh, args=(acct,), daemon=True).start()
+        if not _start_refresh(acct):
+            return jsonify(running=True)
         return jsonify(started=True)
 
     @app.get("/api/groups/refresh")
@@ -533,11 +538,7 @@ def create_app(state: _State | None = None) -> Flask:
                     # useful but optional and can take minutes on a large backlog, so
                     # run it independently after the UI is free to enter the app.
                     account = engine.load_config().account
-                    threading.Thread(
-                        target=lambda: _safe(
-                            lambda: engine.sync_groups(account, on_log=lambda *_: None), None),
-                        daemon=True,
-                    ).start()
+                    _start_refresh(account)
                     return
             with st.lock:
                 if not st.link_linked and not st.link_error:
@@ -604,8 +605,11 @@ def create_app(state: _State | None = None) -> Flask:
 
     @app.post("/api/unlink")
     def api_unlink():
+        try:
+            engine.unlink()
+        except engine.BroadcastError as exc:
+            return jsonify(error=str(exc)), 409
         _cron_clear()      # also remove any scheduled cron (engine.unlink handles launchd only)
-        engine.unlink()
         with st.lock:
             st.reset_send()
             st.reset_link()
@@ -1464,7 +1468,8 @@ async function startLink(){
 }
 async function unlink(){
   if(!confirm('Unlink and erase this app’s data?\n\nYour Signal account and phone are unaffected.'))return;
-  await api('/api/unlink',{method:'POST'});
+  const r=await api('/api/unlink',{method:'POST'});
+  if(r.error){ toast(r.error,'err'); return; }
   toast('Unlinked'); refreshState();
 }
 

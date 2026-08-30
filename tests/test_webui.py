@@ -322,8 +322,10 @@ class WebUITests(unittest.TestCase):
     def test_link_reports_success_while_initial_group_sync_is_still_running(self):
         sync_started = threading.Event()
         release_sync = threading.Event()
+        sync_calls = []
 
         def slow_sync(_account, on_log=None):
+            sync_calls.append(_account)
             sync_started.set()
             release_sync.wait(timeout=5)
             return 3
@@ -349,6 +351,9 @@ class WebUITests(unittest.TestCase):
         self.assertTrue(s["linked"])
         self.assertTrue(sync_started.is_set())
         self.assertFalse(release_sync.is_set(), "link status must not wait for group sync")
+        self.assertTrue(self.c.get("/api/groups/refresh").get_json()["running"])
+        self.assertTrue(self.c.post("/api/groups/refresh").get_json()["running"])
+        self.assertEqual(len(sync_calls), 1, "manual refresh must reuse the tracked run")
 
     def test_link_fresh_starts_when_idle(self):
         # Tapping "Open Signal" calls /api/link/fresh; with no loop running it should kick
@@ -440,6 +445,17 @@ class WebUITests(unittest.TestCase):
             self.assertTrue(r.get_json()["ok"])
             u.assert_called_once()
             cc.assert_called_once()  # the port's scheduled cron is torn down too
+
+    def test_unlink_reports_busy_without_resetting_state(self):
+        self.state.link_linked = True
+        with mock.patch.object(engine, "unlink",
+                               side_effect=engine.BroadcastError("Signal is busy")), \
+             mock.patch.object(webui, "_cron_clear") as clear_cron:
+            r = self.c.post("/api/unlink")
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("busy", r.get_json()["error"])
+        self.assertTrue(self.state.link_linked)
+        clear_cron.assert_not_called()
 
     # ---- upload hardening ----
     def test_upload_keeps_images_and_drops_nonimages(self):
