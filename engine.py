@@ -64,7 +64,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.21.4"
+APP_VERSION = "1.21.5"
 
 
 @dataclass(frozen=True)
@@ -460,6 +460,7 @@ def write_attachments(paths: list[str], path: Path = ATTACHMENTS_FILE) -> None:
 
 
 _GROUPS_LOCK = threading.RLock()
+_GROUP_ENTRIES_CACHE: tuple[Path, int, int, int, tuple[GroupEntry, ...]] | None = None
 
 
 @contextmanager
@@ -537,7 +538,18 @@ def read_group_entries(path: Path | None = None) -> list[GroupEntry]:
     if target != GROUPS_FILE:
         return _read_group_entries_file(target)
     with _groups_transaction():
-        return _read_group_entries_file(target)
+        global _GROUP_ENTRIES_CACHE
+        try:
+            stat = target.stat()
+        except FileNotFoundError:
+            _GROUP_ENTRIES_CACHE = None
+            return []
+        key = (target, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+        if _GROUP_ENTRIES_CACHE and _GROUP_ENTRIES_CACHE[:4] == key:
+            return list(_GROUP_ENTRIES_CACHE[4])
+        entries = _read_group_entries_file(target)
+        _GROUP_ENTRIES_CACHE = (*key, tuple(entries))
+        return list(entries)
 
 
 def write_group_selection(enabled_ids: set[str]) -> None:
@@ -2643,7 +2655,7 @@ def unlink() -> None:
 
 
 def _unlink_locked() -> None:
-    global _GROUP_PERMISSION_CACHE
+    global _GROUP_ENTRIES_CACHE, _GROUP_PERMISSION_CACHE
     disable_schedule()
     LOCAL_PLIST.unlink(missing_ok=True)
     shutil.rmtree(DATA_DIR, ignore_errors=True)        # link keys + account.db cache
@@ -2658,6 +2670,7 @@ def _unlink_locked() -> None:
               NOTES_CORRUPT_FILE, CONFIG_FILE):
         f.unlink(missing_ok=True)
     _GROUP_PERMISSION_CACHE = ("", set())
+    _GROUP_ENTRIES_CACHE = None
     # Keep both empty lock inodes stable while and after the wipe. Deleting a locked
     # pathname would let another process create a new inode and bypass the held flock.
     _clear_dir(LOGS_DIR, keep={".gitkeep", SIGNAL_CLI_LOCK_FILE.name})

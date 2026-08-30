@@ -335,6 +335,7 @@ class StoringNotes(unittest.TestCase):
         self.assertFalse(engine.GROUPS_FILE.exists())
         self.assertFalse(engine.GROUP_PERMISSIONS_FILE.exists())
         self.assertEqual(engine._GROUP_PERMISSION_CACHE, ("", set()))
+        self.assertIsNone(engine._GROUP_ENTRIES_CACHE)
         self.assertTrue(engine.NOTES_LOCK_FILE.exists())
         self.assertTrue(engine.SIGNAL_CLI_LOCK_FILE.exists())
         self.assertTrue(engine.GROUPS_LOCK_FILE.exists())

@@ -170,6 +170,26 @@ class GroupFileTransactionTests(unittest.TestCase):
             self.assertEqual((holder.exitcode, writer.exitcode), (0, 0))
             self.assertTrue(done.is_set())
 
+    def test_repeated_large_catalog_reads_parse_once_and_atomic_write_invalidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            groups = Path(directory) / "groups.txt"
+            lock = Path(directory) / "groups.lock"
+            groups.write_text("".join(f"g{i}\tGroup {i}\n" for i in range(50_000)),
+                              encoding="utf-8")
+            engine._GROUP_ENTRIES_CACHE = None
+            original_parser = engine._read_group_entries_file
+            with mock.patch.object(engine, "GROUPS_FILE", groups), \
+                 mock.patch.object(engine, "GROUPS_LOCK_FILE", lock), \
+                 mock.patch.object(engine, "_read_group_entries_file",
+                                   wraps=original_parser) as parser:
+                for _ in range(20):
+                    self.assertEqual(len(engine.read_group_entries()), 50_000)
+                self.assertEqual(parser.call_count, 1)
+                engine.write_group_selection({"g0"})
+                entries = engine.read_group_entries()
+                self.assertEqual(parser.call_count, 3)  # writer merge, then new inode read
+            self.assertEqual(sum(entry.enabled for entry in entries), 1)
+
 
 class AppUpdateTests(unittest.TestCase):
     @staticmethod
