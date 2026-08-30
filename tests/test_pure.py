@@ -212,7 +212,15 @@ class SyncGroupsTests(unittest.TestCase):
         err = engine.BroadcastError("Could not fetch groups:\nUser +1 is not registered.")
         with self.assertRaises(engine.BroadcastError) as ctx:
             self._sync(self._Recv(rc=1, err="User +1 is not registered."), [err])
-        self.assertIn("not registered", str(ctx.exception))
+        self.assertIn("no longer linked", str(ctx.exception))
+
+    def test_connected_catalog_failures_are_not_reported_as_a_large_backlog(self):
+        failed = engine.BroadcastError("Could not fetch groups: account already in use")
+        with self.assertRaises(engine.BroadcastError) as ctx:
+            self._sync(self._Recv(rc=0, err="server timestamp received"), [failed])
+        message = str(ctx.exception).lower()
+        self.assertIn("group list could not be read", message)
+        self.assertNotIn("large backlog", message)
 
     def test_success_returns_count(self):
         # Three stable reads settle the loop and return the count.

@@ -62,7 +62,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.19.3"
+APP_VERSION = "1.19.4"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -134,6 +134,7 @@ SYNC_MAX_S = 60                  # budget once no more progress is being made
 SYNC_HARD_CAP_S = 240            # absolute ceiling, even while a big backlog is still
                                  # actively downloading (deadline extends toward this)
 SYNC_STABLE_ROUNDS = 2           # stop once the group count holds steady this many rounds
+SYNC_LIST_FAILURE_LIMIT = 3      # repeated catalog failures are an error, not a backlog
 SYNC_RENUDGE_EVERY = 3           # re-ask the phone for the groups sync every N rounds while
                                  # we still have none (the first nudge can be missed/delayed)
 LISTGROUPS_TIMEOUT_S = 30        # listGroups is mostly local; guard against a network hang
@@ -942,6 +943,8 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
     hard_cap = time.monotonic() + SYNC_HARD_CAP_S   # ceiling even while draining a backlog
     last, stable = -1, 0     # last == -1 means "no listGroups has EVER succeeded"
     last_error = ""
+    last_list_error = ""
+    list_failures = 0
     dead_timeouts = 0        # receive timeouts that produced NO output (real connect hang)
     connected = False        # did receive ever reach the server (produce any output)?
     rounds = 0
@@ -1020,10 +1023,16 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
             count = pull_groups(account)
         except BroadcastError as exc:
             last_error = str(exc)
+            last_list_error = last_error
+            list_failures += 1
             _sync_log(f"listGroups FAILED: {last_error[:200]}")
             if ACCOUNT_UNUSABLE_PATTERN.search(last_error):
                 break  # dead account / removed device — no point retrying
+            if list_failures >= SYNC_LIST_FAILURE_LIMIT:
+                break
             continue   # transient fetch error — try another burst
+        list_failures = 0
+        last_list_error = ""
         _sync_log(f"listGroups OK: {count} groups")
         on_log(f"Syncing your groups from your phone… ({count} so far)")
         # Only settle on a non-zero count; while we still have nothing, keep
@@ -1032,6 +1041,19 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
         last = count
     _sync_log(f"--- sync end: last={last}, connected={connected}, last_error={last_error[:120]!r} ---")
     if last < 0:
+        if last_list_error:
+            if ACCOUNT_UNUSABLE_PATTERN.search(last_list_error):
+                raise BroadcastError(
+                    "Signal says this computer is no longer linked. Link it again from "
+                    "your phone, then update the group list.")
+            raise BroadcastError(
+                "Connected to Signal, but the group list could not be read. Wait for "
+                "other Signal activity to finish, then try “Update list from phone” "
+                "again. Details are in logs/sync-debug.txt.")
+        if ACCOUNT_UNUSABLE_PATTERN.search(last_error):
+            raise BroadcastError(
+                "Signal says this computer is no longer linked. Link it again from "
+                "your phone, then update the group list.")
         if connected:
             # We reached Signal and were downloading, but the group list hadn't come
             # through before the time budget ran out — a large backlog. Each attempt
