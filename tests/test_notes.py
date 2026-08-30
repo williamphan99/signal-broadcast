@@ -109,6 +109,24 @@ class WhatCountsAsANote(unittest.TestCase):
         stream = "\n".join([envelope(note("second", ts=200)), envelope(note("first", ts=100))])
         self.assertEqual([n["text"] for n in engine.harvest_notes(stream)], ["first", "second"])
 
+    def test_twenty_thousand_private_messages_from_many_people_stay_private(self):
+        messages = []
+        for i in range(20_000):
+            friend = f"{i % 500:08x}-0000-0000-0000-000000000002"
+            messages.append(envelope({
+                "destination": friend,
+                "destinationUuid": friend,
+                "destinationNumber": None,
+                "timestamp": i + 1,
+                "message": f"private message {i}",
+            }))
+        messages.extend(envelope(note(f"kept note {i}", ts=30_000 + i)) for i in range(3))
+
+        found = engine.harvest_notes("\n".join(messages), media_downloaded=False)
+
+        self.assertEqual([item["text"] for item in found],
+                         ["kept note 0", "kept note 1", "kept note 2"])
+
 
 class ExplainingAnEmptyCheck(unittest.TestCase):
     """A check that finds nothing has to say which of the three things went wrong,
