@@ -120,6 +120,24 @@ class LinkStateTests(unittest.TestCase):
         app._finish_update.assert_called_once_with(result)
 
 
+class WipeOnQuitTests(unittest.TestCase):
+    def test_busy_wipe_keeps_the_mac_app_open(self):
+        app = gui.App.__new__(gui.App)
+        app.destroy = mock.Mock()
+        config = mock.Mock(wipe_on_close=True)
+
+        with mock.patch.object(engine, "load_config", return_value=config), \
+             mock.patch.object(engine, "unlink", side_effect=engine.BroadcastError("busy")), \
+             mock.patch.object(gui.messagebox, "askyesno", return_value=True, create=True), \
+             mock.patch.object(gui.messagebox, "showerror", create=True) as show_error, \
+             mock.patch.object(gui.thumbs, "clear") as clear_thumbs:
+            app._quit()
+
+        show_error.assert_called_once()
+        app.destroy.assert_not_called()
+        clear_thumbs.assert_not_called()
+
+
 class GroupRefreshTests(unittest.TestCase):
     def test_screen_clear_cancels_a_pending_group_filter(self):
         app = gui.App.__new__(gui.App)

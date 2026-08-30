@@ -1963,8 +1963,11 @@ class App(tk.Tk):
             try:
                 engine.unlink()
                 engine.disable_watcher()
-            except Exception:
-                pass  # best effort — still quit
+            except Exception as exc:
+                messagebox.showerror(
+                    "Couldn't erase",
+                    f"The app is still open and nothing was partly erased.\n\n{exc}")
+                return
         thumbs.clear()   # also registered with atexit, in case we're killed some other way
         self.destroy()
 
