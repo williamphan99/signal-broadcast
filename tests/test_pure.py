@@ -99,20 +99,6 @@ class GroupSnapshotTests(unittest.TestCase):
         self.assertEqual(len(calls), 5, "one nudge plus two quiet receive/listGroups rounds")
 
 
-class SignalOperationProbeTests(unittest.TestCase):
-    def test_free_signal_lease_is_not_busy(self):
-        @mock.patch.object(engine, "signal_cli_operation")
-        def run(operation):
-            operation.return_value.__enter__.return_value = None
-            self.assertFalse(engine.signal_cli_operation_busy())
-        run()
-
-    def test_owned_signal_lease_is_busy(self):
-        with mock.patch.object(engine, "signal_cli_operation",
-                               side_effect=engine.BroadcastError("busy")):
-            self.assertTrue(engine.signal_cli_operation_busy())
-
-
 class GroupFileTransactionTests(unittest.TestCase):
     def test_interrupted_selection_write_keeps_the_previous_catalog(self):
         with tempfile.TemporaryDirectory() as directory:

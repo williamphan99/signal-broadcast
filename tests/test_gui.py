@@ -160,13 +160,39 @@ class UpdateSafetyTests(unittest.TestCase):
         app._linking = app._sending = app._refreshing = app._checking_notes = False
         app.update_btn = mock.Mock()
 
-        with mock.patch.object(engine, "signal_cli_operation_busy", return_value=True), \
+        with mock.patch.object(engine, "signal_cli_operation",
+                               side_effect=engine.BroadcastError("busy")), \
              mock.patch.object(gui.messagebox, "showinfo", create=True), \
              mock.patch.object(gui.os, "execv") as execv:
             app._restart()
 
         execv.assert_not_called()
         app.update_btn.configure.assert_called_once_with(state="normal", text="Restart update")
+
+    def test_update_holds_signal_lease_while_pulling_code(self):
+        app = gui.App.__new__(gui.App)
+        app._update_ready = False
+        app._linking = app._sending = app._refreshing = app._checking_notes = False
+        app.update_btn = mock.Mock()
+        app.events = queue.Queue()
+        operations = []
+
+        @contextmanager
+        def lease(operation):
+            operations.append(operation)
+            yield
+
+        def immediate_thread(*, target, daemon):
+            return types.SimpleNamespace(start=target)
+
+        result = engine.UpdateResult(False, "current")
+        with mock.patch.object(engine, "signal_cli_operation", lease), \
+             mock.patch.object(engine, "git_pull", return_value=result), \
+             mock.patch.object(gui.threading, "Thread", side_effect=immediate_thread):
+            app._check_update()
+
+        self.assertEqual(operations, ["updating the app"])
+        self.assertEqual(app.events.get_nowait(), ("update_done", result))
 
     def test_dependency_update_requires_setup_instead_of_restart(self):
         app = gui.App.__new__(gui.App)

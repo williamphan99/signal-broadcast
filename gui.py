@@ -1955,10 +1955,13 @@ class App(tk.Tk):
         self.update_btn.configure(state="disabled", text="Updating…")
 
         def work():
-            if engine.signal_cli_operation_busy():
+            try:
+                with engine.signal_cli_operation("updating the app"):
+                    result = engine.git_pull()
+            except engine.BroadcastError:
                 self.events.put(("update_blocked", None))
             else:
-                self.events.put(("update_done", engine.git_pull()))
+                self.events.put(("update_done", result))
         threading.Thread(target=work, daemon=True).start()
 
     def _activity_for_update(self) -> str | None:
@@ -2004,7 +2007,7 @@ class App(tk.Tk):
     def _restart(self) -> None:
         """Relaunch the app on the freshly-pulled code, replacing this process."""
         activity = self._activity_for_update()
-        if activity or engine.signal_cli_operation_busy():
+        if activity:
             self.update_btn.configure(state="normal", text="Restart update")
             messagebox.showinfo(
                 "Restart postponed",
@@ -2013,7 +2016,14 @@ class App(tk.Tk):
             return
         gui_path = str(Path(__file__).resolve())
         try:
-            os.execv(sys.executable, [sys.executable, gui_path])
+            with engine.signal_cli_operation("restarting after an update"):
+                os.execv(sys.executable, [sys.executable, gui_path])
+        except engine.BroadcastError:
+            self.update_btn.configure(state="normal", text="Restart update")
+            messagebox.showinfo(
+                "Restart postponed",
+                "The update is installed, but Signal is busy. Wait for the current "
+                "activity to finish, then click Restart update.")
         except OSError as exc:
             messagebox.showerror("Couldn't restart",
                 f"Update downloaded — please close and reopen the app.\n\n{exc}")

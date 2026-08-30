@@ -64,7 +64,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.21.5"
+APP_VERSION = "1.21.6"
 
 
 @dataclass(frozen=True)
@@ -635,15 +635,6 @@ def signal_cli_operation(operation: str) -> Iterator[None]:
             pass
         fh.close()
         _SIGNAL_CLI_THREAD_LOCK.release()
-
-
-def signal_cli_operation_busy() -> bool:
-    """Return whether another thread or process owns the Signal account lease."""
-    try:
-        with signal_cli_operation("checking Signal activity"):
-            return False
-    except BroadcastError:
-        return True
 
 
 @contextmanager
