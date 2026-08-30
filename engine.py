@@ -62,7 +62,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.20.5"
+APP_VERSION = "1.20.6"
 
 
 def git_pull() -> tuple[bool, str]:
@@ -1119,6 +1119,12 @@ def cached_unsendable_groups(account: str) -> set[str]:
 
 
 def unsendable_groups(account: str) -> set[str]:
+    """Read group permissions while exclusively owning the Signal account."""
+    with signal_cli_operation("checking group permissions"):
+        return _unsendable_groups_unlocked(account)
+
+
+def _unsendable_groups_unlocked(account: str) -> set[str]:
     """Group ids the linked account CANNOT post to: announcement groups
     (permissionSendMessage == ONLY_ADMINS) where this account is a non-admin member.
     Used to skip those cleanly instead of letting the send fail. Best-effort — returns
@@ -1971,7 +1977,7 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
         # Admin-only (announcement) groups you can't post in: skip them up front rather
         # than burning a doomed send + retries on each. Best-effort; empty on any error.
         # NOTE: run this BEFORE starting the daemon — both want the account lock.
-        blocked = unsendable_groups(config.account)
+        blocked = _unsendable_groups_unlocked(config.account)
         if blocked:
             n = sum(1 for gid, _ in groups if gid in blocked)
             if n:

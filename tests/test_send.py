@@ -49,18 +49,18 @@ class SendPathTests(unittest.TestCase):
         FakeDaemon.plan = {}
         FakeDaemon.calls = {}
         FakeDaemon.styles = {}
-        self._orig = (engine.signal_cli_bin, engine.unsendable_groups,
+        self._orig = (engine.signal_cli_bin, engine._unsendable_groups_unlocked,
                       engine.SignalCliDaemon, engine._send_one,
                       engine.MIN_DELAY_S, engine.NON_THROTTLE_WAIT_S)
         engine.signal_cli_bin = lambda: "/usr/bin/true"
-        engine.unsendable_groups = lambda account: set()
+        engine._unsendable_groups_unlocked = lambda account: set()
         engine.SignalCliDaemon = FakeDaemon
         engine._send_one = lambda *a: (True, False, "")
         engine.MIN_DELAY_S = 0.0          # don't sleep between sends in tests
         engine.NON_THROTTLE_WAIT_S = 0.0  # don't sleep between retries in tests
 
     def tearDown(self):
-        (engine.signal_cli_bin, engine.unsendable_groups, engine.SignalCliDaemon,
+        (engine.signal_cli_bin, engine._unsendable_groups_unlocked, engine.SignalCliDaemon,
          engine._send_one, engine.MIN_DELAY_S, engine.NON_THROTTLE_WAIT_S) = self._orig
         engine.clear_run_progress()  # don't leave a test's crash marker behind
 
@@ -115,7 +115,7 @@ class SendPathTests(unittest.TestCase):
         # The live in-flight view is driven by on_group_start. It must fire exactly once
         # per group that actually sends, with the right position+name, and NOT for an
         # admin-only group (which never leaves the machine).
-        engine.unsendable_groups = lambda account: {"g2"}
+        engine._unsendable_groups_unlocked = lambda account: {"g2"}
         started = []
         engine.broadcast(
             config=engine.Config(account="+t", base_delay_seconds=0.0, jitter_seconds=0.0,
@@ -165,6 +165,8 @@ class SendPathTests(unittest.TestCase):
                 engine.sync_groups("+test")
             with self.assertRaises(engine.BroadcastError):
                 engine.fetch_notes("+test")
+            with self.assertRaises(engine.BroadcastError):
+                engine.unsendable_groups("+test")
 
     def test_shared_operation_lock_is_released_after_an_exception(self):
         with self.assertRaises(RuntimeError):
@@ -441,16 +443,16 @@ class TextStyleDeliveryTests(unittest.TestCase):
         FakeDaemon.plan = {}
         FakeDaemon.calls = {}
         FakeDaemon.styles = {}
-        self._orig = (engine.signal_cli_bin, engine.unsendable_groups,
+        self._orig = (engine.signal_cli_bin, engine._unsendable_groups_unlocked,
                       engine.SignalCliDaemon, engine._send_one, engine.MIN_DELAY_S,
                       engine._reap_orphan_signal_cli)
         engine.signal_cli_bin = lambda: "/usr/bin/true"
-        engine.unsendable_groups = lambda account: set()
+        engine._unsendable_groups_unlocked = lambda account: set()
         engine.SignalCliDaemon = FakeDaemon
         engine.MIN_DELAY_S = 0.0
 
     def tearDown(self):
-        (engine.signal_cli_bin, engine.unsendable_groups, engine.SignalCliDaemon,
+        (engine.signal_cli_bin, engine._unsendable_groups_unlocked, engine.SignalCliDaemon,
          engine._send_one, engine.MIN_DELAY_S,
          engine._reap_orphan_signal_cli) = self._orig
         engine.clear_run_progress()
@@ -505,18 +507,18 @@ class ConcurrentSendTests(unittest.TestCase):
         FakeDaemon.plan = {}
         FakeDaemon.calls = {}
         FakeDaemon.styles = {}
-        self._orig = (engine.signal_cli_bin, engine.unsendable_groups,
+        self._orig = (engine.signal_cli_bin, engine._unsendable_groups_unlocked,
                       engine.SignalCliDaemon, engine._send_one,
                       engine.MIN_DELAY_S, engine.NON_THROTTLE_WAIT_S)
         engine.signal_cli_bin = lambda: "/usr/bin/true"
-        engine.unsendable_groups = lambda account: set()
+        engine._unsendable_groups_unlocked = lambda account: set()
         engine.SignalCliDaemon = FakeDaemon
         engine._send_one = lambda *a: (True, False, "")
         engine.MIN_DELAY_S = 0.0
         engine.NON_THROTTLE_WAIT_S = 0.0
 
     def tearDown(self):
-        (engine.signal_cli_bin, engine.unsendable_groups, engine.SignalCliDaemon,
+        (engine.signal_cli_bin, engine._unsendable_groups_unlocked, engine.SignalCliDaemon,
          engine._send_one, engine.MIN_DELAY_S, engine.NON_THROTTLE_WAIT_S) = self._orig
         engine.clear_run_progress()
 
@@ -562,7 +564,7 @@ class ConcurrentSendTests(unittest.TestCase):
         self.assertEqual(engine.failure_breakdown(res), "")
 
     def test_admin_only_group_skipped_in_parallel(self):
-        engine.unsendable_groups = lambda account: {"g2"}
+        engine._unsendable_groups_unlocked = lambda account: {"g2"}
         res = self._run([("g1", "a"), ("g2", "b"), ("g3", "c")], K=2)
         self.assertNotIn("g2", FakeDaemon.calls, "an admin-only group must never be sent")
         g2 = next(r for r in res if r.group_id == "g2")
@@ -587,7 +589,7 @@ class ConcurrentSendTests(unittest.TestCase):
         # The progress position is the group's place in the run order — NOT completion
         # order — so admin-only skips stay in place instead of bunching at the start,
         # and every line maps back to a specific group.
-        engine.unsendable_groups = lambda account: {"g2", "g4"}
+        engine._unsendable_groups_unlocked = lambda account: {"g2", "g4"}
         groups = [("g1", "n1"), ("g2", "n2"), ("g3", "n3"), ("g4", "n4"), ("g5", "n5")]
         seen = {}
         lock = threading.Lock()
@@ -605,7 +607,7 @@ class ConcurrentSendTests(unittest.TestCase):
     def test_on_group_start_fires_for_every_sent_group_in_parallel(self):
         # The live in-flight view needs a start event for each group that sends, exactly
         # once, even under concurrency (completion order is nondeterministic).
-        engine.unsendable_groups = lambda account: {"g3"}  # admin-only — should not start
+        engine._unsendable_groups_unlocked = lambda account: {"g3"}  # admin-only — should not start
         groups = [(f"g{i}", f"n{i}") for i in range(1, 7)]
         started = []  # list.append is atomic under the GIL — safe from K worker threads
         self._run(groups, K=3, on_group_start=lambda pos, name: started.append(name))

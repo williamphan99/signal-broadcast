@@ -1391,8 +1391,7 @@ class App(tk.Tk):
         def work():
             try:
                 account = engine.load_config().account
-                with engine.signal_cli_operation("checking group permissions"):
-                    ids = engine.unsendable_groups(account)
+                ids = engine.unsendable_groups(account)
             except engine.BroadcastError:
                 ids = set()
             self.events.put(("group_perms", ids))
