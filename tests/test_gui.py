@@ -308,6 +308,27 @@ class NotesStatusTests(unittest.TestCase):
         app._log.assert_called_once_with(
             "Notes check: 253 processed, 1 note(s) to self, 0 new.", "muted")
 
+    def test_missing_long_text_and_photos_have_plain_recovery_copy(self):
+        app = gui.App.__new__(gui.App)
+        app._notes = [{
+            "ts": 1, "text": "preview", "photos": [], "missing_photos": 2,
+            "missing_body": True,
+        }]
+        app.notes_list = mock.Mock()
+        app.notes_list.curselection.return_value = (0,)
+        app.note_text = mock.Mock()
+        app.note_use_btn = mock.Mock()
+        app.note_copy_btn = mock.Mock()
+        app.note_del_btn = mock.Mock()
+        app.note_photos = mock.Mock()
+
+        app._show_note()
+
+        detail = app.note_photos.configure.call_args.kwargs["text"]
+        self.assertIn("full text wasn't downloaded", detail)
+        self.assertIn("2 photos weren't downloaded", detail)
+        self.assertIn("send the note again", detail)
+
 
 class _FakeListbox:
     def __init__(self):

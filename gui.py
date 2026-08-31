@@ -1201,11 +1201,11 @@ class App(tk.Tk):
             parts.append(f"{photos} photo{'' if photos == 1 else 's'} attached")
         if transient:
             parts.append(f"{transient} view-once photo{'' if transient == 1 else 's'} — not kept")
+        if note.get("missing_body"):
+            parts.append("The full text wasn't downloaded — send the note again to get it")
         if missing:
-            # Arrived while the group sync was draining the queue, which can't download
-            # media. Say so plainly — the photos aren't coming back on their own.
             parts.append(f"{missing} photo{'' if missing == 1 else 's'} weren't downloaded "
-                         "(arrived during a group sync) — send the note again to get them")
+                         "— send the note again to get them")
         self.note_photos.configure(text=" · ".join(parts))
 
     def _fetch_notes(self) -> None:

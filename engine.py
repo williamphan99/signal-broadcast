@@ -9,6 +9,8 @@ progress and log lines are delivered through callbacks, and it raises
 
 from __future__ import annotations
 
+import base64
+import binascii
 import collections
 import fcntl
 import hashlib
@@ -64,7 +66,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.21.11"
+APP_VERSION = "1.21.12"
 
 
 @dataclass(frozen=True)
@@ -1331,8 +1333,12 @@ def _notes_transaction() -> Iterator[None]:
             finally:
                 fcntl.flock(fh, fcntl.LOCK_UN)
 NOTES_BURST_S = 10        # signal-cli's own idle cap for one notes drain
-NOTES_TIMEOUT_S = 180     # hard kill-switch; a note's photos have to download inside it
+NOTES_TIMEOUT_S = 180     # hard kill-switch for draining message metadata
+NOTES_ATTACHMENT_TIMEOUT_S = 120  # each selected note attachment; independent so one
+                                  # slow photo can't consume the whole note
 NOTES_KEEP = 300          # most recent notes retained
+LONG_MESSAGE_MIME = "text/x-signal-plain"
+_PENDING_ATTACHMENTS = "_pending_attachments"  # in-memory only; never written to notes.json
 
 
 def _is_note_to_self(envelope: dict, sent: dict) -> bool:
@@ -1348,7 +1354,37 @@ def _is_note_to_self(envelope: dict, sent: dict) -> bool:
     return bool(src_num and dst_num and src_num == dst_num)
 
 
-def _note_from_envelope(envelope: dict, media_downloaded: bool) -> dict | None:
+def _attachment_path(att: dict) -> Path | None:
+    """Where signal-cli stores one attachment, rejecting anything path-like."""
+    attachment_id = att.get("id")
+    if not isinstance(attachment_id, str) or not attachment_id:
+        return None
+    if Path(attachment_id).name != attachment_id:
+        return None
+    return DATA_DIR / "attachments" / attachment_id
+
+
+def _apply_downloaded_note_attachment(note: dict, att: dict, path: Path) -> None:
+    """Add one already-decrypted attachment to its customer-facing note field."""
+    if att.get("contentType") == LONG_MESSAGE_MIME:
+        try:
+            note["text"] = path.read_text(encoding="utf-8", errors="replace")
+            note.pop("missing_body", None)
+        except OSError:
+            note["missing_body"] = True
+        return
+    note["photos"].append({"path": str(path), "name": att.get("filename") or path.name})
+
+
+def _mark_note_attachment_missing(note: dict, att: dict) -> None:
+    if att.get("contentType") == LONG_MESSAGE_MIME:
+        note["missing_body"] = True
+    else:
+        note["missing_photos"] += 1
+
+
+def _note_from_envelope(envelope: dict, media_downloaded: bool,
+                        retain_attachment_pointers: bool = False) -> dict | None:
     """One stored note from one received envelope, or None if it isn't a note.
 
     ``media_downloaded`` says whether this drain was allowed to fetch attachments. The
@@ -1359,42 +1395,46 @@ def _note_from_envelope(envelope: dict, media_downloaded: bool) -> dict | None:
     sent = sync.get("sentMessage") if isinstance(sync, dict) else None
     if not isinstance(sent, dict) or not _is_note_to_self(envelope, sent):
         return None
-    text = sent.get("message") or ""
+    note = {
+        "ts": int(sent.get("timestamp") or envelope.get("timestamp") or 0),
+        "text": sent.get("message") or "",
+        "photos": [],
+        "missing_photos": 0,
+        "view_once_photos": 0,
+        "expires": int(sent.get("expiresInSeconds") or 0),
+    }
     # A view-once photo is meant to survive exactly one look. signal-cli has already
     # written it to disk by the time we read the envelope, so the copy is deleted rather
     # than kept — the same reasoning as the disappearing-message timer below. The note
     # still appears, saying the photo wasn't kept, so it isn't a silent disappearance.
     view_once = bool(sent.get("viewOnce"))
-    photos, missing, transient = [], 0, 0
+    pending = []
     attachments = sent.get("attachments")
     for att in attachments if isinstance(attachments, list) else []:
         if not isinstance(att, dict):
             continue
-        # signal-cli stores a downloaded attachment under its id in the config dir.
-        path = DATA_DIR / "attachments" / str(att.get("id") or "")
         if view_once:
-            transient += 1
+            note["view_once_photos"] += 1
+            path = _attachment_path(att)
             try:
-                path.unlink(missing_ok=True)
+                if path is not None:
+                    path.unlink(missing_ok=True)
             except OSError:
                 pass
-        elif media_downloaded and att.get("id") and path.is_file():
-            photos.append({"path": str(path), "name": att.get("filename") or path.name})
+        elif retain_attachment_pointers and att.get("id"):
+            pending.append({key: att.get(key) for key in ("id", "filename", "contentType")})
         else:
-            missing += 1
-    if not text and not photos and not missing and not transient:
+            path = _attachment_path(att)
+            if media_downloaded and path is not None and path.is_file():
+                _apply_downloaded_note_attachment(note, att, path)
+            else:
+                _mark_note_attachment_missing(note, att)
+    if pending:
+        note[_PENDING_ATTACHMENTS] = pending
+    if not (note["text"] or note["photos"] or note["missing_photos"]
+            or note["view_once_photos"] or note.get("missing_body") or pending):
         return None            # an empty transcript (a read receipt, a typing marker)
-    return {
-        "ts": int(sent.get("timestamp") or envelope.get("timestamp") or 0),
-        "text": text,
-        "photos": photos,
-        "missing_photos": missing,
-        "view_once_photos": transient,
-        # Notes inherit the chat's disappearing-message timer. Signal promises those
-        # vanish; a copy sitting on this Mac forever would quietly break that, so the
-        # expiry is carried here and enforced in prune_notes().
-        "expires": int(sent.get("expiresInSeconds") or 0),
-    }
+    return note
 
 
 def harvest_notes(receive_output: str, media_downloaded: bool = True) -> list[dict]:
@@ -1435,8 +1475,11 @@ def _tail(value) -> str:
     return f"…{text[-4:]}" if text else "(none)"
 
 
-def _inspect_receive(receive_lines: Iterable[str], *, media_downloaded: bool,
-                     collect_notes: bool, log_summary: bool) -> tuple[list[dict], dict, bool]:
+def _inspect_receive(
+    receive_lines: Iterable[str], *, media_downloaded: bool,
+    collect_notes: bool, log_summary: bool,
+    retain_attachment_pointers: bool = False,
+) -> tuple[list[dict], dict, bool]:
     """Classify a receive stream once, retaining only notes and bounded diagnostics."""
     found = []
     envelopes = transcripts = notes = 0
@@ -1463,7 +1506,9 @@ def _inspect_receive(receive_lines: Iterable[str], *, media_downloaded: bool,
         matched = _is_note_to_self(envelope, sent)
         notes += int(matched)
         if collect_notes and matched:
-            note = _note_from_envelope(envelope, media_downloaded)
+            note = _note_from_envelope(
+                envelope, media_downloaded,
+                retain_attachment_pointers=retain_attachment_pointers)
             if note:
                 found.append(note)
         if log_summary:
@@ -1593,6 +1638,73 @@ def merge_notes(existing: list[dict], found: list[dict]) -> tuple[list[dict], in
     return prune_notes(list(existing) + fresh), len(fresh)
 
 
+def _store_note_attachment(att: dict, data: bytes) -> Path | None:
+    """Atomically store one attachment returned by signal-cli's getAttachment."""
+    path = _attachment_path(att)
+    if path is None:
+        return None
+    tmp = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_bytes(data)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        return path
+    except OSError:
+        try:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+
+def _download_pending_note_attachments(account: str, notes: list[dict],
+                                       on_log: LogFn = lambda *_: None) -> None:
+    """Fetch only attachments belonging to positively identified Note-to-Self items."""
+    total = sum(len(note.get(_PENDING_ATTACHMENTS) or []) for note in notes)
+    if not total:
+        return
+    on_log(f"Downloading {total} attachment(s) from your notes…")
+    client = None
+    try:
+        client = SignalCliDaemon(account)
+    except (BroadcastError, OSError, subprocess.SubprocessError):
+        pass
+    downloaded = missing = 0
+    paths: dict[str, Path | None] = {}
+    try:
+        for note in notes:
+            pending = note.pop(_PENDING_ATTACHMENTS, [])
+            for att in pending:
+                attachment_id = att.get("id")
+                path = _attachment_path(att)
+                if path is not None and not path.is_file():
+                    if attachment_id in paths:
+                        path = paths[attachment_id]
+                    elif client is not None:
+                        try:
+                            data = client.get_attachment(attachment_id, account)
+                        except BroadcastError:
+                            path = None
+                        else:
+                            path = _store_note_attachment(att, data)
+                        paths[attachment_id] = path
+                    else:
+                        path = None
+                if path is not None and path.is_file():
+                    _apply_downloaded_note_attachment(note, att, path)
+                    downloaded += 1
+                else:
+                    _mark_note_attachment_missing(note, att)
+                    missing += 1
+    finally:
+        if client is not None:
+            client.close()
+    _notes_log(f"note attachments: requested={total}, downloaded={downloaded}, missing={missing}")
+
+
 def fetch_notes(account: str, on_log: LogFn = lambda *_: None) -> dict:
     """Drain what's waiting for this device and keep the notes.
 
@@ -1601,10 +1713,9 @@ def fetch_notes(account: str, on_log: LogFn = lambda *_: None) -> dict:
     whether the note, the phone, or the app is at fault.
 
     Deliberately a one-shot the user asks for, not a poll: it holds the same lock as a
-    broadcast (one signal-cli operation per account), and unlike the group sync it DOES
-    download attachments, because a note's photos are half the point of reading it here.
-    Everything the drain pulls that isn't a note is discarded immediately after local
-    classification instead of buffering the whole receive output in memory."""
+    broadcast (one signal-cli operation per account). The first pass skips every media
+    download, then fetches only attachments belonging to positively identified notes.
+    Private-chat media is never downloaded just to be discarded."""
     binary = signal_cli_bin()
     started = time.monotonic()
     with signal_cli_operation("checking notes"):
@@ -1612,7 +1723,8 @@ def fetch_notes(account: str, on_log: LogFn = lambda *_: None) -> dict:
             proc = subprocess.Popen(
                 _cli(binary, "--config", str(DATA_DIR), "-a", account, "-o", "json",
                      "receive", "--timeout", str(NOTES_BURST_S),
-                     "--ignore-avatars", "--ignore-stickers", "--ignore-stories"),
+                     "--ignore-attachments", "--ignore-avatars", "--ignore-stickers",
+                     "--ignore-stories"),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
                 errors="replace", env=_signal_env(binary))
         except (OSError, subprocess.SubprocessError) as exc:
@@ -1626,8 +1738,8 @@ def fetch_notes(account: str, on_log: LogFn = lambda *_: None) -> dict:
             try:
                 if proc.stdout is not None:
                     parsed.append(_inspect_receive(
-                        proc.stdout, media_downloaded=True,
-                        collect_notes=True, log_summary=True))
+                        proc.stdout, media_downloaded=False, collect_notes=True,
+                        log_summary=True, retain_attachment_pointers=True))
             except Exception as exc:  # noqa: BLE001 — reported on the calling thread
                 read_errors.append(exc)
 
@@ -1653,6 +1765,8 @@ def fetch_notes(account: str, on_log: LogFn = lambda *_: None) -> dict:
             proc.wait()
         stdout_reader.join()
         stderr_reader.join()
+        if not read_errors and parsed:
+            _download_pending_note_attachments(account, parsed[0][0], on_log=on_log)
 
     if read_errors:
         raise BroadcastError(f"Couldn't read Signal's notes response: {read_errors[0]}")
@@ -1722,12 +1836,12 @@ SendFn = Callable[[str, str, list[str]], "tuple[bool, bool, str]"]
 
 
 class SignalCliDaemon:
-    """One long-lived `signal-cli jsonRpc` process for a whole broadcast. Avoids the
-    ~1-2s JVM startup per group and keeps encryption sessions warm in memory, so
-    sends (especially to big groups) speed up after the first. Speaks JSON-RPC 2.0
-    over stdin/stdout, one JSON object per line; unsolicited notifications (incoming
-    messages/receipts) are ignored. Start it AFTER any other signal-cli call for the
-    account — it holds the account lock for its lifetime."""
+    """One long-lived `signal-cli jsonRpc` process for a batch of account operations.
+
+    Broadcasts avoid the ~1-2s JVM startup per group and keep encryption sessions warm;
+    a Notes check uses the same process to retrieve several selected attachments without
+    paying that startup cost for every photo. It holds signal-cli's account lock for its
+    lifetime, so start it only after any other signal-cli process has exited."""
 
     def __init__(self, account: str, start_timeout: float = 30.0) -> None:
         binary = signal_cli_bin()
@@ -1870,6 +1984,23 @@ class SignalCliDaemon:
         """Dispatch + wait, giving up cleanly on timeout (no late capture)."""
         mid, box = self._dispatch(method, params)
         return self._await(mid, box, timeout, keep_listening=False)
+
+    def get_attachment(self, attachment_id: str, recipient: str) -> bytes:
+        """Retrieve and decode one attachment through the existing JSON-RPC process."""
+        resp = self._request(
+            "getAttachment", {"id": attachment_id, "recipient": recipient},
+            timeout=NOTES_ATTACHMENT_TIMEOUT_S)
+        error = resp.get("error")
+        if error:
+            message = error.get("message") if isinstance(error, dict) else str(error)
+            raise BroadcastError(str(message or "attachment download failed"))
+        encoded = resp.get("result")
+        if not isinstance(encoded, str):
+            raise BroadcastError("signal-cli returned an invalid attachment")
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise BroadcastError("signal-cli returned an invalid attachment") from exc
 
     def send(self, group_id: str, message: str, attachments: list[str],
              text_styles: list[str] | None = None) -> tuple[bool, bool, str]:
