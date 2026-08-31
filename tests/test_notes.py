@@ -13,7 +13,6 @@ Run with:  python3 -m unittest discover -s tests
 """
 from __future__ import annotations
 
-import base64
 import io
 import json
 import multiprocessing
@@ -210,7 +209,7 @@ class FetchingNotes(unittest.TestCase):
         def kill(self):
             self.killed = True
 
-    def _fetch(self, process, download_side_effect=None):
+    def _fetch(self, process):
         stored = []
         patches = (
             mock.patch.object(engine, "signal_cli_bin", return_value="signal-cli"),
@@ -220,8 +219,6 @@ class FetchingNotes(unittest.TestCase):
             mock.patch.object(engine.subprocess, "Popen", return_value=process),
             mock.patch.object(engine, "store_notes",
                               side_effect=lambda notes: stored.extend(notes) or len(notes)),
-            mock.patch.object(engine, "_download_pending_note_attachments",
-                              side_effect=download_side_effect),
             mock.patch.object(engine, "_notes_log"),
         )
         started = []
@@ -251,7 +248,10 @@ class FetchingNotes(unittest.TestCase):
         self.assertEqual(engine.NOTES_BURST_S, 10)
         command = popen.call_args.args[0]
         self.assertEqual(command[command.index("--timeout") + 1], "10")
-        self.assertIn("--ignore-attachments", command)
+        self.assertNotIn("--ignore-attachments", command)
+        self.assertIn("--ignore-avatars", command)
+        self.assertIn("--ignore-stickers", command)
+        self.assertIn("--ignore-stories", command)
 
     def test_partial_notes_are_kept_when_the_hard_timeout_kills_receive(self):
         process = self.Process(envelope(note("arrived before timeout", ts=3)), timeout=True)
@@ -266,15 +266,14 @@ class FetchingNotes(unittest.TestCase):
         attachment = {"contentType": "image/jpeg", "id": "photo.jpg"}
         process = self.Process(envelope(note("caption", attachments=[attachment])))
 
-        def complete(_account, notes, on_log):
-            self.assertIn("_pending_attachments", notes[0])
-            notes[0].pop("_pending_attachments")
-            notes[0]["photos"].append({"path": "/tmp/photo.jpg", "name": "photo.jpg"})
-
-        _, stored, _ = self._fetch(process, download_side_effect=complete)
+        with tempfile.TemporaryDirectory() as folder, \
+             mock.patch.object(engine, "DATA_DIR", Path(folder)):
+            path = Path(folder) / "attachments" / "photo.jpg"
+            path.parent.mkdir()
+            path.write_bytes(b"image")
+            _, stored, _ = self._fetch(process)
 
         self.assertEqual(stored[0]["photos"][0]["name"], "photo.jpg")
-        self.assertNotIn("_pending_attachments", stored[0])
 
     def test_cli_failure_without_received_output_is_reported(self):
         process = self.Process("", error="Connection closed!", returncode=3)
@@ -364,7 +363,7 @@ class NotesWithPhotos(unittest.TestCase):
         self.assertEqual(found[0]["missing_photos"], 1)
 
 
-class SelectiveNoteAttachments(unittest.TestCase):
+class LargeNoteAttachments(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -373,13 +372,6 @@ class SelectiveNoteAttachments(unittest.TestCase):
         engine.DATA_DIR = self.data
         self.addCleanup(lambda: setattr(engine, "DATA_DIR", self._real_data_dir))
 
-    @staticmethod
-    def _pending_notes(stream: str) -> list[dict]:
-        found, _, _ = engine._inspect_receive(
-            stream.splitlines(), media_downloaded=False, collect_notes=True,
-            log_summary=False, retain_attachment_pointers=True)
-        return found
-
     def test_a_long_body_and_fifteen_photos_are_preserved(self):
         body = {"contentType": "text/x-signal-plain", "id": "long-body.txt"}
         photos = [
@@ -387,73 +379,35 @@ class SelectiveNoteAttachments(unittest.TestCase):
              "id": f"photo-{i}.jpg"}
             for i in range(15)
         ]
-        notes = self._pending_notes(envelope(note("preview", attachments=[body, *photos])))
         full_text = ("A long customer message. " * 1_000).encode()
         payloads = {"long-body.txt": full_text,
                     **{f"photo-{i}.jpg": f"image-{i}".encode() for i in range(15)}}
-        client = mock.Mock()
-        client.get_attachment.side_effect = (
-            lambda attachment_id, _recipient: payloads[attachment_id])
+        attachment_dir = self.data / "attachments"
+        attachment_dir.mkdir()
+        for name, payload in payloads.items():
+            (attachment_dir / name).write_bytes(payload)
 
-        with mock.patch.object(engine, "SignalCliDaemon", return_value=client) as daemon_cls:
-            engine._download_pending_note_attachments(ME_NUMBER, notes)
+        notes = engine.harvest_notes(
+            envelope(note("preview", attachments=[body, *photos])))
 
         self.assertEqual(notes[0]["text"], full_text.decode())
         self.assertEqual(len(notes[0]["photos"]), 15)
         self.assertEqual(notes[0]["missing_photos"], 0)
-        self.assertNotIn("_pending_attachments", notes[0])
-        daemon_cls.assert_called_once_with(ME_NUMBER)
-        self.assertEqual(client.get_attachment.call_count, 16)
-        client.close.assert_called_once()
-
-    def test_attachments_for_other_conversations_are_never_downloaded(self):
-        private_attachments = [
-            {"contentType": "image/jpeg", "id": f"private-{i}.jpg"}
-            for i in range(15)
-        ]
-        private = envelope({
-            "destinationUuid": FRIEND_UUID, "timestamp": 1, "message": "private",
-            "attachments": private_attachments,
-        })
-        wanted = {"contentType": "image/jpeg", "id": "wanted.jpg"}
-        notes = self._pending_notes("\n".join([
-            private, envelope(note("keep", ts=2, attachments=[wanted])),
-        ]))
-        client = mock.Mock()
-        client.get_attachment.return_value = b"wanted"
-
-        with mock.patch.object(engine, "SignalCliDaemon", return_value=client):
-            engine._download_pending_note_attachments(ME_NUMBER, notes)
-
-        client.get_attachment.assert_called_once_with("wanted.jpg", ME_NUMBER)
-        self.assertEqual(len(notes[0]["photos"]), 1)
 
     def test_one_failed_photo_does_not_lose_the_note_or_other_photo(self):
         attachments = [
             {"contentType": "image/jpeg", "id": "good.jpg"},
             {"contentType": "image/jpeg", "id": "failed.jpg"},
         ]
-        notes = self._pending_notes(envelope(note("keep this", attachments=attachments)))
-        client = mock.Mock()
-        client.get_attachment.side_effect = [b"good", engine.BroadcastError("offline")]
+        attachment_dir = self.data / "attachments"
+        attachment_dir.mkdir()
+        (attachment_dir / "good.jpg").write_bytes(b"good")
 
-        with mock.patch.object(engine, "SignalCliDaemon", return_value=client):
-            engine._download_pending_note_attachments(ME_NUMBER, notes)
+        notes = engine.harvest_notes(envelope(note("keep this", attachments=attachments)))
 
         self.assertEqual(notes[0]["text"], "keep this")
         self.assertEqual(len(notes[0]["photos"]), 1)
         self.assertEqual(notes[0]["missing_photos"], 1)
-
-    def test_daemon_attachment_response_is_validated_and_decoded(self):
-        daemon = engine.SignalCliDaemon.__new__(engine.SignalCliDaemon)
-        daemon._request = mock.Mock(return_value={
-            "result": base64.b64encode(b"image bytes").decode(),
-        })
-
-        self.assertEqual(daemon.get_attachment("photo.jpg", ME_NUMBER), b"image bytes")
-        daemon._request.assert_called_once_with(
-            "getAttachment", {"id": "photo.jpg", "recipient": ME_NUMBER},
-            timeout=engine.NOTES_ATTACHMENT_TIMEOUT_S)
 
 
 class StoringNotes(unittest.TestCase):

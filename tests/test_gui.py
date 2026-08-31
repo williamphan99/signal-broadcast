@@ -3,6 +3,7 @@
 
 import queue
 import sys
+import tempfile
 import types
 import unittest
 from contextlib import contextmanager
@@ -328,6 +329,45 @@ class NotesStatusTests(unittest.TestCase):
         self.assertIn("full text wasn't downloaded", detail)
         self.assertIn("2 photos weren't downloaded", detail)
         self.assertIn("send the note again", detail)
+
+    def test_use_as_message_loads_all_fifteen_downloaded_photos(self):
+        app = gui.App.__new__(gui.App)
+        app.msg_text = mock.Mock()
+        app._apply_style_preview = mock.Mock()
+        app._sync_photos = mock.Mock()
+        app.nb = mock.Mock()
+        app._log = mock.Mock()
+
+        with tempfile.TemporaryDirectory() as folder:
+            paths = []
+            for index in range(15):
+                path = Path(folder) / f"photo-{index}.jpg"
+                path.write_bytes(b"image")
+                paths.append(str(path))
+            app._selected_note = mock.Mock(return_value={
+                "text": "full message",
+                "photos": [{"path": path} for path in paths],
+                "missing_photos": 0,
+            })
+
+            app._use_note()
+
+        self.assertEqual(app.selected_images, paths)
+        app._sync_photos.assert_called_once_with()
+        app.msg_text.insert.assert_called_once_with("1.0", "full message")
+
+    def test_use_as_message_refuses_an_incomplete_note(self):
+        app = gui.App.__new__(gui.App)
+        app.msg_text = mock.Mock()
+        app._selected_note = mock.Mock(return_value={
+            "text": "partial", "photos": [], "missing_photos": 11,
+        })
+
+        with mock.patch.object(gui.messagebox, "showerror", create=True) as showerror:
+            app._use_note()
+
+        showerror.assert_called_once()
+        app.msg_text.delete.assert_not_called()
 
 
 class _FakeListbox:

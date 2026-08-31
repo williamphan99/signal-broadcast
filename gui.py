@@ -1229,7 +1229,8 @@ class App(tk.Tk):
             return
         self._checking_notes = True
         self.notes_btn.configure(state="disabled")
-        self.notes_status.configure(text="Checking your phone…", foreground=PALETTE["muted"])
+        self.notes_status.configure(text="Checking your phone and downloading note images…",
+                                    foreground=PALETTE["muted"])
         self.notes_progress.pack(fill="x", pady=(8, 0))
         self.notes_progress.start(15)
 
@@ -1284,18 +1285,34 @@ class App(tk.Tk):
         note = self._selected_note()
         if not note:
             return
+        missing = int(note.get("missing_photos") or 0)
+        if note.get("missing_body") or missing:
+            parts = []
+            if note.get("missing_body"):
+                parts.append("the complete text")
+            if missing:
+                parts.append(f"{missing} photo{'' if missing == 1 else 's'}")
+            messagebox.showerror(
+                "Can't use incomplete note",
+                f"This note is missing {' and '.join(parts)}. Forward the original "
+                "message to Note to Self again, then check for new notes.")
+            return
+        photos = [p["path"] for p in (note.get("photos") or []) if Path(p["path"]).is_file()]
+        gone = len(note.get("photos") or []) - len(photos)
+        if gone:
+            messagebox.showerror(
+                "Can't use incomplete note",
+                f"{gone} photo file{'' if gone == 1 else 's'} disappeared from this Mac. "
+                "Forward the original message to Note to Self again, then check for new notes.")
+            return
         self.msg_text.delete("1.0", "end")
         self.msg_text.insert("1.0", note.get("text", ""))
         self._apply_style_preview()
-        photos = [p["path"] for p in (note.get("photos") or []) if Path(p["path"]).is_file()]
-        if photos:
-            self.selected_images = list(photos)
-            self._sync_photos()
+        self.selected_images = list(photos)
+        self._sync_photos()
         self.nb.select(0)
         self.msg_text.focus_set()
-        gone = len(note.get("photos") or []) - len(photos)
-        self._log("Note loaded into the message." +
-                  (f" {gone} photo(s) no longer on disk." if gone else ""), "ok")
+        self._log("Note loaded into the message.", "ok")
 
     def _copy_note(self) -> None:
         note = self._selected_note()
