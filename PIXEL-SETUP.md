@@ -190,14 +190,18 @@ bash scripts/webui-termux.sh          # inside the guest; leave it running
 ```
 
 Then open **http://127.0.0.1:8787** in Chrome on the Pixel. The app ("BROADCAST") has a
-bottom tab bar with four tabs, designed to be tap-and-type simple:
+bottom tab bar with five tabs, designed to be tap-and-type simple:
 
 - **Send** — type the message, **Add photos**, tap **Send to N groups** (it confirms and
   shows a time estimate). During a send you get a live console — a progress bar, "Sending
   N of M — <group>", and an activity log — then a clear result card with **Resend failed**
   if anything didn't go through.
 - **Groups** — **Sync from phone** (with a "last synced" note), tick/untick groups (with a
-  search box when the list is long), **Save selection**.
+  search box when the list is long), **Save selection**. Large group lists can take several
+  minutes; the page keeps showing live progress and resumes watching after a browser reload.
+- **Notes** — pull messages sent to **Note to Self**, then **Use**, **Copy**, or **Delete**
+  them locally. Notes found while refreshing groups are kept here even if the group-list read
+  later fails.
 - **Schedule** — add daily times as chips, **Turn on / Turn off / Update times**, and see
   the current status, **next send**, and how the **last send** went. Best-effort on
   Android — see the Scheduling section below.

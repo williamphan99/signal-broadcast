@@ -45,19 +45,8 @@ proot-distro login "$DISTRO" -- sh -lc "
 
 # Home-screen icons for Termux:Widget (reads ~/.shortcuts/).
 mkdir -p ~/.shortcuts
-cat > ~/.shortcuts/"Signal Broadcast" <<SH
-#!/data/data/com.termux/files/usr/bin/sh
-# Launch: hold a wake lock, open the app in the browser, run the server (foreground so the
-# proot session stays alive). If it's already running, just reopen the browser.
-termux-wake-lock
-if curl -fsS -o /dev/null http://127.0.0.1:8787 2>/dev/null; then
-  termux-open-url http://127.0.0.1:8787
-else
-  (sleep 4; termux-open-url http://127.0.0.1:8787) &
-  proot-distro login $DISTRO -- sh -lc 'cd \$HOME/signal-broadcast && python3 webui.py'
-fi
-SH
-chmod +x ~/.shortcuts/"Signal Broadcast"
+proot-distro login "$DISTRO" -- sh -lc \
+  "cd \$HOME/signal-broadcast && bash scripts/refresh-pixel-widget.sh '$DISTRO'"
 
 cat > ~/.shortcuts/"Update Signal Broadcast" <<SH
 #!/data/data/com.termux/files/usr/bin/sh

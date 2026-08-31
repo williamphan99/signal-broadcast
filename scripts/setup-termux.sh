@@ -129,6 +129,9 @@ else
   exit 1
 fi
 
+# Existing phones get launcher fixes when they tap Update, not only on a fresh install.
+bash scripts/refresh-pixel-widget.sh || true
+
 echo
 echo "All set. Next:"
 echo "  1) Link this device:  bash scripts/link-termux.sh   (see PIXEL-SETUP.md for the QR steps)"

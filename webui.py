@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Mobile web UI for Signal Broadcast — the Android/Pixel counterpart of the Tkinter
-gui.py. Same engine, same three tabs (Send / Groups / Schedule) plus linking and unlink.
+gui.py. Same engine and daily workflows, including groups, notes, scheduling, and unlink.
 
 It runs *inside* the proot-distro Debian guest and binds to 127.0.0.1 only, so it's
 reachable from the phone's own browser and nowhere else — nothing is exposed to the
@@ -17,14 +17,18 @@ Design notes:
 from __future__ import annotations
 
 import base64
+import functools
+import json
+import struct
 import subprocess
 import threading
 import time
+import zlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 from werkzeug.utils import secure_filename
 
 import engine
@@ -63,6 +67,7 @@ class _State:
         self.reset_send()
         self.reset_link()
         self.reset_refresh()
+        self.reset_notes()
 
     def reset_send(self) -> None:
         self.send_running = False
@@ -89,6 +94,36 @@ class _State:
         self.refresh_running = False
         self.refresh_count: int | None = None
         self.refresh_error: str | None = None
+        self.refresh_status = ""
+
+    def reset_notes(self) -> None:
+        self.notes_running = False
+        self.notes_result: dict | None = None
+        self.notes_error: str | None = None
+
+
+@functools.lru_cache(maxsize=2)
+def _icon_png(size: int) -> bytes:
+    """Small dependency-free teal app icon, generated at the manifest's real size."""
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    teal = bytes((31, 179, 188, 255))
+    dark = bytes((11, 14, 20, 255))
+    rows = []
+    center, inner, outer = size / 2, size * .12, size * .34
+    for y in range(size):
+        row = bytearray([0])
+        for x in range(size):
+            distance = ((x - center) ** 2 + (y - center) ** 2) ** .5
+            row.extend(teal if distance < inner or outer - size * .025 < distance < outer
+                       else dark)
+        rows.append(bytes(row))
+    raw = zlib.compress(b"".join(rows), 9)
+    return (b"\x89PNG\r\n\x1a\n" +
+            chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)) +
+            chunk(b"IDAT", raw) + chunk(b"IEND", b""))
 
 
 def create_app(state: _State | None = None) -> Flask:
@@ -171,6 +206,48 @@ def create_app(state: _State | None = None) -> Flask:
     @app.get("/")
     def index():
         return PAGE
+
+    @app.get("/manifest.webmanifest")
+    def manifest():
+        return Response(json.dumps({
+            "name": "Signal Broadcast",
+            "short_name": "Broadcast",
+            "start_url": "/",
+            "scope": "/",
+            "display": "standalone",
+            "background_color": "#0B0E14",
+            "theme_color": "#0B0E14",
+            "icons": [
+                {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+                {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"},
+            ],
+        }), mimetype="application/manifest+json")
+
+    @app.get("/icon-<int:size>.png")
+    def icon(size: int):
+        if size not in (192, 512):
+            return jsonify(error="Unknown icon size."), 404
+        return Response(_icon_png(size), mimetype="image/png",
+                        headers={"Cache-Control": "public, max-age=86400"})
+
+    @app.get("/sw.js")
+    def service_worker():
+        # Cache only the shell and icons. API data is private and must always come from
+        # the live localhost process; when it is down, the shell disables write actions.
+        source = """
+const CACHE='signal-broadcast-shell-v1';
+const SHELL=['/','/manifest.webmanifest','/icon-192.png','/icon-512.png'];
+self.addEventListener('install',event=>event.waitUntil(caches.open(CACHE).then(c=>c.addAll(SHELL))));
+self.addEventListener('activate',event=>event.waitUntil(self.clients.claim()));
+self.addEventListener('fetch',event=>{
+  if(event.request.method!=='GET'||new URL(event.request.url).pathname.startsWith('/api/'))return;
+  event.respondWith(fetch(event.request).then(response=>{
+    const copy=response.clone(); caches.open(CACHE).then(c=>c.put(event.request,copy)); return response;
+  }).catch(()=>caches.match(event.request)));
+});
+""".strip()
+        return Response(source, mimetype="application/javascript",
+                        headers={"Service-Worker-Allowed": "/"})
 
     # ------------------------------------------------------------------ state
     @app.get("/api/state")
@@ -365,8 +442,12 @@ def create_app(state: _State | None = None) -> Flask:
         return jsonify(ok=True)
 
     def _run_refresh(account):
+        def progress(message: str) -> None:
+            with st.lock:
+                st.refresh_status = message
+
         try:
-            count = engine.sync_groups(account, on_log=lambda *_: None)
+            count = engine.sync_groups(account, on_log=progress)
             with st.lock:
                 st.refresh_count = count
         except Exception as exc:
@@ -380,6 +461,8 @@ def create_app(state: _State | None = None) -> Flask:
         with st.lock:
             if st.refresh_running:
                 return False
+            if st.notes_running:
+                raise engine.BroadcastError("Wait for the notes check to finish.")
             st.reset_refresh()
             st.refresh_running = True
         threading.Thread(target=_run_refresh, args=(account,), daemon=True).start()
@@ -390,15 +473,107 @@ def create_app(state: _State | None = None) -> Flask:
         acct = _linked_account()
         if not acct:
             return jsonify(error="Not linked yet."), 400
-        if not _start_refresh(acct):
-            return jsonify(running=True)
+        try:
+            if not _start_refresh(acct):
+                return jsonify(running=True)
+        except engine.BroadcastError as exc:
+            return jsonify(error=str(exc)), 409
         return jsonify(started=True)
 
     @app.get("/api/groups/refresh")
     def api_groups_refresh_status():
         with st.lock:
             return jsonify(running=st.refresh_running, count=st.refresh_count,
-                           error=st.refresh_error)
+                           error=st.refresh_error, status=st.refresh_status)
+
+    # ------------------------------------------------------------------ notes
+    def _browser_note(note: dict) -> dict:
+        return {
+            "ts": int(note.get("ts", 0)),
+            "text": str(note.get("text") or ""),
+            "photos": len(note.get("photos") or []),
+            "missing_photos": int(note.get("missing_photos") or 0),
+            "view_once_photos": int(note.get("view_once_photos") or 0),
+            "missing_body": bool(note.get("missing_body")),
+        }
+
+    @app.get("/api/notes")
+    def api_notes():
+        return jsonify(notes=[_browser_note(note)
+                              for note in _safe(engine.read_notes, [])])
+
+    def _run_notes(account: str) -> None:
+        try:
+            report = engine.fetch_notes(account, on_log=lambda *_: None)
+            with st.lock:
+                st.notes_result = {key: int(report.get(key, 0))
+                                   for key in ("transcripts", "notes", "new")}
+        except Exception as exc:
+            with st.lock:
+                st.notes_error = str(exc)
+        finally:
+            with st.lock:
+                st.notes_running = False
+
+    @app.post("/api/notes/refresh")
+    def api_notes_refresh():
+        account = _linked_account()
+        if not account:
+            return jsonify(error="Not linked yet."), 400
+        with st.lock:
+            if st.refresh_running:
+                return jsonify(error="Wait for the groups sync to finish."), 409
+            if st.notes_running:
+                return jsonify(running=True)
+            st.reset_notes()
+            st.notes_running = True
+        threading.Thread(target=_run_notes, args=(account,), daemon=True).start()
+        return jsonify(started=True)
+
+    @app.get("/api/notes/refresh")
+    def api_notes_refresh_status():
+        with st.lock:
+            return jsonify(running=st.notes_running, result=st.notes_result,
+                           error=st.notes_error)
+
+    @app.post("/api/notes/use")
+    def api_notes_use():
+        data = request.get_json(force=True, silent=True) or {}
+        try:
+            timestamp = int(data.get("ts"))
+        except (TypeError, ValueError):
+            return jsonify(error="Choose a note first."), 400
+        note = next((item for item in _safe(engine.read_notes, [])
+                     if int(item.get("ts", 0)) == timestamp), None)
+        if not note:
+            return jsonify(error="That note is no longer here."), 404
+        missing = int(note.get("missing_photos") or 0)
+        missing_parts = []
+        if note.get("missing_body"):
+            missing_parts.append("the complete text")
+        if missing:
+            missing_parts.append(f"{missing} photo{'s' if missing != 1 else ''}")
+        if missing_parts:
+            return jsonify(error=(
+                f"This note is missing {' and '.join(missing_parts)}. Forward the original "
+                "message to Note to Self again, then check for new notes.")), 409
+        stored_photos = list(note.get("photos") or [])
+        photos = [str(photo["path"]) for photo in stored_photos
+                  if photo.get("path") and Path(photo["path"]).is_file()]
+        gone = len(stored_photos) - len(photos)
+        if gone:
+            return jsonify(error=(
+                f"{gone} photo file{'s' if gone != 1 else ''} disappeared from this Pixel. "
+                "Forward the original message to Note to Self again, then check for new notes.")), 409
+        engine.write_message(str(note.get("text") or ""))
+        engine.write_attachments(photos)
+        return jsonify(ok=True, message=str(note.get("text") or ""),
+                       attachments=[Path(path).name for path in photos])
+
+    @app.delete("/api/notes/<int:timestamp>")
+    def api_notes_delete(timestamp: int):
+        engine.delete_note(timestamp)
+        return jsonify(ok=True)
 
     # --------------------------------------------------------------- schedule
     @app.get("/api/schedule")
@@ -759,6 +934,9 @@ PAGE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0B0E14">
 <meta name="color-scheme" content="dark">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon-192.png">
 <title>Broadcast</title>
 <style>
   :root{
@@ -816,7 +994,7 @@ PAGE = r"""<!doctype html>
   .btn.ghost{background:transparent;border:1px solid var(--line);color:var(--fg);font-weight:600}
   .btn.ghost:active{background:var(--card2)}
   .btn.danger{background:transparent;border:1px solid rgba(255,92,87,.5);color:var(--err);font-weight:600}
-  .btn.sm{min-height:40px;padding:8px 12px;font-size:14px;border-radius:11px}
+  .btn.sm{min-height:var(--tap);padding:8px 12px;font-size:14px;border-radius:11px}
   .btn:disabled{opacity:.45;cursor:default}
   .btn.primary:not(:disabled){box-shadow:0 6px 20px -8px rgba(43,139,255,.6)}
   /* subtle idle sheen on the big send button */
@@ -835,7 +1013,7 @@ PAGE = r"""<!doctype html>
   .attrow{display:flex;gap:8px;margin-top:10px}
   .attrow .btn{flex:1}
   .stylerow{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
-  .stylebtn{border-radius:999px;padding:7px 13px;font-size:13px;font-weight:600;cursor:pointer;
+  .stylebtn{border-radius:999px;padding:7px 13px;min-height:var(--tap);font-size:13px;font-weight:600;cursor:pointer;
     background:transparent;border:1px solid var(--line);color:var(--muted)}
   .stylebtn.on{color:var(--fg);border-color:var(--accent);background:rgba(47,199,212,.14)}
   .stylebtn:active{transform:translateY(1px)}
@@ -894,6 +1072,13 @@ PAGE = r"""<!doctype html>
   .selrow{display:flex;gap:8px;margin-top:12px}
   .selrow .btn{flex:1}
   .empty{padding:22px 6px;text-align:center;color:var(--muted)}
+  /* ---------- notes ---------- */
+  .notes{display:flex;flex-direction:column;gap:10px;margin-top:12px}
+  .note{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:12px}
+  .note-meta{font-size:12px;color:var(--muted);margin-bottom:7px}
+  .note-text{white-space:pre-wrap;overflow-wrap:anywhere;max-height:9em;overflow:auto}
+  .note-actions{display:flex;gap:7px;margin-top:10px}
+  .note-actions .btn{flex:1;width:auto}
   /* ---------- schedule ---------- */
   .sched-status{font-size:17px;font-weight:700;display:flex;align-items:center;gap:8px}
   .dotr{width:9px;height:9px;border-radius:99px;background:var(--faint)}
@@ -901,7 +1086,7 @@ PAGE = r"""<!doctype html>
   .timechips{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}
   .tchip{display:inline-flex;align-items:center;gap:8px;background:var(--bg);border:1px solid var(--line);
     border-radius:999px;padding:7px 8px 7px 14px;font-size:15px;font-variant-numeric:tabular-nums}
-  .tchip button{background:none;border:0;color:var(--muted);width:24px;height:24px;border-radius:99px;
+  .tchip button{background:none;border:0;color:var(--muted);width:var(--tap);height:var(--tap);border-radius:99px;
     font-size:16px;cursor:pointer;display:grid;place-items:center}
   .tchip button:active{background:var(--card2);color:var(--err)}
   .addtime{display:flex;gap:8px;align-items:center}
@@ -1085,6 +1270,16 @@ PAGE = r"""<!doctype html>
       </div>
     </div>
 
+    <!-- NOTES -->
+    <div id="tab-notes" class="tabpane hidden">
+      <div class="card">
+        <div class="card-h">Note to Self</div>
+        <button class="btn primary" id="notesBtn" onclick="refreshNotes()">Check for new notes</button>
+        <div id="notesStatus" class="muted small center" style="margin-top:9px"></div>
+        <div id="notes" class="notes"></div>
+      </div>
+    </div>
+
     <!-- SCHEDULE -->
     <div id="tab-schedule" class="tabpane hidden">
       <div class="card">
@@ -1139,10 +1334,12 @@ PAGE = r"""<!doctype html>
 </main>
 
 <nav id="nav" class="hidden">
-  <button data-tab="send" class="active" onclick="tab('send')">
+  <button data-tab="send" class="active" aria-current="page" onclick="tab('send')">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></svg>Send</button>
   <button data-tab="groups" onclick="tab('groups')">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9.5" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.9"/><path d="M16 3.1a4 4 0 0 1 0 7.8"/></svg>Groups</button>
+  <button data-tab="notes" onclick="tab('notes')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3h11l3 3v15H5z"/><path d="M16 3v4h4M8 11h8M8 15h8"/></svg>Notes</button>
   <button data-tab="schedule" onclick="tab('schedule')">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>Schedule</button>
   <button data-tab="settings" onclick="tab('settings')">
@@ -1160,7 +1357,16 @@ async function api(path,opts){
   try{const r=await fetch(path,opts); setOffline(false); return await r.json().catch(()=>({}));}
   catch(e){ setOffline(true); return {__neterr:true}; }
 }
-function setOffline(v){ if(v===offline)return; offline=v; $('#netbanner').classList.toggle('hidden',!v); }
+function setOffline(v){
+  if(v===offline)return;
+  offline=v;
+  $('#netbanner').classList.toggle('hidden',!v);
+  $$('#app button, #linkScreen button').forEach(button=>{
+    if(v){ button.dataset.offlineDisabled=button.disabled?'kept':'added'; button.disabled=true; }
+    else{ if(button.dataset.offlineDisabled==='added')button.disabled=false;
+      delete button.dataset.offlineDisabled; }
+  });
+}
 function toast(msg,kind){ const t=document.createElement('div'); t.className='toast '+(kind||'');
   t.textContent=msg; $('#toasts').appendChild(t);
   setTimeout(()=>{t.style.opacity='0';t.style.transition='opacity .3s';setTimeout(()=>t.remove(),300);}, 2400); }
@@ -1168,8 +1374,11 @@ function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>'
 
 function tab(t){
   $$('#app .tabpane').forEach(d=>d.classList.toggle('hidden',d.id!=='tab-'+t));
-  $$('#nav button').forEach(b=>b.classList.toggle('active',b.dataset.tab===t));
+  $$('#nav button').forEach(b=>{ const active=b.dataset.tab===t;
+    b.classList.toggle('active',active);
+    if(active)b.setAttribute('aria-current','page'); else b.removeAttribute('aria-current'); });
   if(t==='groups')loadGroups();
+  if(t==='notes')loadNotes();
   if(t==='schedule')loadSchedule();
 }
 
@@ -1333,6 +1542,12 @@ async function loadGroups(){
   const ls=localStorage.getItem('sb_last_sync');
   $('#lastSync').textContent = ls ? ('Last synced '+ls) : 'Not synced yet on this phone';
   $('#grpSearch').classList.toggle('hidden', allGroups.length<8);
+  const refresh=await api('/api/groups/refresh');
+  if(!refresh.__neterr&&refresh.running){
+    $('#syncBtn').disabled=true; $('#syncLabel').textContent='Syncing…';
+    $('#grpMsg').textContent=refresh.status||'Syncing your groups from your phone…';
+    watchGroupRefresh();
+  }
 }
 function renderGroups(){
   const q=($('#grpSearch').value||'').toLowerCase();
@@ -1360,19 +1575,100 @@ async function saveGroups(){
   refreshState();
 }
 let grpTimer=null;
+function watchGroupRefresh(){
+  if(grpTimer)clearInterval(grpTimer);
+  checkGroupRefresh();
+  grpTimer=setInterval(checkGroupRefresh,1500);
+}
+async function checkGroupRefresh(){
+  const s=await api('/api/groups/refresh'); if(s.__neterr)return;
+  if(s.status)$('#grpMsg').textContent=s.status;
+  if(s.running)return;
+  if(grpTimer)clearInterval(grpTimer); grpTimer=null;
+  $('#syncBtn').disabled=false; $('#syncLabel').textContent='Sync from phone';
+  await loadNotes();
+  if(s.error){ $('#grpMsg').innerHTML='<span class="err">'+esc(s.error)+'</span>';
+    toast('Sync failed: '+s.error,'err'); loadGroups(); }
+  else{ const now=new Date(); localStorage.setItem('sb_last_sync', now.toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}));
+    $('#grpMsg').textContent='Updated — '+(s.count||0)+' groups.';
+    toast('Synced '+(s.count||0)+' group'+(s.count===1?'':'s'),'ok'); loadGroups(); refreshState(); }
+}
 async function refreshGroups(){
   $('#syncBtn').disabled=true; $('#syncLabel').textContent='Syncing…';
+  $('#grpMsg').textContent='Syncing your groups from your phone…';
   const r=await api('/api/groups/refresh',{method:'POST'});
   if(r.error){ toast(r.error,'err'); $('#syncBtn').disabled=false; $('#syncLabel').textContent='Sync from phone'; return; }
-  if(grpTimer)clearInterval(grpTimer);
-  grpTimer=setInterval(async()=>{
-    const s=await api('/api/groups/refresh'); if(s.__neterr||s.running)return;
-    clearInterval(grpTimer); grpTimer=null;
-    $('#syncBtn').disabled=false; $('#syncLabel').textContent='Sync from phone';
-    if(s.error){ toast('Sync failed: '+s.error,'err'); }
-    else{ const now=new Date(); localStorage.setItem('sb_last_sync', now.toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}));
-      toast('Synced '+(s.count||0)+' group'+(s.count===1?'':'s'),'ok'); loadGroups(); refreshState(); }
-  },1500);
+  watchGroupRefresh();
+}
+
+// ---------------- notes ----------------
+let allNotes=[], notesTimer=null;
+async function loadNotes(){
+  const r=await api('/api/notes'); if(r.__neterr)return;
+  allNotes=r.notes||[]; renderNotes();
+  const status=await api('/api/notes/refresh');
+  if(!status.__neterr&&status.running){
+    $('#notesBtn').disabled=true; $('#notesBtn').textContent='Checking…';
+    $('#notesStatus').textContent='Checking your phone…'; watchNotesRefresh();
+  }
+}
+function renderNotes(){
+  const el=$('#notes');
+  if(!allNotes.length){ el.innerHTML='<div class="empty">No notes yet.<br>Write one in Note to Self, then check.</div>'; return; }
+  el.innerHTML=allNotes.map(note=>{
+    const when=new Date(note.ts).toLocaleString([], {day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'});
+    const kept=note.photos||0, missing=note.missing_photos||0, transient=note.view_once_photos||0;
+    const details=[];
+    if(kept)details.push(kept+' photo'+(kept===1?'':'s')+' attached');
+    if(missing)details.push(missing+' photo'+(missing===1?'':'s')+' not downloaded');
+    if(transient)details.push(transient+' view-once photo'+(transient===1?'':'s')+' not kept');
+    if(note.missing_body)details.push('full text not downloaded');
+    return '<article class="note"><div class="note-meta">'+esc(when+(details.length?' · '+details.join(' · '):''))+'</div>'+
+      '<div class="note-text">'+esc(note.text||'(photo only)')+'</div><div class="note-actions">'+
+      '<button class="btn primary sm" onclick="useNote('+note.ts+')">Use</button>'+
+      '<button class="btn ghost sm" onclick="copyNote('+note.ts+')">Copy</button>'+
+      '<button class="btn ghost sm" onclick="deleteNote('+note.ts+')">Delete</button></div></article>';
+  }).join('');
+}
+function watchNotesRefresh(){
+  if(notesTimer)clearInterval(notesTimer);
+  checkNotesRefresh(); notesTimer=setInterval(checkNotesRefresh,1000);
+}
+async function checkNotesRefresh(){
+  const s=await api('/api/notes/refresh'); if(s.__neterr||s.running)return;
+  if(notesTimer)clearInterval(notesTimer); notesTimer=null;
+  $('#notesBtn').disabled=false; $('#notesBtn').textContent='Check for new notes';
+  await loadNotes();
+  if(s.error){ $('#notesStatus').innerHTML='<span class="err">'+esc(s.error)+'</span>'; return; }
+  const result=s.result||{}, fresh=result.new||0;
+  if(fresh)$('#notesStatus').innerHTML='<span class="ok">'+fresh+' new note'+(fresh===1?'':'s')+'.</span>';
+  else if(result.notes)$('#notesStatus').textContent='Nothing new — those notes are already here.';
+  else if(result.transcripts)$('#notesStatus').textContent='Messages arrived, but none were notes to yourself.';
+  else $('#notesStatus').textContent='Signal had nothing waiting. Write a note on your phone, wait a few seconds, then check again.';
+}
+async function refreshNotes(){
+  $('#notesBtn').disabled=true; $('#notesBtn').textContent='Checking…';
+  $('#notesStatus').textContent='Checking your phone…';
+  const r=await api('/api/notes/refresh',{method:'POST'});
+  if(r.error){ $('#notesBtn').disabled=false; $('#notesBtn').textContent='Check for new notes';
+    $('#notesStatus').innerHTML='<span class="err">'+esc(r.error)+'</span>'; return; }
+  watchNotesRefresh();
+}
+async function useNote(ts){
+  const r=await api('/api/notes/use',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ts})});
+  if(r.error){toast(r.error,'err');return;}
+  $('#msg').value=r.message||''; S.message=r.message||''; renderAtts(r.attachments||[]);
+  tab('send'); toast('Note loaded into the message','ok');
+}
+async function copyNote(ts){
+  const note=allNotes.find(item=>item.ts===ts); if(!note)return;
+  try{await navigator.clipboard.writeText(note.text||''); toast('Copied','ok');}
+  catch(_error){toast('Couldn’t copy this note','err');}
+}
+async function deleteNote(ts){
+  if(!confirm('Delete this note from the Pixel? Your phone keeps it.'))return;
+  const r=await api('/api/notes/'+ts,{method:'DELETE'}); if(r.error){toast(r.error,'err');return;}
+  await loadNotes(); $('#notesStatus').textContent='Note deleted from this Pixel. Your phone keeps it.';
 }
 
 // ---------------- schedule ----------------
@@ -1484,7 +1780,9 @@ async function unlink(){
 
 // ---------------- boot ----------------
 refreshState();
-heartbeat=setInterval(()=>{ if(!(S.send&&S.send.running)) refreshState(); }, 5000);
+heartbeat=setInterval(()=>{ if(document.visibilityState==='visible'&&!(S.send&&S.send.running)) refreshState(); }, 5000);
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible')refreshState(); });
+if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
 </script>
 </body></html>"""
 

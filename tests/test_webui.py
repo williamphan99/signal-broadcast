@@ -56,6 +56,7 @@ class WebUITests(unittest.TestCase):
         patch("read_group_entries", lambda *a, **k: [
             engine.GroupEntry("g1", "One", True), engine.GroupEntry("g2", "Two", True),
             engine.GroupEntry("g3", "Three", False)])
+        patch("read_notes", lambda: [])
         patch("write_group_selection", lambda ids: None)
         patch("cooldown_blocks_run", lambda h: None)
         patch("stamp_run", lambda: None)
@@ -445,6 +446,154 @@ class WebUITests(unittest.TestCase):
                 time.sleep(0.05)
         self.assertFalse(s["running"])
         self.assertEqual(s["count"], 7)
+
+    def test_groups_refresh_publishes_customer_safe_progress(self):
+        def sync(_account, on_log=None):
+            on_log("Reading your group list… Large accounts can take several minutes.")
+            return 7
+
+        with mock.patch.object(engine, "sync_groups", sync):
+            self.assertTrue(self.c.post("/api/groups/refresh").get_json()["started"])
+            end = time.time() + 5
+            s = {}
+            while time.time() < end:
+                s = self.c.get("/api/groups/refresh").get_json()
+                if not s["running"]:
+                    break
+                time.sleep(0.01)
+        self.assertEqual(s["status"],
+                         "Reading your group list… Large accounts can take several minutes.")
+
+    def test_groups_refresh_waits_for_notes_check(self):
+        with self.state.lock:
+            self.state.notes_running = True
+        with mock.patch.object(engine, "sync_groups") as sync:
+            response = self.c.post("/api/groups/refresh")
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("notes", response.get_json()["error"].lower())
+        sync.assert_not_called()
+
+    # ---- notes ----
+    def test_notes_list_projects_only_browser_safe_fields(self):
+        notes = [{"ts": 123, "text": "buy milk", "photos": [
+            {"path": "/private/secret/photo.jpg", "name": "photo.jpg"}],
+            "missing_photos": 2, "view_once_photos": 1, "missing_body": True,
+            "unexpected": "private"}]
+        with mock.patch.object(engine, "read_notes", return_value=notes):
+            response = self.c.get("/api/notes")
+            j = response.get_json()
+        self.assertEqual(j["notes"], [{"ts": 123, "text": "buy milk", "photos": 1,
+                                        "missing_photos": 2, "view_once_photos": 1,
+                                        "missing_body": True}])
+        self.assertNotIn("/private/secret", response.get_data(as_text=True))
+
+    def test_notes_refresh_reports_plain_completion_summary(self):
+        report = {"envelopes": 8, "transcripts": 3, "notes": 2, "new": 1,
+                  "seconds": 4.2}
+        with mock.patch.object(engine, "fetch_notes", return_value=report):
+            self.assertTrue(self.c.post("/api/notes/refresh").get_json()["started"])
+            end = time.time() + 5
+            s = {}
+            while time.time() < end:
+                s = self.c.get("/api/notes/refresh").get_json()
+                if not s["running"]:
+                    break
+                time.sleep(0.01)
+        self.assertFalse(s["running"])
+        self.assertEqual(s["result"], {"transcripts": 3, "notes": 2, "new": 1})
+
+    def test_notes_refresh_waits_for_group_sync(self):
+        with self.state.lock:
+            self.state.refresh_running = True
+        with mock.patch.object(engine, "fetch_notes") as fetch:
+            response = self.c.post("/api/notes/refresh")
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("groups", response.get_json()["error"].lower())
+        fetch.assert_not_called()
+
+    def test_note_can_be_loaded_into_message_with_existing_photos(self):
+        writes = {}
+        with tempfile.TemporaryDirectory() as directory:
+            one = Path(directory) / "one.jpg"
+            one.write_bytes(b"photo")
+            two = Path(directory) / "two.jpg"
+            two.write_bytes(b"photo")
+            note = {"ts": 123, "text": "send this", "photos": [
+                {"path": str(one), "name": "one.jpg"},
+                {"path": str(two), "name": "two.jpg"}]}
+            with mock.patch.object(engine, "read_notes", return_value=[note]), \
+                 mock.patch.object(engine, "write_message",
+                                   side_effect=lambda value: writes.update(message=value)), \
+                 mock.patch.object(engine, "write_attachments",
+                                   side_effect=lambda value: writes.update(attachments=value)):
+                response = self.c.post("/api/notes/use", json={"ts": 123})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(writes["message"], "send this")
+        self.assertEqual(writes["attachments"], [str(one), str(two)])
+
+    def test_note_delete_uses_timestamp(self):
+        with mock.patch.object(engine, "delete_note") as delete:
+            response = self.c.delete("/api/notes/123")
+        self.assertTrue(response.get_json()["ok"])
+        delete.assert_called_once_with(123)
+
+    def test_incomplete_note_is_refused_without_changing_the_draft(self):
+        note = {"ts": 123, "text": "text only", "photos": [
+            {"path": "/missing/photo.jpg", "name": "photo.jpg"}],
+            "missing_photos": 1}
+        with mock.patch.object(engine, "read_notes", return_value=[note]), \
+             mock.patch.object(engine, "write_message") as write_message, \
+             mock.patch.object(engine, "write_attachments") as write:
+            response = self.c.post("/api/notes/use", json={"ts": 123})
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("missing", response.get_json()["error"])
+        write_message.assert_not_called()
+        write.assert_not_called()
+
+    def test_text_only_note_clears_old_draft_photos(self):
+        note = {"ts": 123, "text": "text only", "photos": []}
+        with mock.patch.object(engine, "read_notes", return_value=[note]), \
+             mock.patch.object(engine, "write_attachments") as write:
+            response = self.c.post("/api/notes/use", json={"ts": 123})
+        self.assertEqual(response.status_code, 200)
+        write.assert_called_once_with([])
+
+    def test_note_with_disappeared_photo_file_is_refused(self):
+        note = {"ts": 123, "text": "caption", "photos": [
+            {"path": "/missing/photo.jpg", "name": "photo.jpg"}]}
+        with mock.patch.object(engine, "read_notes", return_value=[note]), \
+             mock.patch.object(engine, "write_message") as write_message:
+            response = self.c.post("/api/notes/use", json={"ts": 123})
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("disappeared", response.get_json()["error"])
+        write_message.assert_not_called()
+
+    def test_pixel_page_has_install_offline_accessibility_and_polling_guards(self):
+        page = self.c.get("/").get_data(as_text=True)
+        self.assertIn('rel="manifest"', page)
+        self.assertIn("serviceWorker.register", page)
+        self.assertIn('aria-current="page"', page)
+        self.assertIn("document.visibilityState==='visible'", page)
+        self.assertIn("offlineDisabled", page)
+        self.assertIn("min-height:var(--tap)", page)
+
+    def test_pwa_assets_have_expected_shape(self):
+        manifest = self.c.get("/manifest.webmanifest")
+        self.assertEqual(manifest.status_code, 200)
+        self.assertEqual(manifest.get_json()["display"], "standalone")
+        self.assertEqual(self.c.get("/sw.js").mimetype, "application/javascript")
+        for size in (192, 512):
+            icon = self.c.get(f"/icon-{size}.png")
+            self.assertEqual(icon.mimetype, "image/png")
+            self.assertEqual(icon.data[16:24], size.to_bytes(4, "big") * 2)
+
+    def test_pixel_launcher_waits_for_server_readiness(self):
+        root = Path(__file__).resolve().parent.parent
+        script = (root / "scripts" / "refresh-pixel-widget.sh").read_text()
+        self.assertNotIn("sleep 4; termux-open-url", script)
+        self.assertIn("until curl -fsS", script)
+        self.assertIn('kill -0 "\\$server_pid"', script)
+        self.assertIn("refresh-pixel-widget.sh", (root / "scripts" / "setup-termux.sh").read_text())
 
     def test_unlink(self):
         # Mock _cron_clear too — otherwise the real one rewrites the dev's actual crontab.
