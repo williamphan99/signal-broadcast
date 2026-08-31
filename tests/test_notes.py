@@ -13,11 +13,13 @@ Run with:  python3 -m unittest discover -s tests
 """
 from __future__ import annotations
 
+import io
 import json
 import multiprocessing
 import sys
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest import mock
 
@@ -165,6 +167,103 @@ class ExplainingAnEmptyCheck(unittest.TestCase):
                                       "message": "dm"})])
         self.assertEqual(engine.describe_receive(stream)["notes"],
                          len(engine.harvest_notes(stream)))
+
+    def test_a_large_drain_writes_one_bounded_content_free_diagnostic(self):
+        stream = "\n".join(envelope({
+            "destinationUuid": FRIEND_UUID,
+            "timestamp": i,
+            "message": f"private message {i}",
+        }) for i in range(2_000))
+
+        with mock.patch.object(engine, "_notes_log") as notes_log:
+            report = engine.describe_receive(stream)
+
+        self.assertEqual(report, {"envelopes": 2_000, "transcripts": 2_000, "notes": 0})
+        notes_log.assert_called_once()
+        diagnostic = notes_log.call_args.args[0]
+        self.assertLess(len(diagnostic), 2_000)
+        self.assertNotIn("private message", diagnostic)
+
+
+class FetchingNotes(unittest.TestCase):
+    class StreamingOutput(io.StringIO):
+        def read(self, *args, **kwargs):
+            raise AssertionError("stdout must be consumed incrementally, not buffered")
+
+    class Process:
+        def __init__(self, output: str, error: str = "", returncode: int = 0,
+                     timeout: bool = False):
+            self.stdout = FetchingNotes.StreamingOutput(output)
+            self.stderr = io.StringIO(error)
+            self.returncode = returncode
+            self.timeout = timeout
+            self.killed = False
+            self.wait_timeouts = []
+
+        def wait(self, timeout=None):
+            self.wait_timeouts.append(timeout)
+            if self.timeout and not self.killed:
+                raise engine.subprocess.TimeoutExpired("receive", timeout)
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+
+    def _fetch(self, process):
+        stored = []
+        patches = (
+            mock.patch.object(engine, "signal_cli_bin", return_value="signal-cli"),
+            mock.patch.object(engine, "_signal_env", return_value={}),
+            mock.patch.object(engine, "signal_cli_operation",
+                              side_effect=lambda *_: nullcontext()),
+            mock.patch.object(engine.subprocess, "Popen", return_value=process),
+            mock.patch.object(engine, "store_notes",
+                              side_effect=lambda notes: stored.extend(notes) or len(notes)),
+            mock.patch.object(engine, "_notes_log"),
+        )
+        started = []
+        for patcher in patches:
+            started.append(patcher.start())
+            self.addCleanup(patcher.stop)
+        return engine.fetch_notes("+61400000000"), stored, started[3]
+
+    def test_each_envelope_is_parsed_once_and_the_idle_wait_stays_ten_seconds(self):
+        stream = "\n".join([
+            envelope(note("kept", ts=1)),
+            envelope({"destinationUuid": FRIEND_UUID, "timestamp": 2,
+                      "message": "not stored"}),
+        ])
+        process = self.Process(stream)
+        real_loads = json.loads
+
+        with mock.patch.object(engine.json, "loads", wraps=real_loads) as loads:
+            report, stored, popen = self._fetch(process)
+
+        self.assertEqual(loads.call_count, 2)
+        self.assertEqual([item["text"] for item in stored], ["kept"])
+        self.assertEqual(report["envelopes"], 2)
+        self.assertEqual(report["transcripts"], 2)
+        self.assertEqual(report["notes"], 1)
+        self.assertEqual(process.wait_timeouts, [engine.NOTES_TIMEOUT_S])
+        self.assertEqual(engine.NOTES_BURST_S, 10)
+        command = popen.call_args.args[0]
+        self.assertEqual(command[command.index("--timeout") + 1], "10")
+        self.assertNotIn("--ignore-attachments", command)
+
+    def test_partial_notes_are_kept_when_the_hard_timeout_kills_receive(self):
+        process = self.Process(envelope(note("arrived before timeout", ts=3)), timeout=True)
+
+        report, stored, _ = self._fetch(process)
+
+        self.assertTrue(process.killed)
+        self.assertEqual([item["text"] for item in stored], ["arrived before timeout"])
+        self.assertEqual(report["new"], 1)
+
+    def test_cli_failure_without_received_output_is_reported(self):
+        process = self.Process("", error="Connection closed!", returncode=3)
+
+        with self.assertRaisesRegex(engine.BroadcastError, "Connection closed"):
+            self._fetch(process)
 
 
 class NothingToSend(unittest.TestCase):

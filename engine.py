@@ -30,7 +30,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterable, Iterator
 
 # Platform switch. Assigning to a bool (rather than testing sys.platform inline)
 # deliberately defeats type-checker platform-narrowing, so the Linux/Termux branches
@@ -64,7 +64,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.21.10"
+APP_VERSION = "1.21.11"
 
 
 @dataclass(frozen=True)
@@ -1355,7 +1355,8 @@ def _note_from_envelope(envelope: dict, media_downloaded: bool) -> dict | None:
     group sync deliberately isn't (it would pull the whole media backlog), so a note
     that arrives during one keeps its text and records that its photos never landed —
     better than showing a note with silently missing images."""
-    sent = (envelope.get("syncMessage") or {}).get("sentMessage")
+    sync = envelope.get("syncMessage")
+    sent = sync.get("sentMessage") if isinstance(sync, dict) else None
     if not isinstance(sent, dict) or not _is_note_to_self(envelope, sent):
         return None
     text = sent.get("message") or ""
@@ -1365,7 +1366,10 @@ def _note_from_envelope(envelope: dict, media_downloaded: bool) -> dict | None:
     # still appears, saying the photo wasn't kept, so it isn't a silent disappearance.
     view_once = bool(sent.get("viewOnce"))
     photos, missing, transient = [], 0, 0
-    for att in (sent.get("attachments") or []):
+    attachments = sent.get("attachments")
+    for att in attachments if isinstance(attachments, list) else []:
+        if not isinstance(att, dict):
+            continue
         # signal-cli stores a downloaded attachment under its id in the config dir.
         path = DATA_DIR / "attachments" / str(att.get("id") or "")
         if view_once:
@@ -1397,21 +1401,10 @@ def harvest_notes(receive_output: str, media_downloaded: bool = True) -> list[di
     """Every note-to-self in one `receive -o json` run, oldest first. Tolerant by
     design: a malformed line is skipped, never fatal — this runs inside the group sync,
     which must not fail because of an odd envelope."""
-    found = []
-    for line in (receive_output or "").splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            envelope = json.loads(line).get("envelope")
-        except ValueError:
-            continue
-        if not isinstance(envelope, dict):
-            continue
-        note = _note_from_envelope(envelope, media_downloaded)
-        if note:
-            found.append(note)
-    return sorted(found, key=lambda n: n["ts"])
+    found, _, _ = _inspect_receive(
+        (receive_output or "").splitlines(), media_downloaded=media_downloaded,
+        collect_notes=True, log_summary=False)
+    return found
 
 
 NOTES_DEBUG_FILE = LOGS_DIR / "notes-debug.txt"
@@ -1442,6 +1435,64 @@ def _tail(value) -> str:
     return f"…{text[-4:]}" if text else "(none)"
 
 
+def _inspect_receive(receive_lines: Iterable[str], *, media_downloaded: bool,
+                     collect_notes: bool, log_summary: bool) -> tuple[list[dict], dict, bool]:
+    """Classify a receive stream once, retaining only notes and bounded diagnostics."""
+    found = []
+    envelopes = transcripts = notes = 0
+    samples = collections.deque(maxlen=5)
+    had_output = False
+    for raw_line in receive_lines:
+        had_output = True
+        line = raw_line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        envelope = value.get("envelope") if isinstance(value, dict) else None
+        if not isinstance(envelope, dict):
+            continue
+        envelopes += 1
+        sync = envelope.get("syncMessage")
+        sent = sync.get("sentMessage") if isinstance(sync, dict) else None
+        if not isinstance(sent, dict):
+            continue
+        transcripts += 1
+        matched = _is_note_to_self(envelope, sent)
+        notes += int(matched)
+        if collect_notes and matched:
+            note = _note_from_envelope(envelope, media_downloaded)
+            if note:
+                found.append(note)
+        if log_summary:
+            attachments = sent.get("attachments")
+            samples.append((
+                envelope.get("sourceUuid"), envelope.get("sourceNumber"),
+                sent.get("destinationUuid"), sent.get("destinationNumber"),
+                bool(sent.get("groupInfo")),
+                len(attachments) if isinstance(attachments, list) else 0,
+                matched,
+            ))
+    report = {"envelopes": envelopes, "transcripts": transcripts, "notes": notes}
+    if log_summary:
+        rendered_samples = [
+            f"src={_tail(src_uuid)}/{_tail(src_number)} "
+            f"dst={_tail(dst_uuid)}/{_tail(dst_number)} "
+            f"group={'yes' if group else 'no'} attachments={attachment_count} "
+            f"note={'YES' if matched else 'no'}"
+            for (src_uuid, src_number, dst_uuid, dst_number, group,
+                 attachment_count, matched) in samples
+        ]
+        sample_text = f"; latest transcripts: {' | '.join(rendered_samples)}" \
+            if rendered_samples else ""
+        _notes_log(
+            f"drain: {envelopes} envelope(s), {transcripts} transcript(s), "
+            f"{notes} note(s){sample_text}")
+    return sorted(found, key=lambda n: n["ts"]), report, had_output
+
+
 def describe_receive(receive_output: str) -> dict:
     """Count what a drain actually contained, so a check that finds nothing can say
     WHY on screen instead of just "nothing new".
@@ -1451,33 +1502,10 @@ def describe_receive(receive_output: str) -> dict:
     already drained it); envelopes but no transcripts means traffic came in but none of
     it was you sending anything; transcripts but no notes means you sent messages —
     to other people, not to yourself."""
-    envelopes = transcripts = notes = 0
-    for line in (receive_output or "").splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            envelope = json.loads(line).get("envelope")
-        except ValueError:
-            continue
-        if not isinstance(envelope, dict):
-            continue
-        envelopes += 1
-        sent = (envelope.get("syncMessage") or {}).get("sentMessage")
-        if not isinstance(sent, dict):
-            continue
-        transcripts += 1
-        matched = _is_note_to_self(envelope, sent)
-        notes += int(matched)
-        _notes_log(f"transcript src={_tail(envelope.get('sourceUuid'))}/"
-                   f"{_tail(envelope.get('sourceNumber'))} "
-                   f"dst={_tail(sent.get('destinationUuid'))}/"
-                   f"{_tail(sent.get('destinationNumber'))} "
-                   f"group={'yes' if sent.get('groupInfo') else 'no'} "
-                   f"attachments={len(sent.get('attachments') or [])} "
-                   f"note={'YES' if matched else 'no'}")
-    _notes_log(f"drain: {envelopes} envelope(s), {transcripts} transcript(s), {notes} note(s)")
-    return {"envelopes": envelopes, "transcripts": transcripts, "notes": notes}
+    _, report, _ = _inspect_receive(
+        (receive_output or "").splitlines(), media_downloaded=False,
+        collect_notes=False, log_summary=True)
+    return report
 
 
 def prune_notes(notes: list[dict], now: float | None = None) -> list[dict]:
@@ -1575,35 +1603,69 @@ def fetch_notes(account: str, on_log: LogFn = lambda *_: None) -> dict:
     Deliberately a one-shot the user asks for, not a poll: it holds the same lock as a
     broadcast (one signal-cli operation per account), and unlike the group sync it DOES
     download attachments, because a note's photos are half the point of reading it here.
-    Everything the drain pulls that isn't a note is discarded unread, exactly as it is
-    today."""
+    Everything the drain pulls that isn't a note is discarded immediately after local
+    classification instead of buffering the whole receive output in memory."""
     binary = signal_cli_bin()
     started = time.monotonic()
     with signal_cli_operation("checking notes"):
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 _cli(binary, "--config", str(DATA_DIR), "-a", account, "-o", "json",
                      "receive", "--timeout", str(NOTES_BURST_S),
                      "--ignore-avatars", "--ignore-stickers", "--ignore-stories"),
-                capture_output=True, text=True, errors="replace",
-                timeout=NOTES_TIMEOUT_S, env=_signal_env(binary))
-            output, err = proc.stdout or "", (proc.stderr or "").strip()
-            failed = proc.returncode != 0
-        except subprocess.TimeoutExpired as exc:
-            # Timed out mid-drain: keep whatever notes already came through rather than
-            # losing them — the queue delivered them, so this is the only chance to.
-            raw = exc.output or b""
-            output = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
-            output, err, failed = output, "", False
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+                errors="replace", env=_signal_env(binary))
         except (OSError, subprocess.SubprocessError) as exc:
             raise BroadcastError(f"Couldn't run signal-cli to check for notes: {exc}")
-    if failed and not output:
+
+        parsed = []
+        read_errors = []
+        stderr_parts = collections.deque(maxlen=200)
+
+        def read_stdout() -> None:
+            try:
+                if proc.stdout is not None:
+                    parsed.append(_inspect_receive(
+                        proc.stdout, media_downloaded=True,
+                        collect_notes=True, log_summary=True))
+            except Exception as exc:  # noqa: BLE001 — reported on the calling thread
+                read_errors.append(exc)
+
+        def read_stderr() -> None:
+            try:
+                if proc.stderr is not None:
+                    stderr_parts.extend(proc.stderr)
+            except Exception as exc:  # noqa: BLE001 — reported on the calling thread
+                read_errors.append(exc)
+
+        stdout_reader = threading.Thread(target=read_stdout, daemon=True)
+        stderr_reader = threading.Thread(target=read_stderr, daemon=True)
+        stdout_reader.start()
+        stderr_reader.start()
+        timed_out = False
+        try:
+            proc.wait(timeout=NOTES_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            # Keep whatever the streaming reader already received: Signal delivers each
+            # envelope once, so throwing away a partial note here would lose it forever.
+            timed_out = True
+            proc.kill()
+            proc.wait()
+        stdout_reader.join()
+        stderr_reader.join()
+
+    if read_errors:
+        raise BroadcastError(f"Couldn't read Signal's notes response: {read_errors[0]}")
+    found, report, had_output = parsed[0] if parsed else (
+        [], {"envelopes": 0, "transcripts": 0, "notes": 0}, False)
+    err = "".join(stderr_parts).strip()
+    failed = proc.returncode != 0 and not timed_out
+    if failed and not had_output:
         if ACCOUNT_UNUSABLE_PATTERN.search(err):
             raise BroadcastError("Signal says this Mac isn't linked any more — link "
                                  "again from the phone, then check for notes.")
         raise BroadcastError(err or "Couldn't check for notes. Try again.")
-    new = store_notes(harvest_notes(output, media_downloaded=True))
-    report = describe_receive(output)
+    new = store_notes(found)
     report.update(new=new, seconds=round(time.monotonic() - started, 1))
     on_log(f"Notes check: {report['envelopes']} message(s) from Signal, "
            f"{report['transcripts']} sent from your phone, {report['notes']} note(s) to "
