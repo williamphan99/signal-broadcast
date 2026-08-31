@@ -64,7 +64,7 @@ Click **Signal Broadcast** on the Dock. The window opens on the **Send** tab.
   (it's a button, not a background poll), pick one, then **Use as message** — the text
   lands in the Send tab and its photos load into the photo strip. **Copy text** and
   **Delete** do what they say; deleting removes the copy on this Mac, never the note on
-  your phone. Messages you send to other people are never read or stored.
+  your phone. Only Note-to-Self items are added to this Notes list.
   - Only notes that arrive *after* this Mac was linked can appear — Signal never sends
     a linked device your older history.
 - **Groups tab** — tick the groups to send to; untick any to skip. Click **Save

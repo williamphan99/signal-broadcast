@@ -1120,7 +1120,7 @@ class App(tk.Tk):
         ttk.Label(tab, wraplength=620, justify="left", foreground=PALETTE["muted"], text=(
             "Whatever you write in Signal's “Note to Self” chat on your phone — words, "
             "photos, or both — turns up here, ready to send on. Messages to anyone else "
-            "are never read or kept.")).pack(anchor="w", pady=(2, 10))
+            "are never added to this Notes list.")).pack(anchor="w", pady=(2, 10))
 
         top = ttk.Frame(tab)
         top.pack(fill="x")
@@ -1266,10 +1266,10 @@ class App(tk.Tk):
         # already stored — and that's exactly the moment you need to know.
         self.notes_detail.configure(text=(
             f"Last check took {result.get('seconds', 0)}s · "
-            f"{result.get('envelopes', 0)} message(s) waiting · "
+            f"{result.get('envelopes', 0)} message(s) processed · "
             f"{result.get('transcripts', 0)} sent from your phone · "
             f"{result.get('notes', 0)} to yourself"))
-        self._log(f"Notes check: {result.get('envelopes', 0)} waiting, "
+        self._log(f"Notes check: {result.get('envelopes', 0)} processed, "
                   f"{result.get('notes', 0)} note(s) to self, {new} new.", "muted")
         if new:
             self.notes_status.configure(

@@ -285,6 +285,29 @@ class GroupRefreshTests(unittest.TestCase):
         self.assertEqual(app.events.get_nowait(), ("group_perms", {"g1"}))
 
 
+class NotesStatusTests(unittest.TestCase):
+    def test_completed_check_describes_envelopes_as_processed_not_waiting(self):
+        app = gui.App.__new__(gui.App)
+        app._checking_notes = True
+        app.notes_progress = mock.Mock()
+        app.notes_btn = mock.Mock()
+        app.notes_status = mock.Mock()
+        app.notes_detail = mock.Mock()
+        app.notes_list = mock.Mock()
+        app._render_notes = mock.Mock()
+        app._log = mock.Mock()
+        app._show_note = mock.Mock()
+
+        app._finish_notes({
+            "new": 0, "seconds": 2.5, "envelopes": 253,
+            "transcripts": 2, "notes": 1,
+        })
+
+        detail = app.notes_detail.configure.call_args.kwargs["text"]
+        self.assertIn("253 message(s) processed", detail)
+        self.assertNotIn("waiting", detail)
+
+
 class _FakeListbox:
     def __init__(self):
         self.items = []
