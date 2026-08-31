@@ -402,6 +402,54 @@ class WebUITests(unittest.TestCase):
             j = self.c.get("/api/link").get_json()
         self.assertIsNone(j["age"])
 
+    def test_link_status_supplies_explicit_signal_android_intent(self):
+        self.state.link_uri = "sgnl://linkdevice?uuid=abc&pub_key=def%2Bghi"
+        self.state.link_uri_ts = time.time()
+        with mock.patch.object(engine, "is_linked", lambda: False), \
+             mock.patch.object(engine, "detect_account", lambda: None):
+            j = self.c.get("/api/link").get_json()
+        self.assertEqual(
+            j["open_uri"],
+            "intent://linkdevice?uuid=abc&pub_key=def%2Bghi"
+            "#Intent;scheme=sgnl;package=org.thoughtcrime.securesms;end",
+        )
+
+    def test_link_connection_closed_stops_with_actionable_error(self):
+        output = ("sgnl://linkdevice?uuid=x&pub_key=y\\n"
+                  "Link request error: Connection closed!\\n")
+        with mock.patch.object(engine, "is_linked", lambda: False), \
+             mock.patch.object(engine, "signal_cli_command",
+                               lambda *a: (["printf", output], None)), \
+             mock.patch.object(webui, "_qr_png_b64", lambda uri: "QRB64"), \
+             mock.patch.object(engine, "detect_account", lambda: None), \
+             mock.patch.object(webui, "LINK_TOTAL_S", 0.1):
+            self.assertTrue(self.c.post("/api/link/start").get_json()["started"])
+            end = time.time() + 2
+            while self.state.link_running and time.time() < end:
+                time.sleep(0.01)
+            j = self.c.get("/api/link").get_json()
+        self.assertFalse(j["running"])
+        self.assertIn("did not confirm", j["error"])
+        self.assertIn("Try again", j["error"])
+
+    def test_link_http_403_stops_with_update_and_network_advice(self):
+        output = ("sgnl://linkdevice?uuid=x&pub_key=y\\n"
+                  "Link request error: HTTP 403 Forbidden\\n")
+        with mock.patch.object(engine, "is_linked", lambda: False), \
+             mock.patch.object(engine, "signal_cli_command",
+                               lambda *a: (["printf", output], None)), \
+             mock.patch.object(webui, "_qr_png_b64", lambda uri: "QRB64"), \
+             mock.patch.object(engine, "detect_account", lambda: None), \
+             mock.patch.object(webui, "LINK_TOTAL_S", 0.1):
+            self.assertTrue(self.c.post("/api/link/start").get_json()["started"])
+            end = time.time() + 2
+            while self.state.link_running and time.time() < end:
+                time.sleep(0.01)
+            j = self.c.get("/api/link").get_json()
+        self.assertFalse(j["running"])
+        self.assertIn("Update", j["error"])
+        self.assertIn("mobile data", j["error"])
+
     def test_link_fresh_clears_stale_code(self):
         # Asking for a fresh code abandons the current one — the dead code must vanish
         # immediately, so a tap can't open Signal with a code whose provisioning socket
@@ -594,6 +642,12 @@ class WebUITests(unittest.TestCase):
         self.assertIn("until curl -fsS", script)
         self.assertIn('kill -0 "\\$server_pid"', script)
         self.assertIn("refresh-pixel-widget.sh", (root / "scripts" / "setup-termux.sh").read_text())
+
+    def test_both_setups_install_current_signal_provisioning_client(self):
+        root = Path(__file__).resolve().parent.parent
+        self.assertIn('SIGNAL_CLI_VERSION="0.14.7"', (root / "Setup.command").read_text())
+        self.assertIn('SIGNAL_CLI_VERSION="${SIGNAL_CLI_VERSION:-0.14.7}"',
+                      (root / "scripts" / "setup-termux.sh").read_text())
 
     def test_unlink(self):
         # Mock _cron_clear too — otherwise the real one rewrites the dev's actual crontab.

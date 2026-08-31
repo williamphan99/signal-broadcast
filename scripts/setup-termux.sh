@@ -14,7 +14,7 @@ cd "$(dirname "$0")/.."
 
 # The JVM build (plain .tar.gz, NOT -Linux-native) so -Xss can enlarge the libsignal thread
 # stack, exactly like the Mac build. Override with SIGNAL_CLI_VERSION=…
-SIGNAL_CLI_VERSION="${SIGNAL_CLI_VERSION:-0.14.5}"
+SIGNAL_CLI_VERSION="${SIGNAL_CLI_VERSION:-0.14.7}"
 
 echo "=== Signal Broadcast — Termux/Debian setup ==="
 echo

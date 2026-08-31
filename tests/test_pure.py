@@ -681,6 +681,18 @@ class BundledBinaryTests(unittest.TestCase):
             with mock.patch.object(engine, "VENDOR_DIR", Path(tmp)):
                 self.assertEqual(engine._jvm_signal_cli(), binary)
 
+    def test_newest_complete_bundle_wins_after_an_update(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._vendor(tmp, ["libsignal-client-0.83.1.jar", "libsignal-cli-0.14.5.jar"])
+            new_lib = Path(tmp) / "signal-cli-0.14.7" / "lib"
+            new_lib.mkdir(parents=True)
+            (new_lib / "libsignal-client-0.99.1.jar").touch()
+            new_binary = Path(tmp) / "signal-cli-0.14.7" / "bin" / "signal-cli"
+            new_binary.parent.mkdir(parents=True)
+            new_binary.touch()
+            with mock.patch.object(engine, "VENDOR_DIR", Path(tmp)):
+                self.assertEqual(engine._jvm_signal_cli(), new_binary)
+
     def test_missing_vendor_dir_is_absent(self):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(engine, "VENDOR_DIR", Path(tmp) / "nope"):

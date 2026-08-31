@@ -52,6 +52,39 @@ LINK_CHECK_TTL_S = 300
 LINK_CHECK_BUSY_RETRY_S = 1
 
 
+def _signal_open_uri(uri: str | None) -> str | None:
+    """Target Signal's link-device activity explicitly when Chrome opens the URI.
+
+    A plain sgnl:// navigation can merely foreground Signal on some Android/Chrome
+    combinations. Chrome's intent syntax keeps the same provisioning query but names
+    Signal's package, so Android resolves the BROWSABLE link-device activity directly.
+    Unexpected URI shapes are returned unchanged rather than rewritten.
+    """
+    if not uri:
+        return None
+    parsed = urlparse(uri)
+    if parsed.scheme != "sgnl" or parsed.netloc != "linkdevice":
+        return uri
+    target = "intent://linkdevice" + parsed.path
+    if parsed.query:
+        target += "?" + parsed.query
+    return target + "#Intent;scheme=sgnl;package=org.thoughtcrime.securesms;end"
+
+
+def _link_failure_message(output: list[str]) -> str | None:
+    """Turn known provisioning failures into one useful recovery step."""
+    low = "\n".join(output).lower()
+    if "403" in low or "forbidden" in low:
+        return ("Signal rejected the link (403). Tap Update Signal Broadcast so this phone "
+                "installs the current Signal linker, update Signal in the Play Store, then "
+                "Try again. If it still happens, switch between Wi-Fi and mobile data.")
+    if "link request error" in low and "connection closed" in low:
+        return ("Signal did not confirm the link before the code expired. Tap Try again, "
+                "then tap Link device when Signal opens. If Signal only opens your chats, "
+                "update Signal and retry once on mobile data.")
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Shared background state (one server, one user — a simple module-level model).
 # --------------------------------------------------------------------------- #
@@ -652,6 +685,8 @@ self.addEventListener('fetch',event=>{
         _ERR_WORDS = ("error", "closed", "exception", "expired", "timeout", "timed out",
                       "failed", "invalid", "refused", "reset", "warn", "unable")
 
+        output: list[str] = []
+
         def _reader():  # grab the sgnl:// URI as soon as signal-cli prints it
             assert proc.stdout is not None
             try:
@@ -667,6 +702,7 @@ self.addEventListener('fetch',event=>{
                             st.link_qr = _qr_png_b64(line)
                             st.link_scanned = False
                     elif line:
+                        output.append(line)
                         _linklog("out: " + line[:160])
                         if have_uri and not any(w in line.lower() for w in _ERR_WORDS):
                             with st.lock:
@@ -702,6 +738,10 @@ self.addEventListener('fetch',event=>{
                 st.link_broken = False
                 st.link_checked_at = time.monotonic()
             return True
+        failure = _link_failure_message(output)
+        if failure:
+            with st.lock:
+                st.link_error = failure
         return False
 
     def _run_link():
@@ -723,6 +763,9 @@ self.addEventListener('fetch',event=>{
                     account = engine.load_config().account
                     _start_refresh(account)
                     return
+                with st.lock:
+                    if st.link_error:
+                        return
             with st.lock:
                 if not st.link_linked and not st.link_error:
                     st.link_error = "Linking timed out. Tap Start linking to try again."
@@ -781,6 +824,7 @@ self.addEventListener('fetch',event=>{
         # so the page never shows "Linked!" while state still says otherwise.
         with st.lock:
             return jsonify(running=st.link_running, uri=st.link_uri, qr=st.link_qr,
+                           open_uri=_signal_open_uri(st.link_uri),
                            age=(round(time.time() - st.link_uri_ts, 1) if st.link_uri else None),
                            scanned=st.link_scanned,
                            linked=bool(st.link_linked or _linked_account()),
@@ -1121,6 +1165,9 @@ PAGE = r"""<!doctype html>
   .linkstatus.working{color:var(--accent)}
   .linkstatus.working .dot{width:16px;height:16px;background:none;border:2px solid rgba(47,199,212,.3);
     border-top-color:var(--accent);animation:spin .8s linear infinite}
+  .linkhelp{margin-top:12px;padding:12px;border:1px solid var(--line);border-radius:12px;
+    background:var(--card2);font-size:13.5px;color:var(--muted)}
+  .linkhelp b{color:var(--text)} .linkhelp .btn{margin-top:10px}
   @keyframes spin{to{transform:rotate(360deg)}}
   /* ---------- bottom nav ---------- */
   nav{position:fixed;left:0;right:0;bottom:0;z-index:20;display:flex;
@@ -1208,7 +1255,13 @@ PAGE = r"""<!doctype html>
                devices → ＋</b> and scan this code. <a class="ext" href="#" onclick="freshCode();return false">Get a fresh code</a></p>
           </details>
         </div>
-        <p id="linkMsg" class="small center"></p>
+        <div id="linkReturn" class="linkhelp hidden">
+          <b>Back from Signal?</b><br>
+          Signal should have shown a <b>Link device</b> confirmation. If it only opened your
+          chats, that attempt did not link.
+          <button class="btn ghost sm" onclick="signalOnlyOpened()">Signal only opened my chats</button>
+        </div>
+        <p id="linkMsg" class="small center" aria-live="polite"></p>
       </div>
     </div>
   </section>
@@ -1350,7 +1403,7 @@ PAGE = r"""<!doctype html>
 
 <script>
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
-let S={}, offline=false, times=[], schedEnabled=false, sendStart=0, msgTimer=null, heartbeat=null, curUri='', curAge=null;
+let S={}, offline=false, times=[], schedEnabled=false, sendStart=0, msgTimer=null, heartbeat=null, curUri='', curOpenUri='', curAge=null;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
 async function api(path,opts){
@@ -1723,15 +1776,33 @@ function setLinkStatus(mode,text){
 // a fresh code needs a new signal-cli JVM, which can take 30s+ under proot on the phone).
 const FRESH_S=25;                          // codes live ~60s; open only within their youth
 let wantOpen=false;
+let signalHandoff=false;
 function codeIsFresh(){ return curUri && curAge!==null && curAge<FRESH_S; }
 function openInSignal(){
   if(codeIsFresh()){
     setLinkStatus('wait','Signal is opening — tap “Link device” now, then come back.');
-    window.location.href=curUri;           // synchronous: inside the user gesture
+    signalHandoff=true;
+    $('#linkReturn').classList.add('hidden');
+    // Keep this synchronous: Chrome only launches an Android intent from a live tap.
+    window.location.href=curOpenUri||curUri;
+    setTimeout(showSignalReturnHelp,1200);
     return;
   }
   wantOpen=true;
   setLinkStatus('working','Getting a fresh code — takes up to a minute on the phone…');
+  api('/api/link/fresh',{method:'POST'});
+}
+function showSignalReturnHelp(){
+  if(!signalHandoff || document.visibilityState!=='visible')return;
+  $('#linkReturn').classList.remove('hidden');
+  setLinkStatus('working','Checking whether Signal confirmed the link…');
+}
+function signalOnlyOpened(){
+  signalHandoff=false;
+  $('#linkReturn').classList.add('hidden');
+  $('#linkMsg').textContent='That attempt did not reach the link screen. Getting a new code now; when it is ready, tap Open Signal again.';
+  wantOpen=true;
+  setLinkStatus('working','Getting a fresh code…');
   api('/api/link/fresh',{method:'POST'});
 }
 async function freshCode(){                // for the "another device" QR path
@@ -1742,7 +1813,8 @@ async function freshCode(){                // for the "another device" QR path
   toast('Fresh code ready');
 }
 async function startLink(){
-  $('#linkBtn').classList.add('hidden'); $('#linkMsg').textContent='';
+  signalHandoff=false; $('#linkReturn').classList.add('hidden');
+  $('#linkBtn').classList.add('hidden'); $('#linkMsg').textContent=''; $('#linkMsg').classList.remove('err');
   $('#linkOut').classList.remove('hidden'); $('#linkReady').classList.add('hidden');
   $('#linkStatus').classList.remove('done'); $('#linkStatusTxt').textContent='Getting your secure code ready…';
   await api('/api/link/start',{method:'POST'});
@@ -1751,7 +1823,8 @@ async function startLink(){
   linkTimer=setInterval(async()=>{
     const s=await api('/api/link'); if(s.__neterr)return;
     // Track the live code + its age; a cleared/rotated code must never be openable.
-    if(s.uri){ curUri=s.uri; curAge=(s.age==null?null:s.age); } else { curUri=''; curAge=null; }
+    if(s.uri){ curUri=s.uri; curOpenUri=s.open_uri||s.uri; curAge=(s.age==null?null:s.age); }
+    else { curUri=''; curOpenUri=''; curAge=null; }
     // Show the link options only while we're still waiting for a scan.
     if(s.uri && !s.scanned && !s.linked){ $('#linkReady').classList.remove('hidden');
       if(s.qr && s.qr!==lastQr){ lastQr=s.qr; $('#qr').src='data:image/png;base64,'+s.qr; } }
@@ -1760,15 +1833,19 @@ async function startLink(){
     if(wantOpen && codeIsFresh() && !s.scanned && !s.linked){ wantOpen=false;
       setLinkStatus('wait','Fresh code ready — tap “Open Signal on this phone” now.');
       toast('Code ready — tap Open Signal now','ok'); }
-    if(s.error){ clearInterval(linkTimer); linkTimer=null; $('#linkOut').classList.add('hidden');
+    if(s.error){ clearInterval(linkTimer); linkTimer=null; signalHandoff=false;
+      $('#linkReady').classList.add('hidden'); $('#linkReturn').classList.add('hidden');
       $('#linkBtn').classList.remove('hidden'); $('#linkBtn').disabled=false; $('#linkBtn').textContent='Try again';
+      setLinkStatus('wait','Linking stopped'); $('#linkMsg').textContent=s.error; $('#linkMsg').classList.add('err');
       toast(s.error,'err'); return; }
     // Status priority: linked  >  scanned (provisioning)  >  waiting for a scan.
     if(s.linked){ clearInterval(linkTimer); linkTimer=null;
-      $('#linkReady').classList.add('hidden'); setLinkStatus('done','Linked! Setting things up…');
+      signalHandoff=false; $('#linkReady').classList.add('hidden'); $('#linkReturn').classList.add('hidden');
+      setLinkStatus('done','Linked! Setting things up…');
       toast('Linked to Signal','ok'); setTimeout(()=>refreshState(),900); }
     else if(s.scanned){ $('#linkReady').classList.add('hidden'); setLinkStatus('working','Scanned ✓ — finishing linking…'); }
-    else if(s.uri){ setLinkStatus('wait','Waiting for you to scan…'); }
+    else if(s.uri && signalHandoff){ setLinkStatus('working','Waiting for Signal to confirm the link…'); }
+    else if(s.uri){ setLinkStatus('wait','Code ready — open Signal now.'); }
   },1500);
 }
 async function unlink(){
@@ -1781,7 +1858,9 @@ async function unlink(){
 // ---------------- boot ----------------
 refreshState();
 heartbeat=setInterval(()=>{ if(document.visibilityState==='visible'&&!(S.send&&S.send.running)) refreshState(); }, 5000);
-document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible')refreshState(); });
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible'){
+  refreshState(); showSignalReturnHelp();
+} });
 if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
 </script>
 </body></html>"""

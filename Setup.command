@@ -33,7 +33,7 @@ brew install openjdk@25 signal-cli qrencode python-tk
 
 # 2b. Download the JVM build of signal-cli into ./vendor (version-pinned). The app
 #     prefers this over the native build; see engine.py's signal_cli_bin().
-SIGNAL_CLI_VERSION="0.14.5"
+SIGNAL_CLI_VERSION="0.14.7"
 JVM_DIR="vendor/signal-cli-${SIGNAL_CLI_VERSION}"
 JVM_CLI="${JVM_DIR}/bin/signal-cli"
 # Check for libsignal-client, not just the launcher. It carries the native library
