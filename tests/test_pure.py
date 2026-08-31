@@ -472,6 +472,50 @@ class SyncGroupsTests(unittest.TestCase):
         transient = engine.BroadcastError("connection reset by peer")
         self.assertEqual(self._sync(self._Recv(), [transient, 2, 2, 2]), 2)
 
+    def test_sync_debug_does_not_store_receive_sender_metadata(self):
+        private_output = (
+            '{"envelope":{"source":"+61400000000",'
+            '"sourceUuid":"private-uuid","sourceName":"Private Person"}}')
+
+        def busy_receive(*_args, **_kwargs):
+            raise engine.subprocess.TimeoutExpired(
+                cmd="receive", timeout=15, stderr=private_output)
+
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(engine, "SYNC_DEBUG_FILE", Path(directory) / "sync-debug.txt"), \
+             mock.patch.object(engine, "signal_cli_bin", return_value="/bin/true"), \
+             mock.patch.object(engine, "_request_sync", lambda *_a, **_k: None), \
+             mock.patch.object(engine, "pull_groups", return_value=1), \
+             mock.patch.object(engine, "_save_notes_seen_during", lambda *_a, **_k: None), \
+             mock.patch.object(engine.subprocess, "run", side_effect=busy_receive):
+            self.assertEqual(engine._sync_groups_unlocked("+1"), 1)
+            debug = engine.SYNC_DEBUG_FILE.read_text(encoding="utf-8")
+
+        self.assertIn("receive busy-timeout", debug)
+        self.assertNotIn("+61400000000", debug)
+        self.assertNotIn("private-uuid", debug)
+        self.assertNotIn("Private Person", debug)
+        self.assertNotIn("envelope", debug)
+
+    def test_sync_debug_redacts_account_from_catalog_errors(self):
+        private_error = engine.BroadcastError(
+            "Could not fetch groups: Error while checking account +61400000000: "
+            "[403] Authorization failed!")
+        recv = self._Recv(rc=0, err="")
+
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(engine, "SYNC_DEBUG_FILE", Path(directory) / "sync-debug.txt"), \
+             mock.patch.object(engine, "signal_cli_bin", return_value="/bin/true"), \
+             mock.patch.object(engine, "_request_sync", lambda *_a, **_k: None), \
+             mock.patch.object(engine, "pull_groups", side_effect=private_error), \
+             mock.patch.object(engine.subprocess, "run", return_value=recv):
+            with self.assertRaises(engine.BroadcastError):
+                engine._sync_groups_unlocked("+61400000000")
+            debug = engine.SYNC_DEBUG_FILE.read_text(encoding="utf-8")
+
+        self.assertIn("authorization failed", debug.lower())
+        self.assertNotIn("+61400000000", debug)
+
     def test_permanent_error_bails_fast(self):
         # A "not registered" error must break out immediately, not loop for SYNC_MAX_S.
         calls = {"n": 0}

@@ -64,7 +64,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.21.8"
+APP_VERSION = "1.21.9"
 
 
 @dataclass(frozen=True)
@@ -979,12 +979,40 @@ ACCOUNT_UNUSABLE_PATTERN = re.compile(
 SYNC_DEBUG_FILE = LOGS_DIR / "sync-debug.txt"
 
 
+def _sync_error_summary(output: str) -> str:
+    """Classify signal-cli output without copying account or message metadata."""
+    low = (output or "").lower()
+    if not low.strip():
+        return "none"
+    if "account already in use" in low:
+        return "account already in use"
+    if "not registered" in low or "not a registered" in low or "unregistered" in low:
+        return "account not registered"
+    if "authorization failed" in low or "[403]" in low or "unauthor" in low:
+        return "authorization failed"
+    if "timed out" in low or "timeout" in low:
+        return "timed out"
+    if "closed unexpectedly" in low or "connection closed" in low:
+        return "connection closed"
+    if "failed to get response" in low:
+        return "request failed"
+    if "connection reset" in low:
+        return "connection reset"
+    if "invalidkeyidexception" in low:
+        return "encrypted backlog key unavailable"
+    if "nosessionexception" in low:
+        return "encrypted backlog session unavailable"
+    return "signal-cli error"
+
+
 def _sync_log(msg: str) -> None:
-    """Always-on breadcrumb of what the group sync actually did (each receive /
-    listGroups rc + first line of output). Unlike append_debug this is NOT gated on
-    debug=true, because the whole point is diagnosing a sync that fails on a machine
-    we can't reach. Lives in logs/, so unlink / station-mode wipe still erase it.
-    Best-effort — never raises into the sync."""
+    """Always-on status breadcrumb for group sync, without Signal message metadata.
+
+    Unlike append_debug this is not gated on debug=true, because it diagnoses sync on
+    a machine we cannot reach. Callers log only counts and classified error names, not
+    raw signal-cli output. Unlink and station-mode wipe erase it with the other logs.
+    Best-effort: logging never raises into the sync.
+    """
     try:
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
         if SYNC_DEBUG_FILE.exists() and SYNC_DEBUG_FILE.stat().st_size > 500_000:
@@ -1014,7 +1042,8 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
     silently showed zero groups with no reason. A successful listGroups that returns
     0 is a genuine empty account and returns 0 normally."""
     binary = signal_cli_bin()
-    _sync_log(f"--- sync start (binary={binary}, jvm_build={_is_jvm_build(binary)}) ---")
+    runtime = "jvm" if _is_jvm_build(binary) else "native"
+    _sync_log(f"--- sync start (runtime={runtime}) ---")
     _request_sync(binary, account)
     on_log("Syncing your groups from your phone…")
     recv_timeout = SYNC_BURST_S + 10
@@ -1075,7 +1104,9 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
                 connected = True
                 round_active = True
                 deadline = min(hard_cap, time.monotonic() + SYNC_MAX_S)
-                _sync_log(f"receive busy-timeout ({recv_timeout}s), still downloading: {partial[:150]!r}")
+                _sync_log(
+                    f"receive busy-timeout ({recv_timeout}s), "
+                    "still downloading (output received)")
             else:
                 # No output at all → genuinely stuck reaching the server.
                 dead_timeouts += 1
@@ -1092,7 +1123,7 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
             round_active = bool((recv.stdout or "").strip())
             out = ((recv.stderr or "") + (recv.stdout or "")).strip()
             if recv.returncode != 0:
-                _sync_log(f"receive rc={recv.returncode}: {out[:200]}")
+                _sync_log(f"receive rc={recv.returncode}: {_sync_error_summary(out)}")
                 if out:
                     last_error = out
                 # A permanent account problem won't fix itself — stop and report it.
@@ -1108,7 +1139,7 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
             last_error = str(exc)
             last_list_error = last_error
             list_failures += 1
-            _sync_log(f"listGroups FAILED: {last_error[:200]}")
+            _sync_log(f"listGroups FAILED: {_sync_error_summary(last_error)}")
             if ACCOUNT_UNUSABLE_PATTERN.search(last_error):
                 break  # dead account / removed device — no point retrying
             if list_failures >= SYNC_LIST_FAILURE_LIMIT:
@@ -1124,7 +1155,9 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
         last = count
         if stable >= (SYNC_STABLE_ROUNDS if round_active else SYNC_IDLE_STABLE_ROUNDS):
             break
-    _sync_log(f"--- sync end: last={last}, connected={connected}, last_error={last_error[:120]!r} ---")
+    _sync_log(
+        f"--- sync end: last={last}, connected={connected}, "
+        f"last_error={_sync_error_summary(last_error)} ---")
     if last < 0:
         if last_list_error:
             if ACCOUNT_UNUSABLE_PATTERN.search(last_list_error):
