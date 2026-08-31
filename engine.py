@@ -64,7 +64,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.21.7"
+APP_VERSION = "1.21.8"
 
 
 @dataclass(frozen=True)
@@ -165,14 +165,15 @@ CONFIRM_GRACE_S = 60             # after a send times out, how long to keep list
 # receive, so we drain in short bursts until the count stops growing (or the cap).
 SYNC_BURST_S = 5                 # one receive burst while draining the phone's sync
 SYNC_MAX_S = 60                  # budget once no more progress is being made
-SYNC_HARD_CAP_S = 240            # absolute ceiling, even while a big backlog is still
-                                 # actively downloading (deadline extends toward this)
+SYNC_HARD_CAP_S = 240            # ceiling checked between signal-cli calls; one large
+                                 # catalog read has its own bounded timeout below
 SYNC_STABLE_ROUNDS = 2           # active backlog: require three matching catalogs total
 SYNC_IDLE_STABLE_ROUNDS = 1      # quiet queue: two matching catalogs are enough
 SYNC_LIST_FAILURE_LIMIT = 3      # repeated catalog failures are an error, not a backlog
 SYNC_RENUDGE_EVERY = 3           # re-ask the phone for the groups sync every N rounds while
                                  # we still have none (the first nudge can be missed/delayed)
-LISTGROUPS_TIMEOUT_S = 30        # listGroups is mostly local; guard against a network hang
+SIGNAL_CONTROL_TIMEOUT_S = 30    # short account checks and sync requests
+GROUP_CATALOG_TIMEOUT_S = 300    # large group/member catalogs can take several minutes
 MIN_DELAY_S = 10.0               # hard floor: never send faster than this, whatever the config
 # Parallel sending: how many whole-group sends may be in flight at once on the single
 # account. 1 = the safe default (strictly one at a time).
@@ -882,7 +883,7 @@ def detect_account() -> str | None:
     try:
         proc = subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-o", "json", "listAccounts"),
                               capture_output=True, text=True, errors="replace",
-                              timeout=LISTGROUPS_TIMEOUT_S, env=_signal_env(binary))
+                              timeout=SIGNAL_CONTROL_TIMEOUT_S, env=_signal_env(binary))
     except subprocess.TimeoutExpired:
         return None  # a hung JVM must not block the GUI worker indefinitely
     if proc.returncode != 0:
@@ -945,7 +946,7 @@ def _link_is_broken_unlocked() -> bool:
     try:
         proc = subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-o", "json", "listAccounts"),
                               capture_output=True, text=True, errors="replace",
-                              timeout=LISTGROUPS_TIMEOUT_S, env=_signal_env(binary))
+                              timeout=SIGNAL_CONTROL_TIMEOUT_S, env=_signal_env(binary))
     except (OSError, subprocess.SubprocessError):
         return False
     if proc.returncode != 0:
@@ -963,7 +964,7 @@ def _request_sync(binary: str, account: str) -> None:
     try:
         subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-a", account, "sendSyncRequest"),
                        capture_output=True, text=True, errors="replace",
-                       timeout=LISTGROUPS_TIMEOUT_S, env=_signal_env(binary))
+                       timeout=SIGNAL_CONTROL_TIMEOUT_S, env=_signal_env(binary))
     except subprocess.TimeoutExpired:
         pass  # best-effort nudge; a network stall must not hang the sync
 
@@ -1101,6 +1102,7 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
             elif out:
                 connected = True   # clean receive with output → we reached the server
         try:
+            on_log("Reading your group list… Large accounts can take several minutes.")
             count = pull_groups(account)
         except BroadcastError as exc:
             last_error = str(exc)
@@ -1129,6 +1131,11 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
                 raise BroadcastError(
                     "Signal says this computer is no longer linked. Link it again from "
                     "your phone, then update the group list.")
+            if "Timed out fetching groups" in last_list_error:
+                raise BroadcastError(
+                    "Connected to Signal, but reading this account's large group list "
+                    "took longer than five minutes. Check the connection and try "
+                    "“Update list from phone” again.")
             raise BroadcastError(
                 "Connected to Signal, but the group list could not be read. Wait for "
                 "other Signal activity to finish, then try “Update list from phone” "
@@ -1157,10 +1164,11 @@ def pull_groups(account: str) -> int:
     binary = signal_cli_bin()
     try:
         proc = subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-o", "json", "-a", account, "listGroups"),
-                              capture_output=True, text=True, errors="replace", timeout=LISTGROUPS_TIMEOUT_S,
+                              capture_output=True, text=True, errors="replace", timeout=GROUP_CATALOG_TIMEOUT_S,
                               env=_signal_env(binary))
     except subprocess.TimeoutExpired:
-        raise BroadcastError("Timed out fetching groups. Check the connection and try again.")
+        raise BroadcastError(
+            "Timed out fetching groups after 5 minutes. Check the connection and try again.")
     if proc.returncode != 0:
         raise BroadcastError("Could not fetch groups:\n" + (proc.stderr or proc.stdout))
     groups = json.loads(proc.stdout or "[]")
@@ -1246,7 +1254,7 @@ def _unsendable_groups_unlocked(account: str) -> set[str]:
         proc = subprocess.run(
             _cli(binary, "--config", str(DATA_DIR), "-o", "json", "-a", account, "listGroups"),
             capture_output=True, text=True, errors="replace",
-            timeout=LISTGROUPS_TIMEOUT_S, env=_signal_env(binary))
+            timeout=GROUP_CATALOG_TIMEOUT_S, env=_signal_env(binary))
         if proc.returncode != 0:
             return set()
         groups = json.loads(proc.stdout or "[]")

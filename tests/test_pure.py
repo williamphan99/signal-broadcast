@@ -40,6 +40,26 @@ def _write_group_selection_process(groups_file, lock_file, attempting, done):
 
 
 class GroupSnapshotTests(unittest.TestCase):
+    def test_large_group_catalog_gets_five_minutes_to_finish(self):
+        seen_timeout = []
+
+        def slow_catalog(_argv, **kwargs):
+            timeout = kwargs["timeout"]
+            seen_timeout.append(timeout)
+            if timeout < 300:
+                raise engine.subprocess.TimeoutExpired(cmd="listGroups", timeout=timeout)
+            return mock.Mock(returncode=0, stdout='[{"id":"g1","name":"One"}]', stderr="")
+
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(engine, "GROUPS_FILE", Path(directory) / "groups.txt"), \
+             mock.patch.object(engine, "GROUPS_LOCK_FILE", Path(directory) / "groups.lock"), \
+             mock.patch.object(engine, "GROUP_PERMISSIONS_FILE", Path(directory) / "permissions.json"), \
+             mock.patch.object(engine, "signal_cli_bin", return_value="/bin/true"), \
+             mock.patch.object(engine.subprocess, "run", side_effect=slow_catalog):
+            self.assertEqual(engine.pull_groups("+1"), 1)
+
+        self.assertEqual(seen_timeout, [300])
+
     def test_one_group_read_also_populates_the_permission_cache(self):
         groups = [
             {"id": "g1", "name": "One", "permissionSendMessage": "EVERY_MEMBER",
@@ -433,6 +453,15 @@ class SyncGroupsTests(unittest.TestCase):
         message = str(ctx.exception).lower()
         self.assertIn("group list could not be read", message)
         self.assertNotIn("large backlog", message)
+
+    def test_catalog_timeout_names_the_five_minute_limit(self):
+        timed_out = engine.BroadcastError(
+            "Timed out fetching groups after 5 minutes. Check the connection and try again.")
+        with self.assertRaises(engine.BroadcastError) as ctx:
+            self._sync(self._Recv(rc=0, err="server timestamp received"), [timed_out])
+        message = str(ctx.exception).lower()
+        self.assertIn("five minutes", message)
+        self.assertNotIn("other signal activity", message)
 
     def test_success_returns_count(self):
         # Two stable reads settle a quiet queue and return the count.
