@@ -286,13 +286,12 @@ class GroupRefreshTests(unittest.TestCase):
 
 
 class NotesStatusTests(unittest.TestCase):
-    def test_completed_check_describes_envelopes_as_processed_not_waiting(self):
+    def test_completed_check_keeps_diagnostic_counts_out_of_customer_status(self):
         app = gui.App.__new__(gui.App)
         app._checking_notes = True
         app.notes_progress = mock.Mock()
         app.notes_btn = mock.Mock()
         app.notes_status = mock.Mock()
-        app.notes_detail = mock.Mock()
         app.notes_list = mock.Mock()
         app._render_notes = mock.Mock()
         app._log = mock.Mock()
@@ -303,9 +302,11 @@ class NotesStatusTests(unittest.TestCase):
             "transcripts": 2, "notes": 1,
         })
 
-        detail = app.notes_detail.configure.call_args.kwargs["text"]
-        self.assertIn("253 message(s) processed", detail)
-        self.assertNotIn("waiting", detail)
+        status = app.notes_status.configure.call_args.kwargs["text"]
+        self.assertEqual(status, "Nothing new — those notes are already here.")
+        self.assertNotIn("253", status)
+        app._log.assert_called_once_with(
+            "Notes check: 253 processed, 1 note(s) to self, 0 new.", "muted")
 
 
 class _FakeListbox:

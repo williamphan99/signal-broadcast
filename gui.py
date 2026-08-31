@@ -1130,10 +1130,6 @@ class App(tk.Tk):
                                       wraplength=430, justify="left")
         self.notes_status.pack(side="left", padx=10)
         self.notes_progress = ttk.Progressbar(tab, mode="indeterminate")
-        # What the last drain actually contained. Kept on screen (not just in the log)
-        # because "found nothing" is the case that needs explaining.
-        self.notes_detail = ttk.Label(tab, text="", foreground=PALETTE["muted"], font=("", 10))
-        self.notes_detail.pack(anchor="w", pady=(4, 0))
 
         listwrap = ttk.Frame(tab)
         listwrap.pack(fill="both", expand=True, pady=(10, 0))
@@ -1257,18 +1253,9 @@ class App(tk.Tk):
         self._render_notes()
         if isinstance(result, str):
             self.notes_status.configure(text=result, foreground=PALETTE["error"])
-            self.notes_detail.configure(text="")
             self._log(f"Notes check failed: {result}", "error")
             return
         new = result.get("new", 0)
-        # Always show what the drain actually contained. "Nothing new" on its own can't
-        # tell you whether the note never arrived, arrived and was filtered out, or was
-        # already stored — and that's exactly the moment you need to know.
-        self.notes_detail.configure(text=(
-            f"Last check took {result.get('seconds', 0)}s · "
-            f"{result.get('envelopes', 0)} message(s) processed · "
-            f"{result.get('transcripts', 0)} sent from your phone · "
-            f"{result.get('notes', 0)} to yourself"))
         self._log(f"Notes check: {result.get('envelopes', 0)} processed, "
                   f"{result.get('notes', 0)} note(s) to self, {new} new.", "muted")
         if new:
