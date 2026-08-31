@@ -1906,12 +1906,12 @@ class App(tk.Tk):
         self.save_groups_btn.configure(state="normal")
         self.groups_progress.stop()
         self.groups_progress.pack_forget()
+        # The receive drain can save notes even when reading the group catalog fails.
+        if hasattr(self, "notes_list"):
+            self._render_notes()
         if isinstance(result, int):
             self.groups_sync_label.configure(text=f"Updated — {result} groups.",
                                              foreground=PALETTE["muted"])
-            # A sync drains the same queue notes arrive on, so it may have picked some up.
-            if hasattr(self, "notes_list"):
-                self._render_notes()
             account = engine.load_config().account
             self._unsendable_ids = engine.cached_unsendable_groups(account)
             self._populate_groups(check_permissions=False)

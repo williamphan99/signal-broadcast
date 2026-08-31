@@ -229,6 +229,20 @@ class WipeOnQuitTests(unittest.TestCase):
 
 
 class GroupRefreshTests(unittest.TestCase):
+    def test_failed_group_refresh_still_shows_notes_captured_during_the_drain(self):
+        app = gui.App.__new__(gui.App)
+        app._refreshing = True
+        app.refresh_btn = mock.Mock()
+        app.save_groups_btn = mock.Mock()
+        app.groups_progress = mock.Mock()
+        app.groups_sync_label = mock.Mock()
+        app.notes_list = mock.Mock()
+        app._render_notes = mock.Mock()
+
+        app._finish_refresh("Error: group catalogue timed out")
+
+        app._render_notes.assert_called_once_with()
+
     def test_screen_clear_cancels_a_pending_group_filter(self):
         app = gui.App.__new__(gui.App)
         app._group_render_job = "job-1"
