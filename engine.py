@@ -21,6 +21,7 @@ import re
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -64,7 +65,7 @@ ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.21.12"
+APP_VERSION = "1.21.13"
 
 
 @dataclass(frozen=True)
@@ -165,15 +166,24 @@ CONFIRM_GRACE_S = 60             # after a send times out, how long to keep list
 # receive, so we drain in short bursts until the count stops growing (or the cap).
 SYNC_BURST_S = 5                 # one receive burst while draining the phone's sync
 SYNC_MAX_S = 60                  # budget once no more progress is being made
-SYNC_HARD_CAP_S = 240            # ceiling checked between signal-cli calls; one large
-                                 # catalog read has its own bounded timeout below
+SYNC_HARD_CAP_S = 240            # ceiling on the receive/list LOOP, checked between
+                                 # signal-cli calls. A catalog read already in flight is
+                                 # never cut short by it — that read has its own
+                                 # progress-based limits below, and on a large account it
+                                 # can legitimately outlast this cap, ending the loop
+                                 # after the one read that did the work.
 SYNC_STABLE_ROUNDS = 2           # active backlog: require three matching catalogs total
 SYNC_IDLE_STABLE_ROUNDS = 1      # quiet queue: two matching catalogs are enough
 SYNC_LIST_FAILURE_LIMIT = 3      # repeated catalog failures are an error, not a backlog
 SYNC_RENUDGE_EVERY = 3           # re-ask the phone for the groups sync every N rounds while
                                  # we still have none (the first nudge can be missed/delayed)
 SIGNAL_CONTROL_TIMEOUT_S = 30    # short account checks and sync requests
-GROUP_CATALOG_TIMEOUT_S = 300    # large group/member catalogs can take several minutes
+GROUP_CATALOG_TIMEOUT_S = 300    # listGroups is stopped only after this long with NO
+                                 # progress (no exit, no newly prepared group). A read
+                                 # that is still preparing groups is never cut off here.
+GROUP_CATALOG_MAX_S = 45 * 60    # absolute ceiling for one listGroups read even while it
+                                 # progresses; progress is saved, so a retry continues
+GROUP_CATALOG_POLL_S = 2.0       # how often a running listGroups is checked for progress
 MIN_DELAY_S = 10.0               # hard floor: never send faster than this, whatever the config
 # Parallel sending: how many whole-group sends may be in flight at once on the single
 # account. 1 = the safe default (strictly one at a time).
@@ -208,6 +218,18 @@ MESSAGE_STYLE_LABELS: tuple[tuple[str, str], ...] = (
 
 class BroadcastError(Exception):
     """Recoverable, user-facing problem (bad config, missing file, no signal-cli)."""
+
+
+class GroupCatalogStalled(BroadcastError):
+    """A ``listGroups`` read was stopped: no group was prepared for
+    GROUP_CATALOG_TIMEOUT_S, or the GROUP_CATALOG_MAX_S ceiling was reached. The
+    message is already worded for the operator. ``ready``/``total`` are the last counts
+    seen (None when signal-cli's store couldn't be read); ``progressed`` says whether
+    this read prepared any group before stopping."""
+
+    def __init__(self, message: str, ready: int | None, total: int | None, progressed: bool):
+        super().__init__(message)
+        self.ready, self.total, self.progressed = ready, total, progressed
 
 
 # Callback aliases. Defaults are no-ops so callers can pass only what they need.
@@ -961,12 +983,16 @@ def _link_is_broken_unlocked() -> bool:
 def _request_sync(binary: str, account: str) -> None:
     """Best-effort nudge: ask the phone (primary) to (re)send contacts + groups.
     Ignored on failure — the phone usually pushes a sync on linking anyway."""
+    started = time.monotonic()
     try:
         subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-a", account, "sendSyncRequest"),
                        capture_output=True, text=True, errors="replace",
                        timeout=SIGNAL_CONTROL_TIMEOUT_S, env=_signal_env(binary))
     except subprocess.TimeoutExpired:
-        pass  # best-effort nudge; a network stall must not hang the sync
+        # best-effort nudge; a network stall must not hang the sync
+        _sync_log(f"sendSyncRequest timed out ({SIGNAL_CONTROL_TIMEOUT_S}s)")
+    else:
+        _sync_log(f"sendSyncRequest done in {time.monotonic() - started:.0f}s")
 
 
 # signal-cli errors that will NEVER recover by retrying: the account isn't usable
@@ -1035,6 +1061,10 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
     in short bursts until the count stops growing (or SYNC_MAX_S). Reports a running
     count so the wait is visibly progressing. Returns the final group count.
 
+    Raises GroupCatalogStalled when signal-cli stopped preparing groups mid-catalog:
+    that is not an error to retry in-loop (it would only stall again), so it is re-raised
+    as-is, already carrying how far the read got and that a retry continues from there.
+
     Raises BroadcastError if we never once managed to read the group list — that is a
     real failure (signal-cli erroring on every call), and it must NOT be reported as
     "0 groups", which is indistinguishable from an account that simply has none. This
@@ -1055,7 +1085,12 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
     list_failures = 0
     dead_timeouts = 0        # receive timeouts that produced NO output (real connect hang)
     connected = False        # did receive ever reach the server (produce any output)?
+    catalog_stall: GroupCatalogStalled | None = None
     rounds = 0
+    progress = _catalog_progress(account)
+    if progress is not None:
+        store_ready, store_total = progress
+        _sync_log(f"group store: {store_ready} of {store_total} groups prepared")
     while time.monotonic() < deadline and time.monotonic() < hard_cap and stable < SYNC_STABLE_ROUNDS:
         rounds += 1
         round_active = False
@@ -1132,9 +1167,20 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
                     break
             elif out:
                 connected = True   # clean receive with output → we reached the server
+        list_started = time.monotonic()
         try:
             on_log("Reading your group list… Large accounts can take several minutes.")
-            count = pull_groups(account)
+            count = pull_groups(account, on_log)
+        except GroupCatalogStalled as exc:
+            # No progress for GROUP_CATALOG_TIMEOUT_S (or the absolute ceiling). Every
+            # prepared group is already saved in signal-cli's store, so nothing is lost;
+            # but re-running now would only stall again — stop and say exactly where it
+            # got to, so the operator knows a retry continues rather than restarts.
+            catalog_stall = exc
+            last_error = last_list_error = str(exc)
+            _sync_log(f"listGroups STALLED after {time.monotonic() - list_started:.0f}s: "
+                      f"prepared={exc.ready} of {exc.total}, progressed={exc.progressed}")
+            break
         except BroadcastError as exc:
             last_error = str(exc)
             last_list_error = last_error
@@ -1147,7 +1193,7 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
             continue   # transient fetch error — try another burst
         list_failures = 0
         last_list_error = ""
-        _sync_log(f"listGroups OK: {count} groups")
+        _sync_log(f"listGroups OK: {count} groups in {time.monotonic() - list_started:.0f}s")
         on_log(f"Syncing your groups from your phone… ({count} so far)")
         # Only settle on a non-zero count; while we still have nothing, keep
         # draining until the cap, since the phone's first sync can be slow.
@@ -1159,16 +1205,13 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
         f"--- sync end: last={last}, connected={connected}, "
         f"last_error={_sync_error_summary(last_error)} ---")
     if last < 0:
+        if catalog_stall is not None:
+            raise catalog_stall   # already worded for the operator, with the counts
         if last_list_error:
             if ACCOUNT_UNUSABLE_PATTERN.search(last_list_error):
                 raise BroadcastError(
                     "Signal says this computer is no longer linked. Link it again from "
                     "your phone, then update the group list.")
-            if "Timed out fetching groups" in last_list_error:
-                raise BroadcastError(
-                    "Connected to Signal, but reading this account's large group list "
-                    "took longer than five minutes. Check the connection and try "
-                    "“Update list from phone” again.")
             raise BroadcastError(
                 "Connected to Signal, but the group list could not be read. Wait for "
                 "other Signal activity to finish, then try “Update list from phone” "
@@ -1191,17 +1234,155 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
     return last
 
 
-def pull_groups(account: str) -> int:
-    """Fetch the groups this number belongs to and (over)write groups.txt,
-    preserving any groups you previously excluded. Returns the count written."""
-    binary = signal_cli_bin()
+def _account_db_path(account: str) -> Path | None:
+    """signal-cli's SQLite store for ``account`` (data/<path>.d/account.db), located via
+    accounts.json; falls back to the only account directory present. None if unknown."""
+    data = DATA_DIR / "data"
     try:
-        proc = subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-o", "json", "-a", account, "listGroups"),
-                              capture_output=True, text=True, errors="replace", timeout=GROUP_CATALOG_TIMEOUT_S,
-                              env=_signal_env(binary))
-    except subprocess.TimeoutExpired:
-        raise BroadcastError(
-            "Timed out fetching groups after 5 minutes. Check the connection and try again.")
+        index = json.loads((data / "accounts.json").read_text(encoding="utf-8"))
+        entries = list(index.get("accounts", []))
+    except (OSError, ValueError):
+        entries = None   # missing or malformed accounts.json — fall back below
+    except (AttributeError, TypeError):
+        entries = None   # accounts.json parsed but isn't the {"accounts": [...]} shape
+    if entries is not None:
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("number") == account and entry.get("path"):
+                candidate = data / f"{entry['path']}.d" / "account.db"
+                return candidate if candidate.exists() else None
+        return None      # the index is authoritative: this account isn't in it
+    try:
+        found = sorted(data.glob("*.d/account.db"))
+    except OSError:
+        return None
+    return found[0] if len(found) == 1 else None
+
+
+def _catalog_progress(account: str) -> tuple[int, int] | None:
+    """(ready, total) groups in signal-cli's local store, or None when unreadable.
+
+    Why this exists: after linking, the phone's storage sync hands signal-cli every
+    group's key but not its state. The first ``listGroups`` then fetches each group's
+    state from Signal's servers — one network round-trip (plus history and avatar)
+    per group, sequentially — and saves each group as it goes. The rows whose state is
+    still missing are therefore exactly the work left, and because the store is a
+    WAL-mode SQLite file we can read it while signal-cli is writing. Read-only and
+    best-effort: an unreadable or unfamiliar store just means no progress display.
+    Only counts leave this function — no names, ids, members, or messages."""
+    path = _account_db_path(account)
+    if path is None:
+        return None
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+        try:
+            total, pending = con.execute(
+                "SELECT COUNT(*), COALESCE(SUM(group_data IS NULL AND NOT permission_denied), 0) "
+                "FROM group_v2").fetchone()
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError, TypeError, ValueError):
+        return None
+    return int(total) - int(pending), int(total)
+
+
+def _catalog_status_text(ready: int, total: int, prepared_this_run: int,
+                         elapsed: float) -> str:
+    remaining = total - ready
+    text = f"Preparing your groups… {ready} of {total} ready."
+    if remaining > 0 and prepared_this_run >= 5 and elapsed > 0:
+        minutes = remaining / (prepared_this_run / elapsed) / 60
+        text += (f" About {max(1, round(minutes))} min left." if minutes < 90
+                 else " This will take a while.")
+    return text + " Progress is saved if you have to stop."
+
+
+def _minutes_phrase(seconds: float) -> str:
+    """"5 minutes" / "1 minute" — so a retuned constant can't leave stale prose behind."""
+    minutes = max(1, round(seconds / 60))
+    return f"{minutes} minute" + ("" if minutes == 1 else "s")
+
+
+def _catalog_stall_message(ready: int | None, total: int | None, progressed: bool,
+                           hit_ceiling: bool) -> str:
+    """Word a stall for the operator. Durations come from the constants, not prose: the
+    limit is a no-progress window now, so it is the value most likely to be retuned."""
+    stall_mins = _minutes_phrase(GROUP_CATALOG_TIMEOUT_S)
+    if ready is None or total is None:
+        return (f"Timed out fetching groups after {stall_mins} with no sign of progress. "
+                "Check the connection and try “Update list from phone” again.")
+    if hit_ceiling:
+        return (f"Preparing this account's groups is still going after "
+                f"{_minutes_phrase(GROUP_CATALOG_MAX_S)} ({ready} of {total} ready). "
+                "Progress is saved — tap “Update list from phone” again to continue "
+                "from here.")
+    if progressed:
+        return (f"Signal stopped making progress preparing this account's groups "
+                f"({ready} of {total} ready) for {stall_mins}. Progress is saved "
+                "— check the connection, then tap “Update list from phone” again to "
+                "continue.")
+    return (f"Signal made no progress preparing this account's {total} groups "
+            f"({ready} ready) for {stall_mins}. Check the connection, then tap "
+            "“Update list from phone” again — every prepared group is kept.")
+
+
+def _run_group_catalog_read(argv: list[str], env: dict | None, account: str,
+                            on_log: LogFn) -> subprocess.CompletedProcess:
+    """Run one ``listGroups`` while watching signal-cli's own store for progress.
+
+    A fixed subprocess timeout was the reported failure: after relinking, an account
+    with hundreds of groups needs longer than any fixed cap to prepare them all, and
+    killing at the cap discarded the run and blamed the connection. Here the read is
+    killed only when it has made NO progress for GROUP_CATALOG_TIMEOUT_S — a genuine
+    hang or dead network, and the same behaviour as before whenever progress can't be
+    observed — or at the GROUP_CATALOG_MAX_S ceiling. Meanwhile the running count goes
+    to ``on_log`` so a multi-minute wait visibly moves. Output is drained as it runs,
+    so a very large catalog can't fill the pipe and deadlock."""
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, errors="replace", env=env)
+    started = last_progress = time.monotonic()
+    progress = _catalog_progress(account)
+    base_ready = ready = progress[0] if progress else None
+    total = progress[1] if progress else None
+    while True:
+        try:
+            out, err = proc.communicate(timeout=GROUP_CATALOG_POLL_S)
+        except subprocess.TimeoutExpired:
+            pass   # partial output is kept by communicate(); keep watching
+        else:
+            return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+        now = time.monotonic()
+        progress = _catalog_progress(account)
+        if progress is not None:
+            new_ready, total = progress
+            if ready is None:
+                base_ready = ready = new_ready
+            elif new_ready > ready:
+                ready = new_ready
+                last_progress = now
+            if total - ready > 0:
+                on_log(_catalog_status_text(ready, total, ready - base_ready, now - started))
+        hit_ceiling = now - started >= GROUP_CATALOG_MAX_S
+        if hit_ceiling or now - last_progress >= GROUP_CATALOG_TIMEOUT_S:
+            proc.kill()
+            try:
+                proc.communicate(timeout=5)
+            except (subprocess.TimeoutExpired, OSError, ValueError):
+                pass
+            progressed = ready is not None and base_ready is not None and ready > base_ready
+            raise GroupCatalogStalled(
+                _catalog_stall_message(ready, total, progressed, hit_ceiling),
+                ready, total, progressed)
+
+
+def pull_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
+    """Fetch the groups this number belongs to and (over)write groups.txt,
+    preserving any groups you previously excluded. Returns the count written.
+    Raises GroupCatalogStalled if signal-cli stops making progress (see
+    _run_group_catalog_read); ``on_log`` receives the running preparation count."""
+    binary = signal_cli_bin()
+    proc = _run_group_catalog_read(
+        _cli(binary, "--config", str(DATA_DIR), "-o", "json", "-a", account, "listGroups"),
+        _signal_env(binary), account, on_log)
     if proc.returncode != 0:
         raise BroadcastError("Could not fetch groups:\n" + (proc.stderr or proc.stdout))
     groups = json.loads(proc.stdout or "[]")

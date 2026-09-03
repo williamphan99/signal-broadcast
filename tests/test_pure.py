@@ -10,10 +10,13 @@ guest, and guard the small platform-aware seams added for the Pixel/Termux port:
 
 Run with:  python3 -m unittest discover -s tests
 """
+import contextlib
 import json
 import multiprocessing
 import os
+import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -39,27 +42,146 @@ def _write_group_selection_process(groups_file, lock_file, attempting, done):
     done.set()
 
 
-class GroupSnapshotTests(unittest.TestCase):
-    def test_large_group_catalog_gets_five_minutes_to_finish(self):
-        seen_timeout = []
+class _FakeCatalogProc:
+    """Stand-in for the `signal-cli listGroups` Popen: communicate() times out
+    ``busy_polls`` times (the read is still running), then returns the catalog."""
 
-        def slow_catalog(_argv, **kwargs):
-            timeout = kwargs["timeout"]
-            seen_timeout.append(timeout)
-            if timeout < 300:
-                raise engine.subprocess.TimeoutExpired(cmd="listGroups", timeout=timeout)
-            return mock.Mock(returncode=0, stdout='[{"id":"g1","name":"One"}]', stderr="")
+    def __init__(self, stdout="[]", stderr="", rc=0, busy_polls=0, poll_sleep=0.0):
+        self.stdout_text, self.stderr_text, self.returncode = stdout, stderr, rc
+        self.busy_polls, self.poll_sleep = busy_polls, poll_sleep
+        self.polls = 0
+        self.killed = False
 
+    def communicate(self, timeout=None):
+        if self.killed:
+            return "", ""
+        self.polls += 1
+        if self.poll_sleep:
+            time.sleep(self.poll_sleep)
+        if self.polls <= self.busy_polls:
+            raise engine.subprocess.TimeoutExpired(cmd="listGroups", timeout=timeout)
+        return self.stdout_text, self.stderr_text
+
+    def kill(self):
+        self.killed = True
+
+
+def _catalog_popen(stdout, stderr="", rc=0):
+    return mock.patch.object(engine.subprocess, "Popen",
+                             return_value=_FakeCatalogProc(stdout, stderr, rc))
+
+
+class GroupCatalogReadTests(unittest.TestCase):
+    """The first listGroups after (re)linking fetches every group's state from Signal,
+    one network round-trip per group, saving each as it goes. A fixed five-minute kill
+    threw that run away on big accounts and blamed the connection — the reported bug.
+    The read must now only stop when it makes NO progress."""
+
+    def _read(self, proc, progress, **limits):
+        logs = []
+        patches = [mock.patch.object(engine.subprocess, "Popen", return_value=proc),
+                   mock.patch.object(engine, "_catalog_progress", side_effect=progress),
+                   mock.patch.object(engine, "GROUP_CATALOG_POLL_S", 0.001)]
+        for name, value in limits.items():
+            patches.append(mock.patch.object(engine, name, value))
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            result = engine._run_group_catalog_read(["listGroups"], None, "+1", logs.append)
+        return result, logs
+
+    def test_keeps_going_while_groups_are_still_being_prepared(self):
+        ready = iter(range(100, 100_000))
+        proc = _FakeCatalogProc('[{"id":"g1","name":"One"}]', busy_polls=30, poll_sleep=0.005)
+        # 30 polls × 5 ms is well past the 20 ms "no progress" limit — but every poll
+        # shows another group prepared, so the read is never cut off.
+        result, logs = self._read(proc, lambda _a: (next(ready), 640),
+                                  GROUP_CATALOG_TIMEOUT_S=0.02)
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(proc.killed)
+        self.assertTrue(any("of 640 ready" in line for line in logs), logs)
+        self.assertTrue(any("min left" in line for line in logs), logs)
+
+    def test_stops_when_no_group_is_prepared_for_the_limit_and_names_the_counts(self):
+        limit = 0.03
+        proc = _FakeCatalogProc(busy_polls=10_000, poll_sleep=0.005)
+        with self.assertRaises(engine.GroupCatalogStalled) as ctx:
+            self._read(proc, lambda _a: (120, 640), GROUP_CATALOG_TIMEOUT_S=limit)
+        self.assertTrue(proc.killed)
+        message = str(ctx.exception)
+        self.assertIn("120 ready", message)
+        self.assertIn("640 groups", message)
+        # The wait names the limit actually in force, so retuning the constant can't
+        # leave stale prose behind (it read "five minutes" regardless, once).
+        self.assertIn(engine._minutes_phrase(limit), message)
+        self.assertIn("every prepared group is kept", message)
+        self.assertEqual((ctx.exception.ready, ctx.exception.total), (120, 640))
+        self.assertFalse(ctx.exception.progressed)
+
+    def test_progress_then_stall_says_progress_is_saved(self):
+        counts = iter([100, 101, 102, 103, 104, 105])
+        proc = _FakeCatalogProc(busy_polls=10_000, poll_sleep=0.005)
+        with self.assertRaises(engine.GroupCatalogStalled) as ctx:
+            self._read(proc, lambda _a: (next(counts, 105), 640), GROUP_CATALOG_TIMEOUT_S=0.03)
+        self.assertTrue(ctx.exception.progressed)
+        self.assertIn("105 of 640 ready", str(ctx.exception))
+        self.assertIn("Progress is saved", str(ctx.exception))
+
+    def test_ceiling_stops_even_a_progressing_read_and_says_how_to_continue(self):
+        ready = iter(range(1, 100_000))
+        proc = _FakeCatalogProc(busy_polls=10_000, poll_sleep=0.005)
+        with self.assertRaises(engine.GroupCatalogStalled) as ctx:
+            self._read(proc, lambda _a: (next(ready), 5000),
+                       GROUP_CATALOG_TIMEOUT_S=60, GROUP_CATALOG_MAX_S=0.03)
+        self.assertTrue(proc.killed)
+        self.assertIn("Progress is saved", str(ctx.exception))
+        self.assertIn("again to continue", str(ctx.exception))
+
+    def test_unreadable_store_falls_back_to_the_plain_timeout(self):
+        limit = 0.03
+        proc = _FakeCatalogProc(busy_polls=10_000, poll_sleep=0.005)
+        with self.assertRaises(engine.GroupCatalogStalled) as ctx:
+            self._read(proc, lambda _a: None, GROUP_CATALOG_TIMEOUT_S=limit)
+        self.assertIsNone(ctx.exception.ready)
+        self.assertIn("Timed out fetching groups", str(ctx.exception))
+        self.assertIn(engine._minutes_phrase(limit), str(ctx.exception))
+
+    def test_a_one_minute_limit_is_not_described_as_1_minutes(self):
+        self.assertEqual(engine._minutes_phrase(60), "1 minute")
+        self.assertEqual(engine._minutes_phrase(300), "5 minutes")
+        self.assertEqual(engine._minutes_phrase(0.5), "1 minute")
+
+    def test_catalog_progress_counts_prepared_groups_in_the_signal_cli_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory) / "data"
+            (data / "946136.d").mkdir(parents=True)
+            (data / "accounts.json").write_text(json.dumps({
+                "accounts": [{"path": "946136", "number": "+1"}], "version": 2}))
+            con = sqlite3.connect(data / "946136.d" / "account.db")
+            con.execute("""CREATE TABLE group_v2 (
+                _id INTEGER PRIMARY KEY, storage_id BLOB UNIQUE, storage_record BLOB,
+                group_id BLOB UNIQUE NOT NULL, master_key BLOB NOT NULL, group_data BLOB,
+                distribution_id BLOB UNIQUE NOT NULL,
+                endorsement_expiration_time INTEGER NOT NULL DEFAULT 0,
+                blocked INTEGER NOT NULL DEFAULT FALSE,
+                profile_sharing INTEGER NOT NULL DEFAULT FALSE,
+                permission_denied INTEGER NOT NULL DEFAULT FALSE) STRICT""")
+            rows = [(b"a", b"k", b"state", b"d1", 0), (b"b", b"k", None, b"d2", 0),
+                    (b"c", b"k", None, b"d3", 1), (b"d", b"k", b"state", b"d4", 0)]
+            con.executemany("INSERT INTO group_v2 (group_id, master_key, group_data, "
+                            "distribution_id, permission_denied) VALUES (?,?,?,?,?)", rows)
+            con.commit()
+            con.close()
+            with mock.patch.object(engine, "DATA_DIR", Path(directory)):
+                # b is the only group still to prepare: c is denied, so never fetched.
+                self.assertEqual(engine._catalog_progress("+1"), (3, 4))
+                self.assertIsNone(engine._catalog_progress("+2"))
         with tempfile.TemporaryDirectory() as directory, \
-             mock.patch.object(engine, "GROUPS_FILE", Path(directory) / "groups.txt"), \
-             mock.patch.object(engine, "GROUPS_LOCK_FILE", Path(directory) / "groups.lock"), \
-             mock.patch.object(engine, "GROUP_PERMISSIONS_FILE", Path(directory) / "permissions.json"), \
-             mock.patch.object(engine, "signal_cli_bin", return_value="/bin/true"), \
-             mock.patch.object(engine.subprocess, "run", side_effect=slow_catalog):
-            self.assertEqual(engine.pull_groups("+1"), 1)
+             mock.patch.object(engine, "DATA_DIR", Path(directory)):
+            self.assertIsNone(engine._catalog_progress("+1"))
 
-        self.assertEqual(seen_timeout, [300])
 
+class GroupSnapshotTests(unittest.TestCase):
     def test_one_group_read_also_populates_the_permission_cache(self):
         groups = [
             {"id": "g1", "name": "One", "permissionSendMessage": "EVERY_MEMBER",
@@ -67,39 +189,36 @@ class GroupSnapshotTests(unittest.TestCase):
             {"id": "g2", "name": "Two", "permissionSendMessage": "ONLY_ADMINS",
              "members": [{"number": "+1", "isAdmin": False}]},
         ]
-        proc = mock.Mock(returncode=0, stdout=json.dumps(groups), stderr="")
         with tempfile.TemporaryDirectory() as directory, \
              mock.patch.object(engine, "GROUPS_FILE", Path(directory) / "groups.txt"), \
              mock.patch.object(engine, "GROUPS_LOCK_FILE", Path(directory) / "groups.lock"), \
              mock.patch.object(engine, "GROUP_PERMISSIONS_FILE", Path(directory) / "permissions.json"), \
              mock.patch.object(engine, "signal_cli_bin", return_value="/bin/true"), \
-             mock.patch.object(engine.subprocess, "run", return_value=proc) as run:
+             _catalog_popen(json.dumps(groups)) as popen:
             count = engine.pull_groups("+1")
 
         self.assertEqual(count, 2)
         self.assertEqual(engine.cached_unsendable_groups("+1"), {"g2"})
         self.assertEqual(engine.cached_unsendable_groups("+other"), set())
-        self.assertEqual(run.call_count, 1)
+        self.assertEqual(popen.call_count, 1)
 
     def test_permissions_survive_a_process_cache_reset(self):
         groups = [
             {"id": "g1", "name": "One", "permissionSendMessage": "ONLY_ADMINS",
              "members": [{"number": "+1", "isAdmin": False}]},
         ]
-        proc = mock.Mock(returncode=0, stdout=json.dumps(groups), stderr="")
         with tempfile.TemporaryDirectory() as directory, \
              mock.patch.object(engine, "GROUPS_FILE", Path(directory) / "groups.txt"), \
              mock.patch.object(engine, "GROUPS_LOCK_FILE", Path(directory) / "groups.lock"), \
              mock.patch.object(engine, "GROUP_PERMISSIONS_FILE", Path(directory) / "permissions.json"), \
              mock.patch.object(engine, "signal_cli_bin", return_value="/bin/true"), \
-             mock.patch.object(engine.subprocess, "run", return_value=proc):
+             _catalog_popen(json.dumps(groups)):
             engine.pull_groups("+1")
             engine._GROUP_PERMISSION_CACHE = ("", set())
             self.assertEqual(engine.stored_unsendable_groups("+1"), {"g1"})
 
     def test_permission_cache_write_failure_does_not_fail_group_sync(self):
         groups = [{"id": "g1", "name": "One"}]
-        proc = mock.Mock(returncode=0, stdout=json.dumps(groups), stderr="")
         with tempfile.TemporaryDirectory() as directory:
             group_file = Path(directory) / "groups.txt"
             permission_file = Path(directory) / "permissions.json"
@@ -114,7 +233,7 @@ class GroupSnapshotTests(unittest.TestCase):
                  mock.patch.object(engine, "GROUPS_LOCK_FILE", Path(directory) / "groups.lock"), \
                  mock.patch.object(engine, "GROUP_PERMISSIONS_FILE", permission_file), \
                  mock.patch.object(engine, "signal_cli_bin", return_value="/bin/true"), \
-                 mock.patch.object(engine.subprocess, "run", return_value=proc), \
+                 _catalog_popen(json.dumps(groups)), \
                  mock.patch.object(engine, "_atomic_write_text", side_effect=write):
                 self.assertEqual(engine.pull_groups("+1"), 1)
             self.assertTrue(group_file.exists())
@@ -125,18 +244,21 @@ class GroupSnapshotTests(unittest.TestCase):
 
         def fake_run(argv, **_kwargs):
             calls.append(argv)
-            if "listGroups" in argv:
-                return mock.Mock(returncode=0, stdout='[{"id":"g1","name":"One"}]',
-                                 stderr="")
             return mock.Mock(returncode=0, stdout="", stderr="")
+
+        def fake_popen(argv, **_kwargs):   # listGroups is the only Popen in a sync
+            calls.append(argv)
+            return _FakeCatalogProc('[{"id":"g1","name":"One"}]')
 
         with tempfile.TemporaryDirectory() as directory, \
              mock.patch.object(engine, "GROUPS_FILE", Path(directory) / "groups.txt"), \
              mock.patch.object(engine, "GROUPS_LOCK_FILE", Path(directory) / "groups.lock"), \
              mock.patch.object(engine, "GROUP_PERMISSIONS_FILE", Path(directory) / "permissions.json"), \
              mock.patch.object(engine, "signal_cli_bin", return_value="/bin/true"), \
+             mock.patch.object(engine, "_catalog_progress", return_value=None), \
              mock.patch.object(engine, "_sync_log"), \
-             mock.patch.object(engine.subprocess, "run", side_effect=fake_run):
+             mock.patch.object(engine.subprocess, "run", side_effect=fake_run), \
+             mock.patch.object(engine.subprocess, "Popen", side_effect=fake_popen):
             self.assertEqual(engine.sync_groups("+1"), 1)
 
         self.assertEqual(len(calls), 5, "one nudge plus two quiet receive/listGroups rounds")
@@ -428,7 +550,7 @@ class SyncGroupsTests(unittest.TestCase):
         list consumed one per iteration; an item that's an Exception is raised."""
         seq = iter(pull_side_effect)
 
-        def fake_pull(_acct):
+        def fake_pull(_acct, *_on_log):
             item = next(seq, pull_side_effect[-1])
             if isinstance(item, Exception):
                 raise item
@@ -436,6 +558,7 @@ class SyncGroupsTests(unittest.TestCase):
 
         with mock.patch.object(engine, "signal_cli_bin", lambda: "/bin/true"), \
              mock.patch.object(engine, "_request_sync", lambda *a, **k: None), \
+             mock.patch.object(engine, "_catalog_progress", lambda *_a: None), \
              mock.patch.object(engine, "pull_groups", fake_pull), \
              mock.patch.object(engine.subprocess, "run", lambda *a, **k: recv):
             return engine.sync_groups("+1", on_log=lambda *_: None)
@@ -454,14 +577,41 @@ class SyncGroupsTests(unittest.TestCase):
         self.assertIn("group list could not be read", message)
         self.assertNotIn("large backlog", message)
 
-    def test_catalog_timeout_names_the_five_minute_limit(self):
-        timed_out = engine.BroadcastError(
-            "Timed out fetching groups after 5 minutes. Check the connection and try again.")
+    def test_catalog_timeout_names_the_no_progress_limit(self):
+        timed_out = engine.GroupCatalogStalled(
+            engine._catalog_stall_message(None, None, False, False), None, None, False)
         with self.assertRaises(engine.BroadcastError) as ctx:
             self._sync(self._Recv(rc=0, err="server timestamp received"), [timed_out])
         message = str(ctx.exception).lower()
-        self.assertIn("five minutes", message)
+        self.assertIn(engine._minutes_phrase(engine.GROUP_CATALOG_TIMEOUT_S), message)
         self.assertNotIn("other signal activity", message)
+
+    def test_stalled_catalog_reports_counts_and_stops_instead_of_churning(self):
+        # A stall means signal-cli prepared nothing new for five minutes: retrying in
+        # the same run would only stall again. Surface exactly where it got to, once.
+        calls = {"n": 0}
+        stalled = engine.GroupCatalogStalled(
+            engine._catalog_stall_message(118, 640, True, False), 118, 640, True)
+
+        def fake_pull(_acct, *_on_log):
+            calls["n"] += 1
+            raise stalled
+
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(engine, "SYNC_DEBUG_FILE", Path(directory) / "sync-debug.txt"), \
+             mock.patch.object(engine, "signal_cli_bin", lambda: "/bin/true"), \
+             mock.patch.object(engine, "_request_sync", lambda *a, **k: None), \
+             mock.patch.object(engine, "_catalog_progress", lambda *_a: (118, 640)), \
+             mock.patch.object(engine, "pull_groups", fake_pull), \
+             mock.patch.object(engine.subprocess, "run", lambda *a, **k: self._Recv()):
+            with self.assertRaises(engine.GroupCatalogStalled) as ctx:
+                engine.sync_groups("+61400000000", on_log=lambda *_: None)
+            debug = engine.SYNC_DEBUG_FILE.read_text(encoding="utf-8")
+        self.assertEqual(calls["n"], 1)
+        self.assertIn("118 of 640 ready", str(ctx.exception))
+        self.assertIn("STALLED", debug)
+        self.assertIn("prepared=118 of 640", debug)
+        self.assertNotIn("+61400000000", debug)
 
     def test_success_returns_count(self):
         # Two stable reads settle a quiet queue and return the count.
@@ -521,7 +671,7 @@ class SyncGroupsTests(unittest.TestCase):
         calls = {"n": 0}
         dead = engine.BroadcastError("User +1 is not registered.")
 
-        def fake_pull(_acct):
+        def fake_pull(_acct, *_on_log):
             calls["n"] += 1
             raise dead
 
@@ -538,7 +688,7 @@ class SyncGroupsTests(unittest.TestCase):
         call. pull_groups still runs from pull_side_effect."""
         seq = iter(pull_side_effect)
 
-        def fake_pull(_acct):
+        def fake_pull(_acct, *_on_log):
             item = next(seq, pull_side_effect[-1])
             if isinstance(item, Exception):
                 raise item
@@ -549,6 +699,7 @@ class SyncGroupsTests(unittest.TestCase):
 
         with mock.patch.object(engine, "signal_cli_bin", lambda: "/bin/true"), \
              mock.patch.object(engine, "_request_sync", lambda *a, **k: None), \
+             mock.patch.object(engine, "_catalog_progress", lambda *_a: None), \
              mock.patch.object(engine, "pull_groups", fake_pull), \
              mock.patch.object(engine.subprocess, "run", fake_run):
             return engine.sync_groups("+1", on_log=lambda *_: None)
