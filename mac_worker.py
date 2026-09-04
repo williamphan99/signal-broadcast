@@ -71,10 +71,14 @@ def run(request):
     elif kind in ("sync", "notes", "health"):
         if kind == "health":
             emit("link_broken", engine.link_is_broken())
-        elif kind == "sync":
-            emit("groups", engine.sync_groups(engine.load_config().account, on_log=lambda text: emit("log", text)))
         else:
-            emit("notes", engine.fetch_notes(engine.load_config().account, on_log=lambda text: emit("log", text)))
+            account = engine.load_config().account
+            if engine.detect_account() != account:
+                raise engine.BroadcastError("The linked account does not match the saved configuration.")
+            if kind == "sync":
+                emit("groups", engine.sync_groups(account, on_log=lambda text: emit("log", text)))
+            else:
+                emit("notes", engine.fetch_notes(account, on_log=lambda text: emit("log", text)))
     elif kind in ("send", "resume"):
         cfg = engine.load_config()
         groups = engine.read_groups()

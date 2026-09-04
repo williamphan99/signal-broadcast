@@ -904,6 +904,12 @@ def signal_cli_command(*args: str) -> tuple[list[str], dict | None]:
     return _cli(binary, *args), _signal_env(binary)
 
 
+def _account_args(account: str) -> list[str]:
+    # Protected workers verify the configured account before these one-shot reads.
+    # signal-cli selects its sole local account, and refuses ambiguous stores.
+    return [] if PRIVATE_TRANSPORT else ["-a", account]
+
+
 def detect_account() -> str | None:
     """Return the linked number signal-cli knows about, or None."""
     try:
@@ -993,7 +999,7 @@ def _request_sync(binary: str, account: str) -> None:
     Ignored on failure — the phone usually pushes a sync on linking anyway."""
     started = time.monotonic()
     try:
-        subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-a", account, "sendSyncRequest"),
+        subprocess.run(_cli(binary, "--config", str(DATA_DIR), *_account_args(account), "sendSyncRequest"),
                        capture_output=True, text=True, errors="replace",
                        timeout=SIGNAL_CONTROL_TIMEOUT_S, env=_signal_env(binary))
     except subprocess.TimeoutExpired:
@@ -1124,7 +1130,7 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
             # -o json so the drain is parseable on the way past: this queue also
             # carries the phone's notes-to-self, and each message is delivered to this
             # device exactly once, so anything we don't keep here is lost.
-            recv = subprocess.run(_cli(binary, "--config", str(DATA_DIR), "-a", account,
+            recv = subprocess.run(_cli(binary, "--config", str(DATA_DIR), *_account_args(account),
                                        "-o", "json",
                                        "receive", "--timeout", str(SYNC_BURST_S),
                                        "--ignore-attachments", "--ignore-avatars",
@@ -1389,7 +1395,7 @@ def pull_groups(account: str, on_log: LogFn = lambda *_: None) -> int:
     _run_group_catalog_read); ``on_log`` receives the running preparation count."""
     binary = signal_cli_bin()
     proc = _run_group_catalog_read(
-        _cli(binary, "--config", str(DATA_DIR), "-o", "json", "-a", account, "listGroups"),
+        _cli(binary, "--config", str(DATA_DIR), "-o", "json", *_account_args(account), "listGroups"),
         _signal_env(binary), account, on_log)
     if proc.returncode != 0:
         raise BroadcastError("Could not fetch groups:\n" + (proc.stderr or proc.stdout))
@@ -1474,7 +1480,7 @@ def _unsendable_groups_unlocked(account: str) -> set[str]:
     try:
         binary = signal_cli_bin()
         proc = subprocess.run(
-            _cli(binary, "--config", str(DATA_DIR), "-o", "json", "-a", account, "listGroups"),
+            _cli(binary, "--config", str(DATA_DIR), "-o", "json", *_account_args(account), "listGroups"),
             capture_output=True, text=True, errors="replace",
             timeout=GROUP_CATALOG_TIMEOUT_S, env=_signal_env(binary))
         if proc.returncode != 0:
@@ -1830,7 +1836,7 @@ def fetch_notes(account: str, on_log: LogFn = lambda *_: None) -> dict:
     with signal_cli_operation("checking notes"):
         try:
             proc = subprocess.Popen(
-                _cli(binary, "--config", str(DATA_DIR), "-a", account, "-o", "json",
+                _cli(binary, "--config", str(DATA_DIR), *_account_args(account), "-o", "json",
                      "receive", "--timeout", str(NOTES_BURST_S),
                      "--ignore-avatars", "--ignore-stickers", "--ignore-stories"),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
@@ -1964,7 +1970,7 @@ class SignalCliDaemon:
         # path. We only ever send, never receive, so we don't need it; signal-cli
         # still connects on demand for each send.
         self._private_account = account if PRIVATE_TRANSPORT else None
-        cmd = _cli(binary, *([] if PRIVATE_TRANSPORT else ["-a", account]), "--config", str(DATA_DIR),
+        cmd = _cli(binary, *_account_args(account), "--config", str(DATA_DIR),
                    "jsonRpc", "--receive-mode", "manual")
         # Capture stderr (was DEVNULL): when startup fails we need signal-cli's own
         # words — "account is already in use", an auth error, a connect failure —
