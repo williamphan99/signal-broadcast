@@ -1,0 +1,83 @@
+"""Response revocation races with disposable stores and in-memory socket streams."""
+import io
+import json
+import os
+import queue
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from mac_service import Service, serve
+from mac_security import SecurityError
+from runtime import isolated_engine
+from test_mac_security import DirectoryVault, MemoryKeychain, PASSWORD
+
+
+class ResponseRevocationTests(unittest.TestCase):
+    def setUp(self):
+        scope = isolated_engine()
+        scope.__enter__()
+        self.addCleanup(scope.__exit__, None, None, None)
+        temporary = tempfile.TemporaryDirectory(prefix="sb-ipc-review-")
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        project = root / "project"
+        project.mkdir()
+        (project / "message.txt").write_text("PRIVATE RESPONSE SENTINEL")
+        self.service = Service(DirectoryVault(root / "vault", project, MemoryKeychain()), retire=lambda _: None)
+        self.token = self.service.handle({"op": "setup", "password": PASSWORD})["token"]
+        with mock.patch("mac_service.socketserver.ThreadingUnixStreamServer.__init__", return_value=None) as create, \
+             mock.patch("mac_service.os.chmod"):
+            serve(self.service, root / "unused.sock")
+        self.handler = create.call_args.args[1]
+
+    def response_during_lock(self, request, match):
+        handler = object.__new__(self.handler)
+        handler.connection = mock.Mock()
+        handler.connection.getpeereid.return_value = (os.getuid(), 0)
+        handler.rfile = io.BytesIO(json.dumps(request).encode() + b"\n")
+        handler.wfile = io.BytesIO()
+        serialized = threading.Event()
+        release = threading.Event()
+        dumps = json.dumps
+
+        def pause(value, *args, **kwargs):
+            result = dumps(value, *args, **kwargs)
+            if isinstance(value, dict) and match(value.get("result", {})):
+                serialized.set()
+                release.wait(5)
+            return result
+
+        with mock.patch("mac_service.json.dumps", side_effect=pause):
+            worker = threading.Thread(target=handler.handle)
+            worker.start()
+            try:
+                self.assertTrue(serialized.wait(5))
+                with self.service.mutex:
+                    self.service.lock()
+                self.assertEqual(self.service.status()["state"], "screen_locked")
+            finally:
+                release.set()
+                worker.join(5)
+            self.assertFalse(worker.is_alive())
+        response = handler.wfile.getvalue().decode()
+        self.assertNotIn("PRIVATE RESPONSE SENTINEL", response)
+        self.assertNotIn(self.token, response)
+        self.assertEqual(json.loads(response)["error_code"], "locked")
+
+    def test_pending_snapshot_is_rejected_after_lock(self):
+        self.response_during_lock({"op": "snapshot", "token": self.token}, lambda result: "message" in result)
+
+    def test_pending_authentication_token_is_rejected_after_lock(self):
+        self.response_during_lock({"op": "unlock", "password": PASSWORD}, lambda result: "token" in result)
+
+    def test_ui_clears_access_using_error_category(self):
+        from mac_app import App
+        for code in ("locked", "unavailable"):
+            with self.subTest(code=code):
+                app = mock.Mock(generation=0, screen="main", responses=queue.Queue())
+                app.responses.put((0, None, None, SecurityError("Reworded explanation", code=code)))
+                App.drain(app)
+                app.show_login.assert_called_once_with("Reworded explanation")

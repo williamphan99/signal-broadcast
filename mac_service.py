@@ -140,7 +140,7 @@ class Service:
     def _authorized(self, request):
         token = request.get("token")
         if self.erasing or self.vault.marker.exists() or not self.open or not self.token or not isinstance(token, str) or not secrets.compare_digest(token, self.token):
-            raise SecurityError("Locked. Enter your password.")
+            raise SecurityError("Locked. Enter your password.", code="locked")
 
     def _event(self, kind, value):
         self.sequence += 1
@@ -513,9 +513,9 @@ class Client:
                     stream.flush()
                     response = json.loads(stream.readline(8 * MAX_REQUEST))
         except (OSError, ValueError) as exc:
-            raise SecurityError("Local service is unavailable. Run Setup.command or reopen the app.") from exc
+            raise SecurityError("Local service is unavailable. Run Setup.command or reopen the app.", code="unavailable") from exc
         if "error" in response:
-            raise SecurityError(response["error"])
+            raise SecurityError(response["error"], code=response.get("error_code"))
         result = response["result"]
         if op in ("setup", "unlock"):
             self.token = result["token"]
@@ -540,11 +540,21 @@ def serve(service: Service, path: Path):
                 result = service.handle(request)
                 response = {"result": result}
             except (SecurityError, engine.BroadcastError) as exc:
-                response = {"error": str(exc)}
+                response = {"error": str(exc), "error_code": getattr(exc, "code", None)}
             except Exception:
                 response = {"error": "Operation could not complete. Access remains restricted."}
             try:
-                self.wfile.write(json.dumps(response).encode() + b"\n")
+                payload = json.dumps(response).encode() + b"\n"
+                with service.mutex:
+                    if "result" in response and request["op"] not in ("status", "lock", "erase"):
+                        # Serialization can race a lock or logout. Recheck at delivery
+                        # and keep revocation serialized with the socket write.
+                        authorization = ({"token": result["token"]} if request["op"] in ("setup", "unlock") else request)
+                        try:
+                            service._authorized(authorization)
+                        except SecurityError as exc:
+                            payload = json.dumps({"error": str(exc), "error_code": exc.code}).encode() + b"\n"
+                    self.wfile.write(payload)
             except OSError:
                 pass
 

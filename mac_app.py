@@ -46,7 +46,7 @@ class App(tk.Tk):
             try:
                 value, error = client.call(operation, **values), None
             except SecurityError as exc:
-                value, error = None, str(exc)
+                value, error = None, exc
             self.responses.put((generation, callback, value, error))
         threading.Thread(target=work, daemon=True).start()
 
@@ -60,10 +60,10 @@ class App(tk.Tk):
                 continue
             if error:
                 self.auth_pending = False
-                if self.screen != "login" and ("Locked." in error or "service is unavailable" in error or "0 attempts remain" in error):
-                    self.show_login(error)
+                if self.screen != "login" and error.code in ("locked", "unavailable"):
+                    self.show_login(str(error))
                 else:
-                    self.notice.set(error)
+                    self.notice.set(str(error))
                 self.polling = False
                 if hasattr(self, "login_button") and self.screen == "login":
                     self.login_button.configure(state="normal")

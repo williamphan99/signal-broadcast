@@ -43,13 +43,16 @@ def dispatch_guard(root: Path):
 
 
 class SecurityError(Exception):
-    pass
+    def __init__(self, message: str, *, code: str | None = None):
+        self.code = code
+        super().__init__(message)
 
 
 class WrongPassword(SecurityError):
     def __init__(self, remaining: int):
         self.remaining = remaining
-        super().__init__(f"Incorrect password. {remaining} attempts remain.")
+        super().__init__(f"Incorrect password. {remaining} attempts remain.",
+                         code="locked" if remaining == 0 else None)
 
 
 def atomic_json(path: Path, value) -> None:
