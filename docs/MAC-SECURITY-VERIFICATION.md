@@ -102,6 +102,48 @@ native runs; these represent six distinct native integration tests plus the Tk t
 Obsolete disposable fixtures from failed runs were cleaned up. The user's default
 vault was not created, and no existing installation was migrated or erased.
 
+## Code-review follow-up, 4 September 2026
+
+Reviewed snapshot `0a84160` against `dd0597dac40513a3d32d69adbe06e5f681830b3a`
+along separate Standards and Spec axes. Focused fixes now cover:
+
+- Authorization revalidation when delivering pending snapshots and unlock results,
+  with a one-second write deadline so a stalled client cannot hold up locking for
+  the longer request-read timeout.
+- Revocation of authentication that finishes after the window closes, and explicit
+  error categories that clear the interface even when third-attempt erasure fails.
+- Confirmation that all non-zombie worker-group members exited before clearing the
+  recovery record. A timeout leaves cleanup pending.
+- Canonical daily schedule times, including migrated entries such as `9:0`.
+- Account-free process arguments for protected Sync and Notes. These operations
+  first verify one local account matching the saved configuration. Ambiguous stores
+  fail with a specific error. Broadcasting retains explicit account selection in
+  its private JSON-RPC request. The pinned
+  [signal-cli manual](https://github.com/AsamK/signal-cli/blob/v0.14.7/man/signal-cli.1.adoc#options)
+  documents omission of the CLI account argument only for a sole local account.
+
+Results in the isolated review worktree, before combining the separate simplify
+task's commits:
+
+| Check | Result |
+|---|---|
+| Normal suite | 308 discovered, 300 passed, 8 opt-in checks skipped; 16.698 seconds. |
+| Native Tk lifecycle | Passed login, manual lock, close, Cmd-Q, reopen, delayed unlock followed by close, and erasure; 2.936 seconds. |
+| Local socket backpressure | Passed actual stalled-reader timeout alongside five response/lifecycle checks; 2.341 seconds. |
+| Native process and launchd recovery | Two checks passed with disposable encrypted vaults, unique Keychain items, simulated Signal workers, and a temporary launchd job; 146.598 seconds. |
+| Focused regressions | Passed revoked pending responses, failed third-attempt teardown, group-exit timeout recovery, unpadded schedules, private command arguments, and ambiguous/mismatched account rejection. |
+| Diff checks | `git diff --check` passed. |
+
+The extra local socket check is opt-in:
+
+```sh
+SB_RUN_MAC_IPC=1 .venv/bin/python -m unittest discover -s tests -p test_mac_ipc.py
+```
+
+No Setup run, live Signal account access, migration of user data, or message sending
+was performed. Account-argument checks substitute all Signal subprocesses; they do
+not prove live Sync or Notes behavior. The native tests use only local simulators.
+
 ## Remaining acceptance gates
 
 These require hardware or a disposable Signal account and have not been claimed as
@@ -120,6 +162,10 @@ completed:
 5. Check linked, broken-link and unlinked legacy installations with disposable
    data through the actual installer and phone linking flow. Check Keychain prompts
    following an executable update.
+6. Check legacy stores with multiple local Signal accounts. Protected Sync and
+   Notes currently reject these stores explicitly; support that preserves a chosen
+   account through private RPC remains unimplemented. Do not treat migration of a
+   multi-account store as proof that these operations remain compatible.
 
 Do not use patient data for these gates. FileVault remains recommended. A mounted
 vault is accessible to the running service and the Mac user that owns it. Modified
