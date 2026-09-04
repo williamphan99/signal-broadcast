@@ -448,8 +448,8 @@ class Service:
                 return {"saved": True}
             if op == "schedule":
                 times = request["times"]
-                if request["enabled"]:
-                    engine.parse_times(times)
+                if request["enabled"] or times:
+                    times = [f"{entry['Hour']:02d}:{entry['Minute']:02d}" for entry in engine.parse_times(times)]
                 previous = self.schedule()
                 atomic_json(self.vault.data / "schedule.json", {
                     "enabled": bool(request["enabled"]), "times": times, "last": previous["last"],

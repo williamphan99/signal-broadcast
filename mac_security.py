@@ -368,9 +368,12 @@ class Vault:
             config = self.data / "config.toml"
             if config.exists() and not (self.data / "schedule.json").exists():
                 settings = tomllib.loads(config.read_text())
+                from engine import parse_times
+                times = settings.get("send_times", [])
+                times = [f"{entry['Hour']:02d}:{entry['Minute']:02d}" for entry in parse_times(times)] if times else []
                 atomic_json(self.data / "schedule.json", {
                     "enabled": bool(self.keychain.load().get("legacy_schedule_enabled")),
-                    "times": settings.get("send_times", []), "last": ""})
+                    "times": times, "last": ""})
             hashes = {str(p.relative_to(self.data)): digest(p) for p in regular_files(self.data)}
             receipt = {"sources": sources, "hashes": hashes}
             atomic_json(receipt_file, receipt)

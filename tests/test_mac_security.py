@@ -244,6 +244,15 @@ class SecurityTests(unittest.TestCase):
         self.service._event("error", "Network unavailable")
         self.assertEqual(self.service.status()["attempts_remaining"], 3)
 
+    def test_unpadded_schedule_times_execute_while_locked(self):
+        self.setup()
+        self.request("schedule", times=["9:0"], enabled=True)
+        self.assertEqual(self.service.schedule()["times"], ["09:00"])
+        self.request("lock")
+        with mock.patch.object(self.service, "_start_job") as start:
+            self.service.tick(datetime(2026, 9, 4, 9, 0))
+        start.assert_called_once_with("send")
+
     def test_safe_status_never_returns_personal_data_or_token(self):
         self.setup()
         status = json.dumps(self.service.status())
@@ -371,7 +380,7 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(unrelated.read_bytes(), b"must remain")
 
     def test_enabled_legacy_schedule_is_preserved(self):
-        (self.project / "config.toml").write_text('send_times = ["09:00"]\n')
+        (self.project / "config.toml").write_text('send_times = ["9:0"]\n')
         self.service.retire = lambda _: True
         self.setup()
         self.assertEqual(self.service.schedule(), {"enabled": True, "times": ["09:00"], "last": ""})
