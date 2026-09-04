@@ -183,9 +183,10 @@ def copy_import(source: Path, destination_dir: Path) -> tuple[Path, dict]:
         shutil.copyfileobj(src, dest)
         dest.flush()
         os.fsync(dest.fileno())
-    if identity(source) != before or digest(source) != digest(destination):
+    destination_hash = digest(destination)
+    if identity(source) != before or digest(source) != destination_hash:
         raise SecurityError("Import verification failed. The original was retained.")
-    return destination, {"source": str(source), "identity": before, "hash": digest(destination)}
+    return destination, {"source": str(source), "identity": before, "hash": destination_hash}
 
 
 def delete_original(receipt: dict) -> None:
