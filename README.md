@@ -1,349 +1,170 @@
 # Signal Broadcast
 
-Send one message (and optional images) to all your Signal groups, slowly enough
-to stay under Signal's rate limit. Runs on a Mac, linked to your phone as a
-secondary device — your number is **never re-registered**, so your phone stays
-logged in, exactly like Signal Desktop.
-
-It's a small app: a window with tabs — **Send**, **Notes**, **Groups**, **Schedule**.
-The same engine also runs from the command line for the automatic daily schedule.
-
----
-
-## Setting it up for someone (you, the installer)
-
-You install it once on their Mac, link their phone, and put it on their Dock. After
-that they only ever click one icon and type.
-
-1. **Clone the folder onto their Mac:**
-   ```bash
-   git clone https://github.com/williamphan99/signal-broadcast.git ~/signal-broadcast
-   ```
-   (Cloning — rather than downloading a zip — avoids macOS's "unidentified developer"
-   warning. See [Distribution notes](#distribution-notes).)
-2. **Double-click `Setup.command`** in that folder. It installs the requirements
-   (Homebrew, signal-cli, qrencode, python-tk), builds the Dock app, and opens the
-   window. First time only; it can take a few minutes and may ask for the Mac password.
-3. **Link the phone:** the window shows a QR code. On the phone, open
-   **Signal → Settings → Linked Devices → "+"** and scan it. The app pulls the group
-   list automatically. Done.
-4. **Pin it to the Dock** (see below) and hand it over.
-
-> **Keep the folder where it is.** The Dock app remembers this folder's location. If
-> you move or rename it later, just double-click `Setup.command` again to rebuild.
-
-### Pin it to the Dock
-
-1. Open the project folder in **Finder**.
-2. Drag **`Signal Broadcast.app`** onto the Dock (the left side, with your other apps).
-3. That's the daily button. Clicking it opens the window straight away — no Terminal,
-   nothing to type.
-
-If `Signal Broadcast.app` isn't there, run `Setup.command` once and it'll be built.
-
----
-
-## Using it day to day (the person sending)
-
-Click **Signal Broadcast** on the Dock. The window opens on the **Send** tab.
-
-- **Send tab** — type the message, optionally **Add images…**, then click the big blue
-  **Send to N groups** button. It asks you to confirm (showing the first line and how
-  long it'll take), then sends, showing progress and a live log. Anything that fails is
-  listed; **Resend failed** retries just those.
-  - **Photos** are listed by name in send order — `1. shop.jpg · 2. menu.jpg` — which
-    is the order they arrive in everyone's chat. Click **Reorder photos** to open the
-    thumbnails: **drag** one to move it, or select one and use **◀ Earlier / Later ▶ /
-    Remove**; double-click to see it full size. **Hide** puts them away again and keeps
-    the order. It opens by itself when you add photos and stays shut otherwise, so the
-    Send button and the activity log don't get pushed off the window.
-  - **Save for auto-send** stores the message for the daily schedule *without* sending
-    now — use it when you've set up automatic times (see Schedule).
-- **Notes tab** — whatever you write in Signal's **Note to Self** chat on your phone
-  shows up here, words and photos, ready to broadcast. Click **Check for new notes**
-  (it's a button, not a background poll), pick one, then **Use as message** — the text
-  lands in the Send tab and its photos load into the photo strip. **Copy text** and
-  **Delete** do what they say; deleting removes the copy on this Mac, never the note on
-  your phone. Only Note-to-Self items are added to this Notes list.
-  - Only notes that arrive *after* this Mac was linked can appear — Signal never sends
-    a linked device your older history.
-- **Groups tab** — tick the groups to send to; untick any to skip. Click **Save
-  selection**. Your choices stick even when you **Update list from phone**.
-- **Schedule tab** — turn on automatic daily sending at times you choose.
-
-That's the whole loop: open, type, **Send**.
-
-### Erasing the app's data
-
-The **Unlink…** button (top-right) signs this Mac out of Signal and erases
-everything *this app* stored locally — the link keys, signal-cli's cached
-groups/contacts, the group list, the message, the schedule, and any logs. It
-doesn't touch anything else on the Mac, and nothing personal is left behind. Use
-it before handing back a borrowed or shared Mac. Your phone isn't affected; to also
-drop this device from your account, remove it under
-**Signal → Settings → Linked Devices** on the phone.
-
-### Station mode (wipe if unplugged)
-
-For a Mac that lives plugged in at one spot. On the **Security** tab, **Arm station
-mode**. From then on:
-
-- The Mac must be **plugged in** to link — on battery you'll see "Plug in to continue".
-- **Unplugging** the power automatically runs the full wipe above, after a **10-second
-  grace** (plug back in within those 10 seconds to cancel). It only fires once the
-  unplugged reading is confirmed (a few seconds of debounce), so a momentary blip
-  won't trigger it.
-- After a wipe you must scan the QR to **link again**.
-
-It's enforced by a small background agent (`watcher.py`, run via launchd) that keeps
-working even if the app window is closed, and holds the Mac awake while plugged so it
-can notice an unplug. **Disarm** (or **Unlink…**) turns it off and removes the agent.
-
-> This is a deterrent, not full security — someone with time and physical access can
-> still image the disk. The real protection is **FileVault** (System Settings →
-> Privacy & Security → turn on disk encryption). Use station mode *with* FileVault,
-> not instead of it.
-
----
-
-## What it does about rate limits (the important part)
-
-Going too fast is what gets a Signal number flagged, so the defaults err slow.
-
-- Sends are spaced `base_delay_seconds` ± `jitter_seconds` apart (default ~16s, never
-  faster than 10s). **A full run to ~150 groups takes roughly 30–40 minutes** — by
-  design. The confirmation dialog shows the estimate before you commit.
-- A throttled send (Signal returns a rate-limit error) backs off exponentially
-  (30s → 60s → 120s …, capped at 5 min) and retries up to `max_retries` times,
-  honouring an explicit retry-after when Signal sends one.
-- Anything that still fails is written to `logs/failures-YYYY-MM-DD.txt` and shown
-  in the app — use **Resend failed** (or, on the CLI,
-  `python3 broadcast.py --groups logs/failures-YYYY-MM-DD.txt`).
-- **Cooldown guard:** `cooldown_hours` is the minimum gap between whole runs. A run
-  triggered too soon after the last one is skipped (the app asks first). This is
-  what makes multiple scheduled times per day safe from accidental double-sends.
-
-**Keep the Mac awake during a run.** A full send takes ~30 min; if the Mac
-idle-sleeps, sends stall. Keep it plugged in with the lid open. The scheduled run
-wraps itself in `caffeinate` to hold the Mac awake for the duration.
-
-All of this lives in **`config.toml`** — the one settings file:
-
-```toml
-account            = "+61XXXXXXXXX"   # set automatically when you link your phone
-base_delay_seconds = 16               # raise to go slower / safer
-jitter_seconds     = 6
-cooldown_hours     = 1                # minimum gap between runs
-max_retries        = 4
-send_times         = ["12:00", "16:00"]  # times the scheduler fires (see below)
-```
-
----
-
-## Running it automatically (optional)
-
-Two ways to run, with a real tradeoff:
-
-| | App (manual) | Scheduled |
-|---|---|---|
-| How | open from Dock, type, **Send** | fires at your `send_times` |
-| Pro | you watch it, eyeball the message first | hands-off |
-| Con | you must remember | Mac must be awake; you check logs after |
-
-**The easy way:** open the **Schedule** tab, enter your times (24-hour, e.g.
-`09:00, 13:30, 17:00`), and click **Turn on**. To change times later, edit them and
-click **Update times**; **Turn off** stops it. The schedule sends whatever message you
-last saved with **Send** or **Save for auto-send**, so set the message first.
-
-**What "scheduled" means on a laptop:** the Mac must be awake and logged in at each
-time. Asleep → the job runs at the next wake (still sends, just late). Powered off →
-that fire is skipped. You won't see live output; check `logs/`.
-
-> Sending the same message to ~150 groups several times a day is more flag-prone
-> than once a day. The pacing and cooldown are mitigations, not magic — fewer
-> fire-times is the safer choice.
-
----
-
-## Advanced / command line
-
-The CLI front end is handy for testing and is what the schedule runs:
-```bash
-python3 broadcast.py --limit 2 --dry-run   # show what would send, send nothing
-python3 broadcast.py --limit 2             # real send to the first 2 groups
-caffeinate -i python3 broadcast.py         # full run
-python3 broadcast.py --groups logs/failures-2026-06-26.txt   # resend failures
-```
-The Schedule tab manages launchd for you. To do it from the terminal instead:
-`python3 scripts/schedule.py` (prints the exact `launchctl` commands). One-time setup
-without the GUI: `bash scripts/link-device.sh`, then `bash scripts/pull-groups.sh`.
-
-To rebuild the Dock app by hand (e.g. after moving the folder):
-`bash scripts/make-dock-app.sh`.
-
----
-
-## Troubleshooting
-
-**"Send failed" — find the reason.** The app shows a short, safe category (e.g.
-*network or connection problem*, *attachment or upload problem*, *rate limited*) in the
-**Send** tab, and saves the activity to a plain-text log you can reopen later:
-```bash
-open ~/signal-broadcast/logs/                          # the logs folder
-cat  ~/signal-broadcast/logs/activity-$(date +%F).txt  # today's activity
-```
-(`.out`/`.err`/`.log` files have no default app — read them with `cat`, or
-`open -a TextEdit <file>`. `failures-*.txt` is just group IDs for "Resend failed", not
-error text, so it looks like random characters — that's normal.)
-
-**Images fail but text sends fine.** Attachments are uploaded to Signal's CDN
-(`cdn.signal.org`) — a different server than text uses — so a VPN, firewall, or
-antivirus that blocks or inspects that host breaks image sends while text still works.
-Check the CDN is reachable with `-k` — Signal serves its own pinned certificate
-(issuer "Signal Messenger LLC") that generic tools can't verify, so a cert/SSL error
-is **normal and not a block**; only a timeout or `000` means blocked:
-```bash
-curl -sk -m 8 -o /dev/null -w "%{http_code}\n" https://cdn.signal.org/
-```
-If it fails: turn the **VPN off** (or split-tunnel `*.signal.org`) and disable any
-antivirus "HTTPS/SSL scanning". JPEG/PNG are the most reliable formats; HEIC (the
-iPhone default) often won't display for non-Apple recipients.
-
-**See signal-cli's raw error** by sending a test to yourself (drop the `-a <image>`
-part to test text-only):
-```bash
-cd ~/signal-broadcast
-NUM="+61XXXXXXXXX"   # your number, WITH country code (set by hand — QR linking doesn't change it)
-signal-cli --config ./signal-cli-data -a "$NUM" send -m "test" -a /full/path/to/image.jpg "$NUM"
-```
-
-**Check config, groups, and attachment paths parse** (sends nothing):
-```bash
-cd ~/signal-broadcast && python3 broadcast.py --limit 2 --dry-run
-```
-
-**Capture the *raw* signal-cli error.** The Activity log only shows a safe category.
-To see the actual underlying error, turn on debug — it writes signal-cli's raw output
-(which can include group ids) to `logs/debug-*.txt`. Add this line to `config.toml`:
-```bash
-echo 'debug = true' >> ~/signal-broadcast/config.toml
-```
-Quit and reopen the app (or re-run the CLI), reproduce the failure, then read it:
-```bash
-cat ~/signal-broadcast/logs/debug-$(date +%F).txt
-```
-Set it back to `false` (or delete the line) when you're done — like all logs, it's
-erased on **Unlink** and on a station-mode unplug.
-
-### Diagnostic cheat sheet
-
-Run these from the project folder. Set `NUM` to your number once (with country code),
-then use whichever check you need.
-
-```bash
-cd ~/signal-broadcast
-
-# Your linked number (used by the commands below)
-NUM="+61XXXXXXXXX"   # your number, WITH country code (set by hand — QR linking doesn't change it)
-echo "linked as: ${NUM:-<not linked>}"
-
-# Is this device linked? (lists the linked account, or nothing)
-signal-cli --config ./signal-cli-data -o json listAccounts
-
-# How many groups does signal-cli itself know? (0 here = a sync/network issue, not the app)
-signal-cli --config ./signal-cli-data -a "$NUM" -o json listGroups | python3 -c 'import sys,json; print(len(json.load(sys.stdin)), "groups")'
-
-# Force a fresh sync from the phone, then recount (keep the phone unlocked + online)
-signal-cli --config ./signal-cli-data -a "$NUM" sendSyncRequest
-signal-cli --config ./signal-cli-data -a "$NUM" receive --timeout 20 >/dev/null
-signal-cli --config ./signal-cli-data -a "$NUM" -o json listGroups | python3 -c 'import sys,json; print(len(json.load(sys.stdin)), "groups")'
-
-# Can it reach Signal's servers? -k skips cert checks — Signal pins its own CA, so a
-# cert/SSL error is normal and NOT a block; only a timeout / 000 means blocked.
-#   chat = text, storage = groups, cdn/cdn2 = attachments
-for h in chat storage cdn cdn2; do curl -sk -m 8 -o /dev/null -w "$h: %{http_code}\n" "https://$h.signal.org/"; done
-
-# Send a test to yourself — text only, then with an image (shows the real error)
-signal-cli --config ./signal-cli-data -a "$NUM" send -m "test" "$NUM"
-signal-cli --config ./signal-cli-data -a "$NUM" send -m "test" -a /full/path/to/image.jpg "$NUM"
-
-# Dry run: confirm config + groups + attachment paths parse (sends nothing)
-python3 broadcast.py --limit 2 --dry-run
-
-# Read today's activity log (plain text); list everything in logs/
-cat ~/signal-broadcast/logs/activity-$(date +%F).txt
-open ~/signal-broadcast/logs/
-
-# Versions / where things are
-signal-cli --version
-which signal-cli qrencode python3
-```
-
-What the results mean:
-- **0 groups from `listGroups`** → the phone's sync didn't reach this Mac; check the
-  `storage.signal.org` line below and keep the phone unlocked + online while syncing.
-- **`storage`/`cdn` time out (`000`)** → a **VPN, firewall, or antivirus** is blocking
-  Signal's non-chat servers — that breaks group sync *and* image sends while text still
-  works. Turn the VPN off (or split-tunnel `*.signal.org`) / disable HTTPS scanning,
-  then re-sync with **Update list from phone**. (A cert/SSL error is **not** a block —
-  Signal uses its own pinned CA, which `-k` skips checking.)
-- **a send-to-yourself error mentioning timed-out / connection / upload** → same network
-  cause (a bare SSL/certificate complaint on its own is expected, not a fault).
-
----
-
-## Distribution notes
-
-`git clone` is the recommended way to hand this to someone, because it sidesteps
-Gatekeeper: macOS only nags about "unidentified developer" on files carrying the
-`com.apple.quarantine` flag, which is set on **downloaded** zips/DMGs — not on files
-that arrive via `git clone`. So a cloned `.command` just runs, and the
-`Signal Broadcast.app` that `Setup.command` builds locally isn't quarantined either.
-If someone downloads the repo as a **zip** instead, `Setup.command` clears the
-quarantine flag for them (`xattr -dr com.apple.quarantine .`).
-
-The Dock app is built on each machine (it bakes in that Mac's folder path and Python),
-so it isn't committed to the repo — `Setup.command` creates it.
-
----
-
-## Files
-| File | What it is |
+A local Mac app for sending a message and images to selected Signal groups. It links
+as a secondary device. Your phone remains the primary Signal device.
+
+The Mac version requires a password and stores its data in an encrypted vault on
+that Mac. Source code stays on GitHub. There is no app account, hosted backend,
+analytics, password-recovery server or cloud backup feature. Signal traffic and
+software downloads still use Signal and the software providers' services.
+
+For Pixel/Termux instructions, see [PIXEL-SETUP.md](PIXEL-SETUP.md). The Pixel web
+interface is separate and does **not** implement this Mac password protection.
+
+## Installation and upgrades
+
+1. Clone this repository to a folder you will keep on the Mac.
+2. Double-click **Setup.command**. It installs the dependencies, compiles the local
+   Keychain helper, installs the per-user background service and builds the Dock app.
+3. Set and confirm a password of at least 12 characters. Spaces and paste work.
+4. Scan the QR code from Signal on your phone under **Settings → Linked Devices**.
+5. Drag **Signal Broadcast.app** to the Dock.
+
+Existing installations must also set a password. Setup does not silently encrypt or
+wipe their data. After password setup, migration copies the existing Signal store,
+notes, drafts, group choices and logs into the vault, verifies the encrypted copy by
+reopening it, then removes the old copies. A valid link is preserved. Previously
+attached original files also move into protected storage.
+
+If migration cannot finish, normal access remains blocked and the originals needed
+for recovery are retained. Restore any missing attachments and unlock again to
+retry. Do not delete your old files manually while migration is incomplete.
+
+Keep the clone in its original location. If you move it, run Setup again. Update
+with `git pull --ff-only`, then run Setup. Setup restarts the background service;
+finish active broadcasts before upgrading. Unlock after the restart and review any
+interrupted broadcast before resuming it.
+
+## Locking, closing and erasing
+
+There is **no inactivity timer**. The app stays unlocked during and after sending
+until you lock it, close the window, or lock the Mac screen.
+
+| Action | What happens |
 |---|---|
-| `Setup.command` | double-click once: install requirements, link phone, build the Dock app |
-| `Signal Broadcast.app` | the Dock app (built locally by Setup; not in git) |
-| `Signal Broadcast.command` | fallback launcher if you'd rather not use the Dock app |
-| `gui.py` | the app window (Tkinter) |
-| `broadcast.py` | command-line front end (used by the schedule) |
-| `engine.py` | shared core: loop, pacing, retry, failure ledger |
-| `watcher.py` | station-mode background agent: wipes everything if unplugged |
-| `config.example.toml` | settings template (committed; no personal data) |
-| `config.toml` | your live settings — number, pacing, schedule (created from the template on setup; not in git) |
-| `message.txt` | the message body (the app saves it on Send; safe to hand-edit) |
-| `attachments.txt` | image paths (managed by the app; safe to hand-edit) |
-| `groups.txt` | your group list; comment out a line to skip a group |
-| `scripts/make-dock-app.sh` | builds `Signal Broadcast.app` |
-| `scripts/schedule.py` | generates the launchd schedule from `send_times` |
-| `scripts/link-device.sh`, `scripts/pull-groups.sh` | CLI-only setup helpers |
-| `signal-cli-data/` | link keys — **never commit or share this** |
-| `logs/` | run logs and failure ledgers |
+| **Lock now** | Hide the interface and require the password. Background work continues. |
+| Close window or Cmd-Q | Close and lock the interface. Background work continues. |
+| Reopen | Require the password before showing any account details or content. |
+| Lock the Mac | Lock the app interface. Background work can continue while the Mac is awake. |
+| Sleep | macOS pauses execution. No data is erased. |
+| Mac logout, reboot or service restart | Keep encrypted data; require an initial password unlock before sending resumes. |
+| **Log out and erase** | After confirmation, stop broadcasts and schedules and erase this installation's data. |
+| Third consecutive wrong password | Automatically perform the same erasure. |
 
-> `config.toml`, `signal-cli-data/`, `groups.txt`, `message.txt`, `attachments.txt`,
-> `logs/`, the built `.app`, and the generated plist are all `.gitignore`d — your
-> number, groups, and message never get committed. Only the placeholder
-> `config.example.toml` is in git.
+**Log out and erase** is available on the password screen and in Security settings.
+It does not require the password. A person who can reach this screen can deliberately
+erase the installation. There is no way to recover an erased vault through this app.
 
----
+Successful authentication resets the attempt count. Wrong current passwords in
+**Change password** also count. Network errors, cancelled prompts and mismatched
+new-password confirmations do not count. Restarting the app does not reset failures.
 
-## Responsible use
+The old wipe-on-quit and unplug-to-wipe controls are retired. Migration removes their
+old background jobs. Unplugging the Mac no longer erases data.
 
-This automates sending to many Signal groups, which is in tension with Signal's terms
-(bulk/automated messaging). Keep it slow, prefer once a day over many times, only send
-to groups that expect your messages, and don't use it to spam. You are responsible for
-how you use it.
+## Sending and schedules
+
+- **Send**: compose a message, move images into the vault, reorder them and confirm
+  the send. Locking or closing the window does not stop it.
+- **Notes**: check Signal's Note to Self, select a note and use its text and complete
+  attachments as the draft. Deleting a note removes only the local copy.
+- **Groups**: refresh the list, toggle selected groups and save the selection.
+- **Schedule**: save daily times and enable background sends of the saved draft.
+- **Security**: change the password, lock, erase, clear logs or adjust sending pace.
+
+Importing images is a **move**, not just an attachment reference. The app explains
+this before import, copies and verifies each image, then deletes its selected
+original. If verification or deletion fails, it reports an incomplete import.
+Historical backups and other copies of that original are not erased.
+
+Scheduled sending works while the interface is locked or closed, provided the Mac
+is awake and the background service has been unlocked once since its last start.
+Missed schedule slots are not replayed after restarting the service. An unfinished
+broadcast blocks a new scheduled broadcast until it is reviewed. **Resume remaining**
+excludes messages with uncertain delivery, avoiding automatic duplicate sends.
+
+Stopping or erasing cannot recall messages already dispatched to Signal. After a
+sleep, network interruption or stopped job, review uncertain outcomes before sending
+those messages again.
+
+Sending is paced to reduce rate-limit failures. Signal can still rate-limit or
+restrict automated sending. Send only to groups expecting the messages.
+
+## What is protected
+
+The vault is at `~/Library/Application Support/Signal Broadcast/data.sparsebundle`.
+It contains the Signal credentials and databases, account number, groups, notes,
+drafts, images, logs and temporary media. The checkout contains source code and
+installed dependencies, not the migrated account's runtime files.
+
+The image uses AES-256 encryption. A random vault password is wrapped with AES-GCM
+using an Argon2id-derived key. The wrapped material and attempt state live in the
+local file-based Mac Keychain without iCloud synchronization. The user password and
+unwrapped vault password are not saved. The app excludes its storage from Time
+Machine and its vault from Spotlight indexing.
+
+The background service retains decrypted access while it runs. **Lock now is an
+interface lock**, not a sealed storage state. Full sealing happens when that service
+stops and detaches the vault. After erasure the service restarts with a fresh process.
+
+Keep FileVault enabled. This source-built app is not an OS sandbox, a hardware retry
+counter or a replacement for GrapheneOS security. Modified code, a compromised Mac,
+restored backups and other copies remain outside its guarantees. Do not treat file
+deletion as proof that historical SSD remnants or backups are unrecoverable.
+
+Erasure removes this installation's credentials and app data. To remove its entry
+from your account too, use **Signal → Settings → Linked Devices** on your phone.
+Your primary account and messages on other devices are unaffected.
+
+## Terminal and troubleshooting
+
+The protected terminal client prompts for the app password:
+
+```sh
+.venv/bin/python mac_cli.py --dry-run
+.venv/bin/python mac_cli.py --sync
+.venv/bin/python mac_cli.py --notes
+.venv/bin/python mac_cli.py --resume
+```
+
+With no flag, it asks for confirmation before sending the saved draft. Unattended
+CLI invocation is blocked; use the authenticated app's saved schedule. Old Mac
+linking and group-sync helpers route through this client. The unauthenticated web
+interface is disabled on Mac.
+
+If the local service is unavailable, run Setup again. If Keychain denies access,
+resolve the Mac Keychain prompt or permissions first. Such failures do not count as
+wrong app passwords. The source-built Keychain helper may require a new Mac approval
+after an update changes its executable.
+
+An incomplete wipe remains blocked and can be retried with **Log out and erase**.
+The app must not report erasure as complete while cleanup has failed.
+
+## Development and verification
+
+The Mac virtual environment needs Tk and the pinned dependency in
+`requirements-macos.txt`. The Swift helper uses Apple's Security and AppKit APIs.
+
+```sh
+.venv/bin/python -m unittest discover -s tests
+SB_RUN_MAC_UI=1 .venv/bin/python -m unittest discover -s tests -p test_mac_ui.py
+SB_RUN_MAC_INTEGRATION=1 .venv/bin/python -m unittest discover -s tests -p test_mac_integration.py
+SB_RUN_MAC_INTEGRATION=1 SB_LONG_IDLE_SECONDS=310 .venv/bin/python -m unittest discover -s tests -p test_mac_integration.py
+```
+
+The normal suite uses disposable files and mocked OS vault operations for policy
+checks. The opt-in Mac suite creates real temporary encrypted images and uniquely
+named test-only Keychain items. Its sending transport is a disposable process, not
+a live Signal account. The long check waits over five minutes both during and after
+a job. Real Signal delivery, physical screen-lock/sleep behaviour and Intel testing
+must be reported separately from these checks.
+
+See [the implementation and acceptance record](docs/MAC-SECURITY-VERIFICATION.md)
+for coverage, actual results and outstanding hardware/account checks.
+
+Never test erasure against a real patient's data. Never commit or share Signal
+credentials, a vault, its Keychain items, or legacy runtime files.
 
 ## License
 
-[MIT](LICENSE) © William Phan. Do whatever you like with it; no warranty.
-</content>
-</invoke>
+MIT. See [LICENSE](LICENSE).

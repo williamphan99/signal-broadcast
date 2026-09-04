@@ -104,5 +104,17 @@ class ConfirmTests(unittest.TestCase):
                         "no confirmation -> reported as a client timeout (uncertain)")
 
 
+
+# These tests must never use the installer's live Signal store.
+from runtime import isolated_engine
+
+def setUpModule():
+    global _runtime
+    _runtime = isolated_engine()
+    _runtime.__enter__()
+
+def tearDownModule():
+    _runtime.__exit__(None, None, None)
+
 if __name__ == "__main__":
     unittest.main()

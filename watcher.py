@@ -106,6 +106,8 @@ def _make_caffeinate_controller() -> Callable[[bool], None]:
 
 
 def main() -> None:
+    if engine.IS_DARWIN:
+        return  # Retired: unplugging must never erase the protected Mac installation.
     PowerWatcher(
         on_ac=engine.on_ac_power, is_linked=engine.is_linked, wipe=engine.unlink,
         set_awake=_make_caffeinate_controller(),

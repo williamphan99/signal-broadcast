@@ -4,6 +4,9 @@
 # exactly like linking Signal Desktop.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+if [ "$(uname -s)" = Darwin ]; then
+  exec .venv/bin/python mac_cli.py --link
+fi
 
 command -v signal-cli >/dev/null || { echo "Install signal-cli first: brew install signal-cli" >&2; exit 1; }
 command -v qrencode   >/dev/null || { echo "Install qrencode first: brew install qrencode" >&2; exit 1; }

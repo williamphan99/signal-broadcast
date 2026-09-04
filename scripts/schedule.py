@@ -14,6 +14,8 @@ import engine  # noqa: E402
 
 
 def main() -> None:
+    if sys.platform == "darwin":
+        raise engine.BroadcastError("Configure the protected schedule in the Mac app's Schedule tab.")
     cfg = engine.load_config()
     dest = engine.write_plist(cfg.send_times, dest=engine.LOCAL_PLIST)
     times = ", ".join(cfg.send_times)

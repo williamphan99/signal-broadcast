@@ -11,8 +11,7 @@ echo
 # (Folders from 'git clone' are not quarantined, so this is usually a no-op.)
 xattr -dr com.apple.quarantine . 2>/dev/null || true
 
-# Your settings live in config.toml (gitignored); seed it from the template once.
-[ -f config.toml ] || cp config.example.toml config.toml
+# Existing local settings are migrated only after password setup in the app.
 
 # 1. Homebrew (the macOS package installer)
 if ! command -v brew >/dev/null 2>&1; then
@@ -92,6 +91,12 @@ fi
 
 echo
 echo "Building the Dock app…"
+launchctl bootout "gui/$(id -u)/com.user.signal-broadcast.service" >/dev/null 2>&1 || true
+"$PY" -m venv .venv || exit 1
+.venv/bin/python -m pip install --disable-pip-version-check -r requirements-macos.txt || exit 1
+swiftc scripts/mac-security.swift -o vendor/mac-security || exit 1
+.venv/bin/python scripts/install-mac-service.py || exit 1
+PY="$PWD/.venv/bin/python"
 bash scripts/make-dock-app.sh "$PY" \
   || echo "(Couldn't build the Dock app — you can still open 'Signal Broadcast.command'.)"
 

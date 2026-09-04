@@ -38,3 +38,4 @@ vendor/
 webui-uploads/
 
 __pycache__/
+.venv/

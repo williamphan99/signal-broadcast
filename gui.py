@@ -2270,4 +2270,10 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    if sys.platform == "darwin":
+        python = Path(__file__).resolve().parent / ".venv/bin/python"
+        if not python.exists():
+            raise SystemExit("Run Setup.command to install Mac password protection first.")
+        os.execv(str(python), [str(python), str(Path(__file__).with_name("mac_app.py"))])
+    else:
+        App().mainloop()

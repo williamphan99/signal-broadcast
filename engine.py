@@ -27,7 +27,7 @@ import sys
 import threading
 import time
 import tomllib
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -39,12 +39,16 @@ from typing import Callable, Iterable, Iterator
 # (Dock app, launchd schedule, station-mode watcher, pmset) only runs when this is True;
 # elsewhere the portable CLI core (engine send loop + broadcast.py) is what's used.
 IS_DARWIN = sys.platform == "darwin"
+PRIVATE_TRANSPORT = False  # Enabled only by the protected Mac worker.
+DISPATCH_GUARD = nullcontext
 
 # Everything resolves relative to this file, so behaviour is identical whether a
 # human, a launcher, or launchd starts it from an arbitrary working directory.
 PROJECT_DIR = Path(__file__).resolve().parent
-DATA_DIR = PROJECT_DIR / "signal-cli-data"
-LOGS_DIR = PROJECT_DIR / "logs"
+RUNTIME_DIR = (Path.home() / "Library/Application Support/Signal Broadcast/unavailable"
+               if IS_DARWIN else PROJECT_DIR)
+DATA_DIR = RUNTIME_DIR / "signal-cli-data"
+LOGS_DIR = RUNTIME_DIR / "logs"
 LAST_RUN_FILE = LOGS_DIR / "last-run.txt"
 LAST_SEND_FILE = LOGS_DIR / "last-send.json"  # counts-only summary for the UI
 # Keep the historical filename so an older scheduler and a newly updated GUI still
@@ -53,19 +57,19 @@ LAST_SEND_FILE = LOGS_DIR / "last-send.json"  # counts-only summary for the UI
 SIGNAL_CLI_LOCK_FILE = LOGS_DIR / "sending.lock"
 SEND_LOCK_FILE = SIGNAL_CLI_LOCK_FILE          # compatibility for callers/tests
 RUN_PROGRESS_FILE = LOGS_DIR / "run-progress.json"  # in-flight run, for crash resume
-CONFIG_FILE = PROJECT_DIR / "config.toml"          # per-user (holds the number); gitignored
+CONFIG_FILE = RUNTIME_DIR / "config.toml"
 CONFIG_EXAMPLE_FILE = PROJECT_DIR / "config.example.toml"  # tracked template
-GROUPS_FILE = PROJECT_DIR / "groups.txt"
-GROUPS_LOCK_FILE = PROJECT_DIR / "groups.lock"
-GROUP_PERMISSIONS_FILE = PROJECT_DIR / "group-permissions.json"
-MESSAGE_FILE = PROJECT_DIR / "message.txt"
-ATTACHMENTS_FILE = PROJECT_DIR / "attachments.txt"
+GROUPS_FILE = RUNTIME_DIR / "groups.txt"
+GROUPS_LOCK_FILE = RUNTIME_DIR / "groups.lock"
+GROUP_PERMISSIONS_FILE = RUNTIME_DIR / "group-permissions.json"
+MESSAGE_FILE = RUNTIME_DIR / "message.txt"
+ATTACHMENTS_FILE = RUNTIME_DIR / "attachments.txt"
 
 # Bumped by hand on a meaningful change, so the UI can show which build is running
 # (e.g. to confirm a machine actually pulled the latest code). app_version() appends
 # the short git commit when available, so every push is distinguishable even if this
 # number isn't bumped.
-APP_VERSION = "1.21.13"
+APP_VERSION = "2.0.0"
 
 
 @dataclass(frozen=True)
@@ -441,7 +445,8 @@ def set_config_value(key: str, value: bool | int | float | str) -> None:
     CONFIG_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def read_message(path: Path = MESSAGE_FILE) -> str:
+def read_message(path: Path | None = None) -> str:
+    path = path or MESSAGE_FILE
     if not path.exists():
         raise BroadcastError(f"Missing message file: {path.name}")
     text = path.read_text(encoding="utf-8").strip()
@@ -450,9 +455,10 @@ def read_message(path: Path = MESSAGE_FILE) -> str:
     return text
 
 
-def read_attachments(path: Path = ATTACHMENTS_FILE) -> list[str]:
+def read_attachments(path: Path | None = None) -> list[str]:
     """One image path per line; blanks and # comments ignored. Raises if a listed
     file is missing so we never blast every group with a broken image."""
+    path = path or ATTACHMENTS_FILE
     if not path.exists():
         return []
     resolved: list[str] = []
@@ -469,11 +475,13 @@ def read_attachments(path: Path = ATTACHMENTS_FILE) -> list[str]:
     return resolved
 
 
-def write_message(text: str, path: Path = MESSAGE_FILE) -> None:
+def write_message(text: str, path: Path | None = None) -> None:
+    path = path or MESSAGE_FILE
     path.write_text(text.strip() + "\n", encoding="utf-8")
 
 
-def write_attachments(paths: list[str], path: Path = ATTACHMENTS_FILE) -> None:
+def write_attachments(paths: list[str], path: Path | None = None) -> None:
+    path = path or ATTACHMENTS_FILE
     header = (
         "# One image path per line. Lines starting with # are ignored.\n"
         "# Managed by the app, but safe to hand-edit.\n"
@@ -1490,9 +1498,9 @@ def _unsendable_groups_unlocked(account: str) -> set[str]:
 # note's destination is me. So a transcript counts as a note only when its destination
 # is positively our own account, and nothing else about a non-note envelope is parsed,
 # stored, or logged — not the text, not the recipient.
-NOTES_FILE = PROJECT_DIR / "notes.json"
-NOTES_CORRUPT_FILE = PROJECT_DIR / "notes.corrupt.json"   # a file we couldn't parse
-NOTES_LOCK_FILE = PROJECT_DIR / "notes.lock"
+NOTES_FILE = RUNTIME_DIR / "notes.json"
+NOTES_CORRUPT_FILE = RUNTIME_DIR / "notes.corrupt.json"
+NOTES_LOCK_FILE = RUNTIME_DIR / "notes.lock"
 # Notes are written from two places at once: the group sync keeps what it sees from a
 # worker thread while the window can delete or store on the main one. Both do
 # read-modify-write, so without this a delete could resurrect a note, or a note landing
@@ -1909,6 +1917,14 @@ def _send_one(binary: str, account: str, group_id: str, message: str,
               attachments: list[str],
               text_styles: list[str] | None = None) -> tuple[bool, bool, str]:
     """Send to one group. Returns (ok, throttled, stderr)."""
+    if PRIVATE_TRANSPORT:
+        # The legacy fallback puts the message in argv. Mac retries must keep
+        # payloads on private stdin even when a previous daemon has stopped.
+        daemon = SignalCliDaemon(account)
+        try:
+            return daemon.send(group_id, message, attachments, text_styles)
+        finally:
+            daemon.close()
     cmd = _cli(binary, "-a", account, "--config", str(DATA_DIR),
                "send", "-g", group_id, "-m", message)
     if attachments:
@@ -1947,7 +1963,8 @@ class SignalCliDaemon:
         # so the version probe below times out and we drop to the slower per-send
         # path. We only ever send, never receive, so we don't need it; signal-cli
         # still connects on demand for each send.
-        cmd = _cli(binary, "-a", account, "--config", str(DATA_DIR),
+        self._private_account = account if PRIVATE_TRANSPORT else None
+        cmd = _cli(binary, *([] if PRIVATE_TRANSPORT else ["-a", account]), "--config", str(DATA_DIR),
                    "jsonRpc", "--receive-mode", "manual")
         # Capture stderr (was DEVNULL): when startup fails we need signal-cli's own
         # words — "account is already in use", an auth error, a connect failure —
@@ -2046,11 +2063,13 @@ class SignalCliDaemon:
             mid = self._next_id
             box: queue.Queue = queue.Queue(maxsize=1)
             self._pending[mid] = box
+        if getattr(self, "_private_account", None) and method != "version":
+            params = {**params, "account": self._private_account}
         line = json.dumps({"jsonrpc": "2.0", "method": method,
                            "params": params, "id": mid}) + "\n"
         try:
             assert self._proc.stdin is not None
-            with self._write_lock:  # one whole request line at a time — no interleaving
+            with self._write_lock, DISPATCH_GUARD():
                 self._proc.stdin.write(line)
                 self._proc.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
@@ -2145,6 +2164,14 @@ class SignalCliDaemon:
             self._proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             self._proc.kill()
+            self._proc.wait(timeout=3)
+        for name in ("_reader", "_stderr_reader"):
+            reader = getattr(self, name, None)
+            if isinstance(reader, threading.Thread):
+                reader.join(timeout=1)
+        for stream in (self._proc.stdout, self._proc.stderr):
+            if stream:
+                stream.close()
 
 
 def _throttle_wait(attempt: int, stderr: str) -> float:
@@ -2529,11 +2556,19 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
                         record_group_progress(gid, status)  # persisted now — crash-recoverable
                     advance(pos, name, status, secs)
 
-            workers = [threading.Thread(target=worker, daemon=True) for _ in range(K)]
+            errors = []
+            def guarded_worker():
+                try:
+                    worker()
+                except Exception as exc:
+                    errors.append(exc)
+            workers = [threading.Thread(target=guarded_worker, daemon=True) for _ in range(K)]
             for w in workers:
                 w.start()
             for w in workers:
                 w.join()
+            if errors:
+                raise errors[0]
 
         try:
             on_log(f"Broadcasting to {total} groups | {len(attachments)} attachment(s) | "
@@ -2653,7 +2688,15 @@ def begin_run_progress(groups: list[tuple[str, str]], fingerprint: str) -> None:
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     data = {"at": datetime.now().isoformat(timespec="seconds"), "fp": fingerprint,
             "groups": [g for g, _ in groups], "done": {}}
-    RUN_PROGRESS_FILE.write_text(json.dumps(data), encoding="utf-8")
+    _write_run_progress(data)
+
+
+def _write_run_progress(data):
+    if PRIVATE_TRANSPORT:
+        from mac_security import atomic_json
+        atomic_json(RUN_PROGRESS_FILE, data)
+    else:
+        RUN_PROGRESS_FILE.write_text(json.dumps(data), encoding="utf-8")
 
 
 def record_group_progress(group_id: str, status: str) -> None:
@@ -2662,11 +2705,15 @@ def record_group_progress(group_id: str, status: str) -> None:
     try:
         data = json.loads(RUN_PROGRESS_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
+        if PRIVATE_TRANSPORT:
+            raise BroadcastError("Broadcast progress is unreadable. Sending stopped.")
         return
     data.setdefault("done", {})[group_id] = status
     try:
-        RUN_PROGRESS_FILE.write_text(json.dumps(data), encoding="utf-8")
+        _write_run_progress(data)
     except OSError:
+        if PRIVATE_TRANSPORT:
+            raise BroadcastError("Could not persist broadcast progress. Sending stopped.")
         pass
 
 
@@ -2701,6 +2748,8 @@ def read_interrupted_run() -> InterruptedRun | None:
     try:
         data = json.loads(RUN_PROGRESS_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
+        if PRIVATE_TRANSPORT:
+            raise BroadcastError("Interrupted progress is unreadable. Review or discard it before sending.")
         return None
     # "groups" is a flat list of opaque ids (no names on disk); names aren't needed to
     # resume — the resend is keyed by id, and the UI shows counts, not names.

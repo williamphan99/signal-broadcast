@@ -36,6 +36,9 @@ def _cfg(**over):
 @unittest.skipUnless(HAVE_FLASK, "Flask not installed (installed in the Debian guest)")
 class WebUITests(unittest.TestCase):
     def setUp(self):
+        platform = mock.patch.object(engine, "IS_DARWIN", False)
+        platform.start()
+        self.addCleanup(platform.stop)
         self.state = webui._State()
         self.app = webui.create_app(self.state)
         self.c = self.app.test_client()
@@ -708,6 +711,18 @@ class WebUITests(unittest.TestCase):
                         headers={"Origin": "http://127.0.0.1:8787"})
         self.assertTrue(r.get_json()["ok"])
 
+
+
+# These tests must never use the installer's live Signal store.
+from runtime import isolated_engine
+
+def setUpModule():
+    global _runtime
+    _runtime = isolated_engine()
+    _runtime.__enter__()
+
+def tearDownModule():
+    _runtime.__exit__(None, None, None)
 
 if __name__ == "__main__":
     unittest.main()

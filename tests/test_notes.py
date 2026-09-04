@@ -619,5 +619,17 @@ class NotesSurviveTheGroupSync(unittest.TestCase):
         engine._save_notes_seen_during(envelope(note("x")))   # must not raise
 
 
+
+# These tests must never use the installer's live Signal store.
+from runtime import isolated_engine
+
+def setUpModule():
+    global _runtime
+    _runtime = isolated_engine()
+    _runtime.__enter__()
+
+def tearDownModule():
+    _runtime.__exit__(None, None, None)
+
 if __name__ == "__main__":
     unittest.main()

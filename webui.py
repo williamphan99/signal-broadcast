@@ -175,6 +175,8 @@ def create_app(state: _State | None = None) -> Flask:
     # and reads of the live link URI from a cross-site page.
     @app.before_request
     def _guard_local_only():
+        if engine.IS_DARWIN:
+            return jsonify(error="Use the password-protected Mac app. The web interface is Pixel-only."), 403
         if not _local_request(request.host, request.headers.get("Origin")):
             return jsonify(error="Forbidden: this server only answers the phone's own "
                                  "browser (localhost)."), 403

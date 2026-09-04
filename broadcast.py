@@ -160,4 +160,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if sys.platform == "darwin":
+        import os
+        python = Path(__file__).resolve().parent / ".venv/bin/python"
+        if not python.exists():
+            raise SystemExit("Run Setup.command first. Mac sending requires password authentication.")
+        os.execv(str(python), [str(python), str(Path(__file__).with_name("mac_cli.py")), *sys.argv[1:]])
     raise SystemExit(main())

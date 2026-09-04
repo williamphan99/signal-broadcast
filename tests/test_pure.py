@@ -850,5 +850,17 @@ class BundledBinaryTests(unittest.TestCase):
                 self.assertIsNone(engine._jvm_signal_cli())
 
 
+
+# These tests must never use the installer's live Signal store.
+from runtime import isolated_engine
+
+def setUpModule():
+    global _runtime
+    _runtime = isolated_engine()
+    _runtime.__enter__()
+
+def tearDownModule():
+    _runtime.__exit__(None, None, None)
+
 if __name__ == "__main__":
     unittest.main()

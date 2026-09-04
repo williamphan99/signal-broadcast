@@ -625,5 +625,17 @@ class ConcurrentSendTests(unittest.TestCase):
         self.assertTrue(all(r.ok for r in res))
 
 
+
+# These tests must never use the installer's live Signal store.
+from runtime import isolated_engine
+
+def setUpModule():
+    global _runtime
+    _runtime = isolated_engine()
+    _runtime.__enter__()
+
+def tearDownModule():
+    _runtime.__exit__(None, None, None)
+
 if __name__ == "__main__":
     unittest.main()

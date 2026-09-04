@@ -4,6 +4,9 @@
 # app does, so the result is identical to the GUI's "Refresh groups".
 set -euo pipefail
 cd "$(dirname "$0")/.."
+if [ "$(uname -s)" = Darwin ]; then
+  exec .venv/bin/python mac_cli.py --sync
+fi
 
 # Don't hard-check `signal-cli` on PATH: on Android it's the vendored JVM build under
 # vendor/ (found by engine.signal_cli_bin(), not on PATH). The engine raises a clear
