@@ -78,16 +78,18 @@ def run(request):
     elif kind in ("send", "resume"):
         cfg = engine.load_config()
         groups = engine.read_groups()
+        message = engine.read_message()
+        attachments = engine.read_attachments()
         if kind == "resume":
             interrupted = engine.read_interrupted_run()
             if not interrupted:
                 raise engine.BroadcastError("There is no interrupted broadcast to resume.")
-            fingerprint = engine.message_fingerprint(engine.read_message(), engine.read_attachments())
+            fingerprint = engine.message_fingerprint(message, attachments)
             if interrupted.fingerprint != fingerprint:
                 raise engine.BroadcastError("Draft changed. Discard the interrupted run before a new send.")
             groups = interrupted.remaining
-        results = engine.broadcast(config=cfg, groups=groups, message=engine.read_message(),
-            attachments=engine.read_attachments(), on_log=lambda text: emit("log", text),
+        results = engine.broadcast(config=cfg, groups=groups, message=message,
+            attachments=attachments, on_log=lambda text: emit("log", text),
             should_stop=lambda: (root.parents[1] / "erase.json").exists(),
             on_progress=lambda done, total, name, status, seconds: emit("progress", {
                 "done": done, "total": total, "status": status}))

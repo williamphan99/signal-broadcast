@@ -398,6 +398,32 @@ class SecurityTests(unittest.TestCase):
                 engine.record_group_progress("group", "attempting")
         self.assertEqual(engine.read_interrupted_run().remaining, [("group", "")])
 
+    def test_resume_dispatches_the_draft_that_passed_fingerprint_verification(self):
+        from mac_worker import run
+
+        self.setup()
+        engine.CONFIG_FILE.write_text('account = "+19999999999"\n')
+        engine.GROUPS_FILE.write_text("group\tTest group\n")
+        engine.write_message("Verified draft")
+        photo = self.vault.data / "photo.png"
+        photo.write_bytes(b"disposable image")
+        engine.write_attachments([str(photo)])
+        fingerprint = engine.message_fingerprint
+        engine.begin_run_progress([("group", "Test group")], fingerprint("Verified draft", [str(photo)]))
+
+        def verify_then_replace(message, attachments):
+            result = fingerprint(message, attachments)
+            engine.write_message("Changed after verification")
+            engine.write_attachments([])
+            return result
+
+        with mock.patch.object(Path, "is_mount", return_value=True), mock.patch.dict(os.environ), \
+             mock.patch.object(engine, "message_fingerprint", side_effect=verify_then_replace), \
+             mock.patch.object(engine, "broadcast", return_value=[]) as broadcast, mock.patch("mac_worker.emit"):
+            run({"root": str(self.vault.data), "job": "resume"})
+        self.assertEqual(broadcast.call_args.kwargs["message"], "Verified draft")
+        self.assertEqual(broadcast.call_args.kwargs["attachments"], [str(photo)])
+
     def test_clock_rollback_does_not_repeat_a_consumed_schedule(self):
         self.setup()
         self.request("schedule", times=["09:00", "09:10"], enabled=True)
