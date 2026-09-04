@@ -22,6 +22,8 @@ class App(tk.Tk):
         self.geometry("760x780")
         self.minsize(620, 650)
         self.responses = queue.Queue()
+        self.closing = threading.Event()
+        self.authentication = None
         self.generation = 0
         self.sequence = 0
         self.polling = False
@@ -40,15 +42,26 @@ class App(tk.Tk):
 
     def request(self, operation, callback=None, **values):
         generation, token = self.generation, self.client.token
+        client = Client(self.client.root)
+        client.token = token
+        authenticating = operation in ("setup", "unlock")
+        if authenticating:
+            self.authentication = client
         def work():
-            client = Client(self.client.root)
-            client.token = token
             try:
                 value, error = client.call(operation, **values), None
             except SecurityError as exc:
                 value, error = None, exc
+            if self.closing.is_set() or generation != self.generation:
+                if authenticating and client.token:
+                    try:
+                        client.call("lock")
+                    except SecurityError:
+                        pass
+                return
             self.responses.put((generation, callback, value, error))
-        threading.Thread(target=work, daemon=True).start()
+        # Finish revoking an in-flight authentication even after the window quits.
+        threading.Thread(target=work, daemon=not authenticating).start()
 
     def drain(self):
         while True:
@@ -73,6 +86,11 @@ class App(tk.Tk):
 
     def clear(self):
         self.generation += 1
+        while True:
+            try:
+                self.responses.get_nowait()
+            except queue.Empty:
+                break
         for child in self.winfo_children():
             if isinstance(child, tk.Toplevel):
                 child.destroy()
@@ -430,9 +448,12 @@ class App(tk.Tk):
                 "Linked Devices on your phone if it is still listed."), confirmed=True)
 
     def close(self):
-        if self.client.token:
+        self.closing.set()
+        self.generation += 1
+        tokens = {client.token for client in (self.client, self.authentication) if client and client.token}
+        for token in tokens:
             client = Client(self.client.root, timeout=5)
-            client.token = self.client.token
+            client.token = token
             try:
                 client.call("lock")
             except SecurityError:

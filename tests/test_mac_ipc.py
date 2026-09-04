@@ -81,3 +81,49 @@ class ResponseRevocationTests(unittest.TestCase):
                 app.responses.put((0, None, None, SecurityError("Reworded explanation", code=code)))
                 App.drain(app)
                 app.show_login.assert_called_once_with("Reworded explanation")
+
+    def test_close_revokes_authentication_that_finishes_after_window_is_destroyed(self):
+        from mac_app import App
+        started, release, locked = threading.Event(), threading.Event(), threading.Event()
+        app = mock.Mock(generation=0, responses=queue.Queue(), closing=threading.Event(), authentication=None)
+        app.client.token = None
+
+        class PendingClient:
+            def __init__(self, *args, **kwargs):
+                self.token = None
+
+            def call(self, operation, **values):
+                if operation == "unlock":
+                    started.set()
+                    release.wait(5)
+                    self.token = "late authentication"
+                    return {"token": self.token}
+                if operation == "lock":
+                    self.token = None
+                    locked.set()
+                    return {"locked": True}
+                raise AssertionError(operation)
+
+        with mock.patch("mac_app.Client", PendingClient), \
+             mock.patch("mac_app.threading.Thread", wraps=threading.Thread) as thread:
+            App.request(app, "unlock", password=PASSWORD)
+            try:
+                self.assertTrue(started.wait(5))
+                App.close(app)
+                app.destroy.assert_called_once()
+                self.assertFalse(thread.call_args.kwargs["daemon"])
+            finally:
+                release.set()
+            self.assertTrue(locked.wait(5))
+        self.assertIsNone(app.authentication.token)
+        self.assertTrue(app.responses.empty())
+
+    def test_close_revokes_queued_authentication_before_ui_consumes_result(self):
+        from mac_app import App
+        app = mock.Mock(generation=0, closing=threading.Event())
+        app.client.token = None
+        app.authentication.token = "queued authentication"
+        with mock.patch("mac_app.Client") as client:
+            App.close(app)
+        self.assertEqual(client.return_value.token, "queued authentication")
+        client.return_value.call.assert_called_once_with("lock")

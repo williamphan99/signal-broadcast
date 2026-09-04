@@ -73,6 +73,30 @@ class MacUITests(unittest.TestCase):
                 self.assertIs(service.job, job)
                 app = App(Client(vault.root))
                 pump(lambda: str(app.login_button.cget("state")) == "normal")
+                started, release, authenticated = threading.Event(), threading.Event(), threading.Event()
+                authenticate = service.authenticate
+                def delayed_authentication(*args, **kwargs):
+                    started.set()
+                    release.wait(5)
+                    result = authenticate(*args, **kwargs)
+                    authenticated.set()
+                    return result
+                with mock.patch.object(service, "authenticate", side_effect=delayed_authentication):
+                    app.password.insert(0, PASSWORD)
+                    app.login()
+                    try:
+                        pump(started.is_set)
+                        app.close()
+                    finally:
+                        release.set()
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline and not (authenticated.is_set() and service.token is None):
+                        time.sleep(0.01)
+                    self.assertTrue(authenticated.is_set())
+                    self.assertIsNone(service.token)
+                    self.assertIs(service.job, job)
+                app = App(Client(vault.root))
+                pump(lambda: str(app.login_button.cget("state")) == "normal")
                 service.job = None
                 with mock.patch("mac_app.messagebox.askyesno", return_value=True):
                     app.erase()
