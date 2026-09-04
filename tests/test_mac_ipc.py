@@ -3,8 +3,10 @@ import io
 import json
 import os
 import queue
+import socket
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -72,6 +74,34 @@ class ResponseRevocationTests(unittest.TestCase):
 
     def test_pending_authentication_token_is_rejected_after_lock(self):
         self.response_during_lock({"op": "unlock", "password": PASSWORD}, lambda result: "token" in result)
+
+    @unittest.skipUnless(os.environ.get("SB_RUN_MAC_IPC") == "1", "Opt-in local socket backpressure test")
+    def test_stalled_response_reader_cannot_indefinitely_delay_lock(self):
+        writing, sent = threading.Event(), threading.Event()
+        sender, reader = socket.socketpair()
+        with sender, reader, mock.patch.object(self.service, "snapshot", return_value={"message": "x" * (2 * 1024 * 1024)}):
+            sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            handler = object.__new__(self.handler)
+            handler.connection = sender
+            handler.rfile = io.BytesIO(json.dumps({"op": "snapshot", "token": self.token}).encode() + b"\n")
+            def write(payload):
+                writing.set()
+                sender.sendall(payload)
+                sent.set()
+            handler.wfile = mock.Mock(write=write)
+            worker = threading.Thread(target=handler.handle)
+            worker.start()
+            try:
+                self.assertTrue(writing.wait(5))
+                started = time.monotonic()
+                with self.service.mutex:
+                    self.service.lock()
+                self.assertLess(time.monotonic() - started, 3)
+                self.assertFalse(sent.is_set())
+            finally:
+                reader.close()
+                worker.join(5)
+            self.assertFalse(worker.is_alive())
 
     def test_ui_clears_access_using_error_category(self):
         from mac_app import App

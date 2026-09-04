@@ -545,6 +545,7 @@ def serve(service: Service, path: Path):
                 response = {"error": "Operation could not complete. Access remains restricted."}
             try:
                 payload = json.dumps(response).encode() + b"\n"
+                self.connection.settimeout(1)  # A stalled local reader must not hold up revocation for the input timeout.
                 with service.mutex:
                     if "result" in response and request["op"] not in ("status", "lock", "erase"):
                         # Serialization can race a lock or logout. Recheck at delivery
