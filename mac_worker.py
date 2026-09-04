@@ -73,8 +73,8 @@ def run(request):
             emit("link_broken", engine.link_is_broken())
         else:
             account = engine.load_config().account
-            if engine.detect_account() != account:
-                raise engine.BroadcastError("The linked account does not match the saved configuration.")
+            if engine.detect_account(require_single=True) != account:
+                raise engine.AccountSelectionError("The linked account does not match the saved configuration.")
             if kind == "sync":
                 emit("groups", engine.sync_groups(account, on_log=lambda text: emit("log", text)))
             else:
@@ -108,6 +108,9 @@ if __name__ == "__main__":
     try:
         run(json.load(sys.stdin))
         emit("done", True)
+    except engine.AccountSelectionError as exc:
+        emit("error", str(exc))
+        raise SystemExit(1)
     except Exception:
         # Engine exceptions can contain account names, paths or raw provider output.
         # Show a bounded category and retain only authorized normal progress events.

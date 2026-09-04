@@ -224,6 +224,10 @@ class BroadcastError(Exception):
     """Recoverable, user-facing problem (bad config, missing file, no signal-cli)."""
 
 
+class AccountSelectionError(BroadcastError):
+    """A protected account selection failed, with no account details in its message."""
+
+
 class GroupCatalogStalled(BroadcastError):
     """A ``listGroups`` read was stopped: no group was prepared for
     GROUP_CATALOG_TIMEOUT_S, or the GROUP_CATALOG_MAX_S ceiling was reached. The
@@ -910,7 +914,7 @@ def _account_args(account: str) -> list[str]:
     return [] if PRIVATE_TRANSPORT else ["-a", account]
 
 
-def detect_account() -> str | None:
+def detect_account(*, require_single: bool = False) -> str | None:
     """Return the linked number signal-cli knows about, or None."""
     try:
         binary = signal_cli_bin()
@@ -928,6 +932,8 @@ def detect_account() -> str | None:
         accounts = json.loads(proc.stdout or "[]")
     except json.JSONDecodeError:
         return None
+    if require_single and len(accounts) > 1:
+        raise AccountSelectionError("Multiple local Signal accounts were found. Protected Sync and Notes require a single-account store.")
     for entry in accounts:
         number = entry.get("number") or entry.get("account")
         if number:

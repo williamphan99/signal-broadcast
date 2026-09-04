@@ -58,3 +58,12 @@ class PrivateCommandTests(unittest.TestCase):
                         mac_worker.run({"root": str(root), "job": kind})
                     sync.assert_not_called()
                     notes.assert_not_called()
+
+    def test_private_account_detection_rejects_ambiguous_legacy_store(self):
+        accounts = '[{"number":"+19999999999"},{"number":"+18888888888"}]'
+        with mock.patch.object(engine, "signal_cli_bin", return_value="/disposable/signal-cli"), \
+             mock.patch.object(engine, "_signal_env", return_value={}), \
+             mock.patch("engine.subprocess.run", return_value=mock.Mock(returncode=0, stdout=accounts)):
+            self.assertEqual(engine.detect_account(), "+19999999999")
+            with self.assertRaisesRegex(engine.BroadcastError, "Multiple local Signal accounts"):
+                engine.detect_account(require_single=True)
