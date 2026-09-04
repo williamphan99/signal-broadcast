@@ -144,6 +144,36 @@ No Setup run, live Signal account access, migration of user data, or message sen
 was performed. Account-argument checks substitute all Signal subprocesses; they do
 not prove live Sync or Notes behavior. The native tests use only local simulators.
 
+### Standards report
+
+No definite documented-standard violation was found. Two smell findings were
+accepted: duplicated password retry/erasure policy, now shared by unlock and
+password change, and authorization handling tied to English error fragments, now
+using explicit error categories. The latter was the more serious standards issue.
+
+### Spec report
+
+Four findings were addressed: pending responses disclosed after lock (P1), late
+authentication remaining active after window close (P2), account numbers exposed
+in Sync/Notes process arguments (P2), and accepted unpadded schedule times never
+dispatching (P2). The post-lock response disclosure was the highest-severity spec
+finding. Multi-account compatibility remains limited as described below.
+
+### Combined simplify and review verification
+
+The separate simplify task also removed a redundant attachment hash read and fixed
+resume to send the same draft that passed fingerprint verification. Its new resume
+regression failed against the original worker and passed with the fix. A mixed
+unlock/password-change regression verifies that both operations share the durable
+three-attempt limit and preserve background work on attempts one and two.
+
+After integrating both tasks, the normal suite passed: **310 discovered, 302 passed,
+8 opt-in checks skipped**, in 17.554 seconds. The combined diff passed
+`git diff --check`. The simplify worktree separately passed a real disposable
+APFS/Keychain migration, restart and erasure check in 71.545 seconds. These results
+supplement the native review checks above; they do not close the remaining hardware
+and real-account acceptance gates.
+
 ## Remaining acceptance gates
 
 These require hardware or a disposable Signal account and have not been claimed as
