@@ -190,19 +190,11 @@ class Service:
             if record["failures"] >= 3:
                 self.erase()
                 raise SecurityError("Data erased after three incorrect attempts.")
-            try:
-                volume_password = unwrap_password(password, record)
-            except WrongPassword as exc:
-                record["failures"] += 1
-                self.vault.keychain.save(record)
-                if record["failures"] == 3:
-                    self.erase()
-                raise exc
+            volume_password = self._unwrap_password(password, record)
         if record["phase"] == "migrating":
             self.retire(self.vault.project)
             self.vault.create_image(volume_password)
             self.vault.migrate(volume_password)
-            record = self.vault.keychain.load()
         elif not self.open:
             self.vault.attach(volume_password)
         self.vault.recover_imports()
@@ -217,19 +209,22 @@ class Service:
         self.token = secrets.token_urlsafe(32)
         return {"token": self.token}
 
+    def _unwrap_password(self, password, record):
+        try:
+            return unwrap_password(password, record)
+        except WrongPassword:
+            record["failures"] += 1
+            self.vault.keychain.save(record)
+            if record["failures"] >= 3:
+                self.erase()
+            raise
+
     def change_password(self, current, new):
         # Validate the new choice without touching the established retry counter.
         if not isinstance(new, str) or len(new) < 12 or len(new.encode()) > 4096:
             raise SecurityError("New password must have at least 12 characters.")
         record = self.vault.keychain.load()
-        try:
-            secret = unwrap_password(current, record)
-        except WrongPassword as exc:
-            record["failures"] += 1
-            self.vault.keychain.save(record)
-            if record["failures"] >= 3:
-                self.erase()
-            raise exc
+        secret = self._unwrap_password(current, record)
         replacement = wrap_password(new, secret)
         replacement["phase"] = "ready"
         replacement["pending_originals"] = record.get("pending_originals", [])

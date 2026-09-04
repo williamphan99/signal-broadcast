@@ -200,6 +200,25 @@ class SecurityTests(unittest.TestCase):
             self.request("change_password", current="wrong", new="short")
         self.assertEqual(self.store.record["failures"], 0)
 
+    def test_unlock_and_password_change_share_the_three_attempt_limit(self):
+        self.setup()
+        job = {"kind": "send"}
+        self.service.job = job
+        with mock.patch.object(self.service, "stop_job", side_effect=lambda: setattr(self.service, "job", None)) as stop:
+            for operation, remaining in (("change_password", 2), ("unlock", 1), ("change_password", 0)):
+                with self.assertRaises(WrongPassword) as error:
+                    self.request(operation, password="wrong", current="wrong", new="another long password")
+                self.assertEqual(error.exception.remaining, remaining)
+                if remaining:
+                    self.assertEqual(self.store.record["failures"], 3 - remaining)
+                    self.assertIs(self.service.job, job)
+                    self.assertTrue(self.vault.attached)
+                    stop.assert_not_called()
+            stop.assert_called_once()
+        self.assertIsNone(self.store.record)
+        self.assertFalse(self.vault.image.exists())
+        self.assertEqual(self.service.status()["state"], "unlinked")
+
     def test_logout_on_lock_screen_needs_confirmation_not_password(self):
         self.setup()
         self.request("lock")
