@@ -43,6 +43,10 @@ def socket_path(root: Path = ROOT) -> Path:
 def terminate_group(proc, seconds: float = 3):
     pid = proc if isinstance(proc, int) else proc.pid
     poll = getattr(proc, "poll", lambda: None)
+    def live_members():
+        listing = subprocess.run(["ps", "-axo", "pgid=,stat="], capture_output=True, text=True, check=True)
+        members = [row.split() for row in listing.stdout.splitlines() if row.strip()]
+        return any(int(group) == pid and not state.startswith("Z") for group, state in members)
     def send(sig):
         try:
             os.killpg(pid, sig)
@@ -50,9 +54,7 @@ def terminate_group(proc, seconds: float = 3):
         except ProcessLookupError:
             return False
         except PermissionError as exc:
-            listing = subprocess.run(["ps", "-axo", "pgid=,stat="], capture_output=True, text=True, check=True)
-            live = [row.split() for row in listing.stdout.splitlines() if row.strip()]
-            if any(int(group) == pid and not state.startswith("Z") for group, state in live):
+            if live_members():
                 raise SecurityError("A worker could not be stopped. Erasure remains pending.") from exc
             return False
     try:
@@ -74,11 +76,17 @@ def terminate_group(proc, seconds: float = 3):
         send(signal.SIGKILL)
     except ProcessLookupError:
         pass
+    deadline = time.monotonic() + 3
     try:
         if not isinstance(proc, int):
             proc.wait(timeout=3)
     except subprocess.TimeoutExpired as exc:
         raise SecurityError("A worker did not stop. Erasure remains pending.") from exc
+    while live_members():
+        if time.monotonic() >= deadline:
+            raise SecurityError("A worker group did not stop. Erasure remains pending.")
+        poll()
+        time.sleep(0.05)
 
 
 def retire_legacy(project: Path):
@@ -547,6 +555,9 @@ def serve(service: Service, path: Path):
                 payload = json.dumps(response).encode() + b"\n"
                 self.connection.settimeout(1)  # A stalled local reader must not hold up revocation for the input timeout.
                 with service.mutex:
+                    if "error" in response and (service.erasing or service.vault.marker.exists()):
+                        response["error_code"] = "locked"
+                        payload = json.dumps(response).encode() + b"\n"
                     if "result" in response and request["op"] not in ("status", "lock", "erase"):
                         # Serialization can race a lock or logout. Recheck at delivery
                         # and keep revocation serialized with the socket write.

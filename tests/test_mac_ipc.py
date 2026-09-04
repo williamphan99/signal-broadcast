@@ -112,6 +112,25 @@ class ResponseRevocationTests(unittest.TestCase):
                 App.drain(app)
                 app.show_login.assert_called_once_with("Reworded explanation")
 
+    def test_failed_teardown_after_third_current_password_attempt_revokes_ui(self):
+        self.service.vault.fail_detach = True
+        for failures in (0, 1, 2):
+            with self.subTest(previous_failures=failures):
+                handler = object.__new__(self.handler)
+                handler.connection = mock.Mock()
+                handler.connection.getpeereid.return_value = (os.getuid(), 0)
+                handler.rfile = io.BytesIO(json.dumps({"op": "change_password", "token": self.token,
+                    "current": "incorrect", "new": "a new long password"}).encode() + b"\n")
+                handler.wfile = io.BytesIO()
+                handler.handle()
+                response = json.loads(handler.wfile.getvalue())
+                if failures < 2:
+                    self.assertNotEqual(response["error_code"], "locked")
+                    self.assertEqual(self.service.token, self.token)
+                else:
+                    self.assertEqual(response, {"error": "Unmount failed", "error_code": "locked"})
+                    self.assertIsNone(self.service.token)
+
     def test_close_revokes_authentication_that_finishes_after_window_is_destroyed(self):
         from mac_app import App
         started, release, locked = threading.Event(), threading.Event(), threading.Event()

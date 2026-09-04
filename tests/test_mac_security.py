@@ -2,6 +2,7 @@
 import copy
 import json
 import os
+import signal
 import tempfile
 import threading
 import unittest
@@ -462,6 +463,29 @@ class SecurityTests(unittest.TestCase):
              mock.patch("mac_service.subprocess.run", return_value=mock.Mock(stdout="123 S\n")):
             with self.assertRaises(SecurityError):
                 terminate_group(123)
+
+    def test_group_kill_waits_for_descendants_after_the_leader_exits(self):
+        proc = mock.Mock(pid=123)
+        with mock.patch("mac_service.os.killpg") as kill, \
+             mock.patch("mac_service.subprocess.run", side_effect=[mock.Mock(stdout="123 S\n"), mock.Mock(stdout="123 Z\n")]) as listing, \
+             mock.patch("mac_service.time.sleep"):
+            terminate_group(proc, seconds=0)
+        kill.assert_any_call(123, signal.SIGKILL)
+        proc.wait.assert_called_once_with(timeout=3)
+        self.assertEqual(listing.call_count, 2)
+
+    def test_recovery_retains_worker_record_if_group_does_not_exit(self):
+        import mac_service
+        self.vault.prepare()
+        worker = self.vault.root / "worker.json"
+        atomic_json(worker, {"pid": 123})
+        listing = [mock.Mock(stdout=f"123 123 S {mac_service.PROJECT / 'mac_worker.py'}\n"), mock.Mock(stdout="123 S\n")]
+        with mock.patch("mac_service.os.killpg"), \
+             mock.patch("mac_service.subprocess.run", side_effect=listing), \
+             mock.patch("mac_service.time.monotonic", side_effect=[0, 1, 2, 6]):
+            with self.assertRaisesRegex(SecurityError, "group did not stop"):
+                self.service.reap_worker()
+        self.assertTrue(worker.exists())
 
 
 if __name__ == "__main__":
