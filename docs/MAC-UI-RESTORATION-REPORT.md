@@ -96,7 +96,9 @@ schedules and logs. The application code remains in the Git checkout.
 4. Locking revokes the window's token and clears its visible content. The vault
    stays mounted so an existing broadcast and saved schedules can continue.
 5. Restarting the service or the Mac requires another unlock before background
-   schedules can run. Missed scheduled jobs are not automatically replayed.
+   schedules can run. The scheduler now combines missed times into one pending send
+   with a one-hour lateness limit. A previously dispatched run is never replayed
+   automatically. See `MAC-SCHEDULE-RELIABILITY.md`.
 6. Three consecutive wrong passwords, or confirmed Log out and erase, stop work,
    remove the wrapped vault key and delete the local vault and associated data.
    Failed cleanup remains pending and is reported. The phone and already-delivered

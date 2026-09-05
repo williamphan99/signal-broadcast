@@ -82,7 +82,7 @@ old background jobs. Unplugging the Mac no longer erases data.
   `logs/notes-debug.txt` record counts, duration and completion status inside the vault.
 - **Groups**: search, toggle groups, select/deselect visible matches and save.
   Selections outside the current search are retained.
-- **Schedule**: save daily times, enable background sends and see the last result.
+- **Schedule**: save daily times, see the next time or pending run, and read schedule activity.
 - **Security**: change the password, lock, erase, clear logs or adjust sending pace.
 
 Choose formatting beside the message. Notes show the complete text before you
@@ -115,9 +115,22 @@ Historical backups and other copies of that original are not erased.
 
 Scheduled sending works while the interface is locked or closed, provided the Mac
 is awake and the background service has been unlocked once since its last start.
-Missed schedule slots are not replayed after restarting the service. An unfinished
-broadcast blocks a new scheduled broadcast until it is reviewed. **Resume remaining**
+While another operation or cooldown blocks sending, due times wait in one durable
+pending slot. Multiple missed times combine into the latest due time. It expires
+one hour after that time, preventing a backlog of late broadcasts. Sleep or a service
+restart can delay a send; after waking and unlocking when required, only a pending
+send still within this limit can start. Disabling or resaving the schedule cancels
+pending work. It does not stop an active broadcast.
+
+Active broadcasts use `caffeinate` to prevent idle sleep. This does not wake a
+sleeping Mac or override closing its lid. Keep it awake for on-time schedules.
+An unfinished broadcast blocks a new scheduled broadcast until it is reviewed. **Resume remaining**
 excludes messages with uncertain delivery, avoiding automatic duplicate sends.
+
+Schedule activity shows waiting reasons, expiry and results. The vault's
+`logs/schedule.jsonl` records status and counts without message text or group names.
+It rotates at 256 KiB and keeps one previous file. See
+[the scheduler report](docs/MAC-SCHEDULE-RELIABILITY.md) for failure and restart behaviour.
 
 Stopping or erasing cannot recall messages already dispatched to Signal. After a
 sleep, network interruption or stopped job, review uncertain outcomes before sending
