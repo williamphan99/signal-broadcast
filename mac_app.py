@@ -4,6 +4,7 @@ from __future__ import annotations
 import queue
 import resource
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +12,37 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from mac_security import SecurityError
 from mac_service import Client
+from mac_photos import Thumbnails
+from photo_strip import PhotoStrip
+from ui_theme import PALETTE
+
+
+def operation_status(data, pending=None):
+    if pending == "stop":
+        return "Stopping… Waiting for the background service to confirm."
+    kind = data.get("job") or pending
+    if kind:
+        return {"send": "Sending…", "resume": "Sending remaining groups…",
+                "sync": "Updating groups…", "notes": "Checking for new notes…",
+                "link": "Linking…", "health": "Checking the Signal link…",
+                "import": "Adding and verifying photos…"}.get(kind, "Working…")
+    last = data.get("last_operation") or {}
+    name = {"send": "Broadcast", "resume": "Broadcast", "sync": "Group update",
+            "notes": "Notes check", "link": "Linking", "health": "Link check"}.get(last.get("kind"), "Operation")
+    if last.get("outcome") == "stopped":
+        suffix = " Messages already dispatched may still arrive." if last.get("kind") in ("send", "resume") else ""
+        return f"{name} stopped.{suffix}"
+    if last.get("outcome") == "failed":
+        return f"{name} failed. Check the activity below before trying again."
+    if last.get("outcome") == "completed":
+        summary = data.get("summary")
+        if last.get("kind") in ("send", "resume") and summary:
+            return (f"Broadcast finished. {summary.get('sent', 0)} sent, {summary.get('skipped', 0)} skipped, "
+                    f"{summary.get('failed', 0)} failed, {summary.get('uncertain', 0)} unconfirmed.")
+        return f"{name} finished."
+    if data.get("interrupted"):
+        return "Broadcast interrupted. Review the remaining groups below."
+    return "Ready to send."
 
 
 class App(tk.Tk):
@@ -40,7 +72,7 @@ class App(tk.Tk):
         self.after(80, self.drain)
         self.after(500, self.poll)
 
-    def request(self, operation, callback=None, **values):
+    def request(self, operation, callback=None, on_error=None, **values):
         generation, token = self.generation, self.client.token
         client = Client(self.client.root)
         client.token = token
@@ -59,7 +91,10 @@ class App(tk.Tk):
                     except SecurityError:
                         pass
                 return
-            self.responses.put((generation, callback, value, error))
+            if error and on_error and error.code not in ("locked", "unavailable"):
+                self.responses.put((generation, on_error, error, None))
+            else:
+                self.responses.put((generation, callback, value, error))
         # Finish revoking an in-flight authentication even after the window quits.
         threading.Thread(target=work, daemon=not authenticating).start()
 
@@ -85,6 +120,9 @@ class App(tk.Tk):
         self.after(80, self.drain)
 
     def clear(self):
+        if getattr(self, "thumbnailer", None):
+            self.thumbnailer.close()
+            self.thumbnailer = None
         self.generation += 1
         while True:
             try:
@@ -99,6 +137,11 @@ class App(tk.Tk):
         self.data, self.images, self.previews = {}, [], []
         self.qr_image = None
         self.notes_signature = self.group_signature = None
+        self.pending_action = None
+        self.activity_kind = None
+        self.activity_started = None
+        self.last_activity = None
+        self.progress_caption = ""
         self.polling = False
         self.notice = tk.StringVar()
 
@@ -189,7 +232,17 @@ class App(tk.Tk):
         header.pack(fill="x")
         ttk.Label(header, text="Signal Broadcast", font=("", 16, "bold")).pack(side="left")
         ttk.Button(header, text="Lock now", command=self.lock).pack(side="right")
-        ttk.Button(header, text="Log out and erase", command=self.erase).pack(side="right", padx=8)
+        if self.screen == "main":
+            status = ttk.Frame(self.container)
+            status.pack(fill="x", pady=(12, 0))
+            self.operation_text = tk.StringVar(value="Ready to send.")
+            status_row = ttk.Frame(status)
+            status_row.pack(fill="x")
+            ttk.Label(status_row, textvariable=self.operation_text, font=("", 13, "bold"), wraplength=500).pack(side="left")
+            self.stop_button = ttk.Button(status_row, text="Stop broadcast", command=self.stop)
+            self.operation_progress = ttk.Progressbar(status, mode="indeterminate")
+            self.activity_hint = tk.StringVar()
+            ttk.Label(status, textvariable=self.activity_hint, wraplength=650).pack(anchor="w", pady=(4, 0))
 
     def build_tabs(self):
         self.tabs = ttk.Notebook(self.container)
@@ -200,30 +253,43 @@ class App(tk.Tk):
             self.tabs.add(frame, text=name)
             frames[name] = frame
         send = frames["Send"]
-        self.message = tk.Text(send, height=8, wrap="word")
+        self.recipient_text = tk.StringVar()
+        ttk.Label(send, textvariable=self.recipient_text).pack(anchor="w", pady=(0, 8))
+        ttk.Label(send, text="Message").pack(anchor="w")
+        self.message = tk.Text(send, height=6, wrap="word", background=PALETTE["text_bg"], foreground=PALETTE["text_fg"], insertbackground=PALETTE["text_fg"])
         self.message.pack(fill="both", expand=True)
         self.message.insert("1.0", self.data["message"])
         self.images = list(self.data["attachments"])
-        self.image_list = tk.Listbox(send, height=4, exportselection=False)
-        self.image_list.pack(fill="x", pady=8)
+        self.thumbnailer = Thumbnails()
+        self.photo_strip = PhotoStrip(send, self.photos_changed, palette=PALETTE,
+                                      make_thumbnail=self.thumbnailer.make)
+        self.photo_strip.pack(fill="x", pady=8)
         self.refresh_images()
         row = ttk.Frame(send)
         row.pack(fill="x")
-        for label, command in (("Move images into vault…", self.import_images), ("Earlier", lambda: self.reorder(-1)),
-                               ("Later", lambda: self.reorder(1)), ("Remove", self.remove_image)):
-            ttk.Button(row, text=label, command=command).pack(side="left", padx=2)
+        self.add_photos_button = ttk.Button(row, text="Add photos…", command=self.import_images)
+        self.add_photos_button.pack(side="left")
         row = ttk.Frame(send)
         row.pack(fill="x", pady=10)
-        for index, (label, command) in enumerate((("Save for schedule", self.save), ("Send now", self.send),
-                               ("Stop broadcast", lambda: self.request("stop")),
-                               ("Resume remaining", lambda: self.job("resume")),
-                               ("Discard interrupted", lambda: self.request("discard")))):
-            ttk.Button(row, text=label, command=command).grid(row=index // 3, column=index % 3, sticky="w", padx=2, pady=3)
-        self.activity = tk.Text(send, height=7, state="disabled", wrap="word")
-        self.activity.pack(fill="both", expand=True)
+        self.send_button = ttk.Button(row, text="Send now", command=self.send)
+        self.send_button.pack(side="left")
+        self.save_button = ttk.Button(row, text="Save draft", command=self.save)
+        self.save_button.pack(side="right")
+        self.recovery = ttk.LabelFrame(send, text="Interrupted broadcast", padding=8)
+        self.recovery_text = ttk.Label(self.recovery, wraplength=620)
+        self.recovery_text.pack(anchor="w")
+        self.resume_button = ttk.Button(self.recovery, text="Resume remaining", command=lambda: self.job("resume"))
+        self.resume_button.pack(side="left", pady=(8, 0))
+        self.discard_button = ttk.Button(self.recovery, text="Discard this run…", command=self.discard)
+        self.discard_button.pack(side="left", padx=8, pady=(8, 0))
+        self.activity_label = ttk.Label(send, text="Recent activity")
+        self.activity_label.pack(anchor="w", pady=(8, 0))
+        self.activity = tk.Text(send, height=4, state="disabled", wrap="word", relief="flat", background=PALETTE["text_bg"], foreground=PALETTE["text_fg"])
+        self.activity.pack(fill="x", pady=(6, 0))
 
         notes = frames["Notes"]
-        ttk.Button(notes, text="Check for new notes", command=lambda: self.job("notes")).pack(anchor="w")
+        self.notes_button = ttk.Button(notes, text="Check for new notes", command=lambda: self.job("notes"))
+        self.notes_button.pack(anchor="w")
         self.note_list = tk.Listbox(notes, exportselection=False)
         self.note_list.pack(fill="both", expand=True, pady=10)
         row = ttk.Frame(notes)
@@ -233,7 +299,8 @@ class App(tk.Tk):
         self.notes_signature = None
 
         groups = frames["Groups"]
-        ttk.Button(groups, text="Update list from phone", command=lambda: self.job("sync")).pack(anchor="w")
+        self.sync_button = ttk.Button(groups, text="Update list from phone", command=lambda: self.job("sync"))
+        self.sync_button.pack(anchor="w")
         self.group_list = ttk.Treeview(groups, columns=("enabled", "name"), show="headings")
         self.group_list.heading("enabled", text="Send")
         self.group_list.column("enabled", width=65, stretch=False)
@@ -278,6 +345,8 @@ class App(tk.Tk):
             "The background service can access data while running; this is not an operating-system security boundary.", wraplength=600).pack(anchor="w", pady=12)
 
     def poll(self):
+        if self.screen == "main":
+            self.refresh_elapsed()
         if self.screen != "login" and not self.polling:
             self.polling = True
             self.request("snapshot", self.apply_snapshot, after=self.sequence)
@@ -291,6 +360,8 @@ class App(tk.Tk):
 
     def apply_snapshot(self, data):
         self.polling = False
+        if data["sequence"] < self.sequence:
+            return
         if self.screen == "link" and data["linked"]:
             self.initial_snapshot(data)
             self.job("sync")
@@ -317,39 +388,158 @@ class App(tk.Tk):
             if kind == "qr" and self.screen == "link":
                 self.qr_image = tk.PhotoImage(data=value)
                 self.qr.configure(image=self.qr_image)
-            elif kind == "finished" and value in ("notes", "sync"):
-                continue  # Keep the receive summary or warning visible.
-            elif kind in ("error", "log", "finished", "progress", "receive_status"):
-                text = (f"{value['done']}/{value['total']} {value['status']}" if kind == "progress" else str(value))
-                self.notice.set(text)
-                if self.screen == "main":
-                    self.activity.configure(state="normal")
-                    self.activity.insert("end", text + "\n")
-                    self.activity.see("end")
-                    self.activity.configure(state="disabled")
+            elif self.screen == "main":
+                if kind == "receive_status":
+                    self.notice.set(str(value))
+                    self.add_activity(str(value))
+                elif kind == "error":
+                    self.notice.set(str(value))
+                    self.add_activity(str(value))
+                elif kind == "started":
+                    self.progress_caption = ""
+                    self.add_activity(operation_status({"job": value}))
+                elif kind == "progress":
+                    result = {"sent": "Message sent", "failed": "Send failed", "skipped": "Group skipped",
+                              "uncertain": "Delivery not confirmed"}.get(value["status"], "Group processed")
+                    self.progress_caption = f"{value['done']} of {value['total']} groups processed."
+                    self.add_activity(f"{result}. {self.progress_caption}")
+                elif kind == "phase":
+                    text = {"preparing": "Preparing your saved message and photos…",
+                            "sending": "Sending your message. Photo uploads can take a while.",
+                            "sync": "Getting the latest groups from Signal…",
+                            "notes": "Receiving notes and downloading their photos…"}.get(value)
+                    if text:
+                        self.add_activity(text)
+                elif kind in ("stopped", "finished"):
+                    self.add_activity(operation_status(data))
         self.sequence = data["sequence"]
+        if self.screen == "main":
+            self.refresh_controls()
+
+    def refresh_controls(self):
+        active = self.pending_action or self.data.get("job")
+        blocked = bool(active)
+        sending = active in ("send", "resume", "stop")
+        count = sum(group["enabled"] for group in self.data["groups"])
+        self.operation_text.set(operation_status(self.data, self.pending_action))
+        if active != self.activity_kind:
+            self.activity_kind = active
+            self.activity_started = time.monotonic() if active else None
+            self.operation_progress.stop()
+            if active:
+                self.operation_progress.pack(fill="x", pady=(6, 0))
+                self.operation_progress.start(16)
+            else:
+                self.operation_progress.pack_forget()
+        self.refresh_elapsed()
+        schedule = self.data["schedule"]
+        suffix = " Scheduled sends remain enabled." if schedule["enabled"] else ""
+        self.recipient_text.set(f"{count} groups selected · {len(self.images)} photos.{suffix}")
+        self.send_button.configure(text=f"Send to {count} groups", state="disabled" if blocked or not count or self.data.get("interrupted") else "normal")
+        self.save_button.configure(state="disabled" if blocked else "normal")
+        self.add_photos_button.configure(state="disabled" if blocked else "normal")
+        self.notes_button.configure(state="disabled" if blocked else "normal")
+        self.sync_button.configure(state="disabled" if blocked else "normal")
+        self.message.configure(state="disabled" if sending else "normal")
+        if self.photo_strip._enabled == bool(sending):
+            self.photo_strip.set_enabled(not sending)
+        if blocked and self.pending_action != "import":
+            self.stop_button.pack(side="right", padx=(8, 0))
+            label = "Stop broadcast" if sending else "Cancel"
+            self.stop_button.configure(text="Stopping…" if self.pending_action == "stop" else label,
+                                       state="disabled" if self.pending_action else "normal")
+        else:
+            self.stop_button.pack_forget()
+        interrupted = self.data.get("interrupted")
+        if interrupted and not blocked:
+            remaining = len(interrupted.get("remaining", []))
+            self.recovery_text.configure(text=f"{remaining} groups remain in the saved broadcast. Resume uses the saved draft.")
+            self.recovery.pack(fill="x", before=self.activity_label, pady=(4, 8))
+        else:
+            self.recovery.pack_forget()
+
+    def refresh_elapsed(self):
+        if self.activity_started is None:
+            self.activity_hint.set("")
+            return
+        elapsed = int(time.monotonic() - self.activity_started)
+        detail = "Waiting for the send processes to exit." if self.pending_action == "stop" else self.progress_caption
+        self.activity_hint.set(f"Working for {elapsed // 60}:{elapsed % 60:02d}. {detail}")
+
+    def add_activity(self, text):
+        if text == self.last_activity:
+            return
+        self.last_activity = text
+        self.activity.configure(state="normal")
+        self.activity.insert("end", f"{datetime.now():%H:%M:%S}  {text}\n")
+        if int(self.activity.index("end-1c").split(".")[0]) > 100:
+            self.activity.delete("1.0", "2.0")
+        self.activity.see("end")
+        self.activity.configure(state="disabled")
+
+    def action_failed(self, error):
+        stopping = self.pending_action == "stop"
+        self.pending_action = None
+        self.notice.set(("Stop not confirmed. " if stopping else "") + str(error))
+        if self.screen == "main":
+            self.add_activity(self.notice.get())
+            self.refresh_controls()
+
+    def action_snapshot(self, _=None):
+        def apply(data):
+            self.pending_action = None
+            self.apply_snapshot(data)
+        self.request("snapshot", apply, on_error=self.action_failed, after=self.sequence)
 
     def job(self, kind):
-        self.request("job", lambda _: self.notice.set("Started. You can lock or close the window."), kind=kind)
+        self.pending_action = kind
+        self.notice.set("")
+        if self.screen == "main":
+            self.refresh_controls()
+        self.request("job", self.action_snapshot, on_error=self.action_failed, kind=kind)
+
+    def stop(self):
+        if self.pending_action or not self.data.get("job"):
+            return
+        self.pending_action = "stop"
+        self.notice.set("Stopping this broadcast. Messages already dispatched cannot be recalled."
+                        if self.data["job"] in ("send", "resume") else "Cancelling this operation. Waiting for confirmation.")
+        self.add_activity("Stop requested. Waiting for the background service to confirm.")
+        self.refresh_controls()
+        self.request("stop", self.action_snapshot, on_error=self.action_failed)
+
+    def discard(self):
+        if messagebox.askyesno("Discard interrupted broadcast?", "Forget the remaining groups in this run? Your draft and photos are kept.", default="no", parent=self):
+            self.request("discard", self.action_snapshot, on_error=self.action_failed)
 
     def save(self, callback=None):
         self.request("save", callback or (lambda _: self.notice.set("Saved.")),
+                     on_error=self.action_failed,
                      message=self.message.get("1.0", "end-1c"), attachments=list(self.images))
 
     def send(self):
+        if self.pending_action or self.data.get("job") or self.data.get("interrupted"):
+            return
         count = sum(group["enabled"] for group in self.data["groups"])
         text = self.message.get("1.0", "end-1c")
+        if not count:
+            self.notice.set("Choose and save at least one group in Groups first.")
+            return
         if not text.strip() and not self.images:
             self.notice.set("Type a message or attach an image first.")
             return
         if messagebox.askyesno("Send broadcast?", f"Send to {count} selected groups with {len(self.images)} images?\n\n"
                               f"{text[:120]}\n\nSending continues if you lock or close this window."):
+            self.pending_action = "send"
+            self.refresh_controls()
             self.save(lambda _: self.job("send"))
 
     def refresh_images(self):
-        self.image_list.delete(0, "end")
-        for path in self.images:
-            self.image_list.insert("end", Path(path).name)
+        self.photo_strip.set_paths(self.images)
+
+    def photos_changed(self, paths):
+        self.images = list(paths)
+        self.refresh_controls()
 
     def import_images(self):
         paths = list(filedialog.askopenfilenames(title="Move images into the encrypted vault",
@@ -357,30 +547,30 @@ class App(tk.Tk):
         if not paths or not messagebox.askyesno("Move original images?", "After each copy is verified, its original file "
                 "will be deleted from its current location. The protected copy remains in this app. Continue?"):
             return
+        self.pending_action = "import"
+        total = len(paths)
+        self.progress_caption = f"Adding {total} photos."
+        self.refresh_controls()
         def next_image(_=None):
             if paths:
-                self.request("import", added, path=paths.pop(0))
+                self.request("import", added, on_error=self.action_failed, path=paths.pop(0))
+            else:
+                self.pending_action = None
+                self.notice.set(f"Added {total} photos. Drag them into send order.")
+                self.add_activity(self.notice.get())
+                self.refresh_controls()
         def added(result):
             self.images.append(result["path"])
             self.refresh_images()
+            self.progress_caption = f"{total - len(paths)} of {total} photos added."
+            self.refresh_controls()
             next_image()
         next_image()
 
-    def reorder(self, offset):
-        selection = self.image_list.curselection()
-        if selection and 0 <= selection[0] + offset < len(self.images):
-            position = selection[0]
-            self.images[position], self.images[position + offset] = self.images[position + offset], self.images[position]
-            self.refresh_images()
-            self.image_list.selection_set(position + offset)
-
-    def remove_image(self):
-        selection = self.image_list.curselection()
-        if selection:
-            self.images.pop(selection[0])
-            self.refresh_images()
-
     def use_note(self):
+        if self.pending_action or self.data.get("job") in ("send", "resume"):
+            self.notice.set("Wait for the broadcast to stop before replacing the draft.")
+            return
         selected = self.note_list.curselection()
         if not selected:
             return
@@ -408,10 +598,17 @@ class App(tk.Tk):
 
     def save_groups(self):
         enabled = [item for item in self.group_list.get_children() if self.group_list.item(item, "values")[0]]
-        self.request("groups", enabled=enabled)
+        def saved(result):
+            self.notice.set(f"Saved selection: {len(enabled)} groups.")
+            self.request("snapshot", self.apply_snapshot, after=self.sequence)
+        self.request("groups", saved, enabled=enabled)
 
     def save_schedule(self):
-        self.request("schedule", enabled=self.schedule_enabled.get(),
+        enabled = self.schedule_enabled.get()
+        def saved(result):
+            self.notice.set("Daily schedule saved and enabled." if enabled else "Daily schedule turned off.")
+            self.request("snapshot", self.apply_snapshot, after=self.sequence)
+        self.request("schedule", saved, enabled=enabled,
                      times=[time.strip() for time in self.times.get().split(",") if time.strip()])
 
     def change_password(self):
@@ -461,6 +658,11 @@ class App(tk.Tk):
             except SecurityError:
                 pass
         self.destroy()
+
+    def destroy(self):
+        if getattr(self, "thumbnailer", None):
+            self.thumbnailer.close()
+        super().destroy()
 
 
 if __name__ == "__main__":

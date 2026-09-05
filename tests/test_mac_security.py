@@ -3,6 +3,8 @@ import copy
 import json
 import os
 import signal
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -85,6 +87,61 @@ class SecurityTests(unittest.TestCase):
         for operation in ("snapshot", "job", "save", "groups", "settings", "schedule", "import"):
             with self.assertRaisesRegex(SecurityError, "Locked"):
                 self.service.handle({"op": operation})
+
+    def test_saved_photo_order_survives_lock_and_reopen(self):
+        self.setup()
+        paths = []
+        for name in ("third.png", "first.png", "second.png"):
+            path = self.vault.data / name
+            path.write_bytes(b"disposable attachment")
+            paths.append(str(path))
+        self.request("save", message="Ordered photos", attachments=paths)
+        self.service.lock()
+        self.token = self.service.authenticate(PASSWORD)["token"]
+        self.assertEqual(self.request("snapshot")["attachments"], paths)
+        self.assertEqual(engine.read_attachments(), paths)
+
+    @unittest.skipUnless(os.environ.get("SB_RUN_MAC_PROCESSES") == "1", "Opt-in native worker teardown test")
+    def test_stop_reports_stopped_only_after_worker_exit(self):
+        self.setup()
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+        def cleanup():
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+        self.addCleanup(cleanup)
+        self.service.job = {"kind": "send", "proc": proc}
+        self.request("stop")
+        self.assertIsNotNone(proc.poll())
+        state = self.request("snapshot")
+        self.assertIsNone(state["job"])
+        self.assertEqual(state["last_operation"], {"kind": "send", "outcome": "stopped"})
+        self.assertEqual(state["events"][-1]["kind"], "stopped")
+
+    def test_failed_stop_keeps_running_state(self):
+        self.setup()
+        self.service.job = {"kind": "send", "proc": object()}
+        with mock.patch("mac_service.terminate_group", side_effect=SecurityError("Worker did not exit")):
+            with self.assertRaisesRegex(SecurityError, "Worker did not exit"):
+                self.request("stop")
+        state = self.request("snapshot")
+        self.assertEqual(state["job"], "send")
+        self.assertIsNone(state["last_operation"])
+        self.assertFalse(any(event["kind"] == "stopped" for event in state["events"]))
+
+    def test_worker_exit_distinguishes_finished_from_failed(self):
+        self.setup()
+        for returncode, outcome in ((0, "completed"), (1, "failed")):
+            with self.subTest(returncode=returncode):
+                proc = mock.Mock()
+                proc.stdout = mock.Mock()
+                proc.stdout.__iter__ = mock.Mock(return_value=iter([]))
+                proc.wait.return_value = returncode
+                job = {"kind": "send", "proc": proc}
+                self.service.job = job
+                with mock.patch("mac_service.terminate_group"):
+                    self.service._read_job(job)
+                self.assertEqual(self.request("snapshot")["last_operation"], {"kind": "send", "outcome": outcome})
 
     def test_setup_rejects_short_password_without_creating_any_record(self):
         with self.assertRaises(SecurityError):

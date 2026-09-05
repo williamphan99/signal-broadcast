@@ -14,6 +14,128 @@ from test_mac_security import DirectoryVault, MemoryKeychain, PASSWORD
 
 @unittest.skipUnless(os.environ.get("SB_RUN_MAC_UI") == "1", "Opt-in native Tk UI test")
 class MacUITests(unittest.TestCase):
+    def test_photo_drag_preview_save_and_lock(self):
+        from types import SimpleNamespace
+        from mac_app import App
+        from test_mac_photos import png_bytes
+
+        class FixtureApp(App):
+            def request(self, operation, callback=None, on_error=None, **values):
+                self.requests.append((operation, values))
+                self.callbacks[operation] = callback
+                self.errors[operation] = on_error
+                if operation == "save" and callback:
+                    callback({"saved": True})
+                if operation == "snapshot" and callback:
+                    callback(self.fixture_snapshot)
+
+        with tempfile.TemporaryDirectory(prefix="sb-photo-ui-") as directory:
+            paths = []
+            for name in ("first", "second", "third"):
+                path = Path(directory) / (name + ".png")
+                path.write_bytes(png_bytes())
+                paths.append(str(path))
+            app = FixtureApp.__new__(FixtureApp)
+            app.requests = []
+            app.callbacks, app.errors = {}, {}
+            FixtureApp.__init__(app, SimpleNamespace(token="fixture"))
+            data = {"linked": True, "message": "Photo order fixture", "attachments": paths,
+                    "schedule": {"times": [], "enabled": False}, "config": {
+                        "base_delay_seconds": 1, "jitter_seconds": 0,
+                        "cooldown_hours": 0, "concurrent_sends": 1},
+                    "groups": [{"group_id": "fixture", "name": "Fixture", "enabled": True}],
+                    "notes": [], "job": None, "events": [], "sequence": 0}
+            try:
+                app.initial_snapshot(data)
+                app.update()
+                strip = app.photo_strip
+                deadline = time.monotonic() + 10
+                while strip._pending and time.monotonic() < deadline:
+                    app.update()
+                    time.sleep(0.01)
+                self.assertTrue(all(strip._photos.get(path) is not None for path in paths))
+                strip.set_open(True)
+                app.update()
+                x, y = strip._slot_xy(0)
+                target_x, target_y = strip._slot_xy(2)
+                strip.canvas.event_generate("<Button-1>", x=x+40, y=y+40)
+                strip.canvas.event_generate("<B1-Motion>", x=target_x+40, y=target_y+40)
+                strip.canvas.event_generate("<ButtonRelease-1>", x=target_x+40, y=target_y+40)
+                app.update()
+                ordered = [paths[1], paths[2], paths[0]]
+                self.assertEqual(app.images, ordered)
+                strip._preview_selected()
+                deadline = time.monotonic() + 10
+                while not strip._previews and time.monotonic() < deadline:
+                    app.update()
+                    time.sleep(0.01)
+                self.assertTrue(strip._previews)
+                with mock.patch("mac_app.messagebox.askyesno", return_value=True):
+                    app.send()
+                saves = [values for op, values in app.requests if op == "save"]
+                self.assertEqual(saves[-1]["attachments"], ordered)
+                self.assertIn(("job", {"kind": "send"}), app.requests)
+                app.fixture_snapshot = {**data, "job": "send", "sequence": 1,
+                                        "events": [{"id": 1, "kind": "started", "value": "send"}]}
+                app.callbacks["job"]({"started": "send"})
+                self.assertEqual(app.operation_text.get(), "Sending…")
+                self.assertTrue(app.operation_progress.winfo_manager())
+                self.assertEqual(str(app.stop_button.cget("state")), "normal")
+                before = app.operation_progress.cget("value")
+                deadline = time.monotonic() + 0.15
+                while time.monotonic() < deadline:
+                    app.update()
+                    time.sleep(0.01)
+                self.assertNotEqual(app.operation_progress.cget("value"), before)
+                app.apply_snapshot({**app.fixture_snapshot, "sequence": 3, "events": [
+                    {"id": 2, "kind": "log", "value": "INTERNAL TRACE MUST NOT APPEAR"},
+                    {"id": 3, "kind": "progress", "value": {"done": 1, "total": 3, "status": "sent"}}]})
+                self.assertIn("1 of 3 groups processed", app.activity.get("1.0", "end"))
+                self.assertNotIn("INTERNAL TRACE", app.activity.get("1.0", "end"))
+                app.stop()
+                self.assertIn("Stopping…", app.operation_text.get())
+                self.assertEqual(str(app.stop_button.cget("state")), "disabled")
+                self.assertTrue(app.operation_progress.winfo_manager())
+                stops = sum(op == "stop" for op, _ in app.requests)
+                app.stop()
+                self.assertEqual(sum(op == "stop" for op, _ in app.requests), stops)
+                from mac_security import SecurityError
+                app.errors["stop"](SecurityError("The worker has not exited."))
+                self.assertIn("Stop not confirmed", app.notice.get())
+                self.assertEqual(app.operation_text.get(), "Sending…")
+                app.stop()
+                app.fixture_snapshot = {**data, "sequence": 4, "last_operation": {"kind": "send", "outcome": "stopped"},
+                    "interrupted": {"remaining": [["fixture", "Fixture"]]},
+                    "events": [{"id": 4, "kind": "stopped", "value": "send"}]}
+                app.callbacks["stop"]({"stopped": True})
+                self.assertIn("Broadcast stopped", app.operation_text.get())
+                self.assertFalse(app.operation_progress.winfo_manager())
+                self.assertFalse(app.stop_button.winfo_manager())
+                self.assertTrue(app.recovery.winfo_manager())
+                # A snapshot started before Stop must not bring back Sending.
+                app.apply_snapshot({**data, "sequence": 1, "job": "send"})
+                self.assertIn("Broadcast stopped", app.operation_text.get())
+                app.apply_snapshot({**data, "sequence": 5})
+                app.images = paths * 5
+                app.refresh_images()
+                app.update()
+                self.assertLessEqual(strip.canvas.winfo_height(), 216)
+                for geometry in ("760x780", "620x650"):
+                    app.geometry(geometry)
+                    app.update()
+                    for button in (app.send_button, app.save_button):
+                        self.assertTrue(button.winfo_viewable(), geometry)
+                        self.assertLess(button.winfo_rooty() + button.winfo_height(), app.winfo_rooty() + app.winfo_height())
+                app.show_login()
+                app.update()
+                self.assertEqual(app.images, [])
+                self.assertFalse(strip._photos)
+                self.assertFalse(strip._previews)
+                self.assertTrue(strip._ready.empty())
+                self.assertFalse(strip.winfo_exists())
+            finally:
+                app.destroy()
+
     def test_login_manual_lock_close_reopen_and_erase(self):
         from mac_app import App
         with isolated_engine(), tempfile.TemporaryDirectory(prefix="sb-ui-tests-") as directory:

@@ -95,6 +95,7 @@ launchctl bootout "gui/$(id -u)/com.user.signal-broadcast.service" >/dev/null 2>
 "$PY" -m venv .venv || exit 1
 .venv/bin/python -m pip install --disable-pip-version-check -r requirements-macos.txt || exit 1
 swiftc scripts/mac-security.swift -o vendor/mac-security || exit 1
+swiftc scripts/mac-thumbnail.swift -o vendor/mac-thumbnail || exit 1
 .venv/bin/python scripts/install-mac-service.py || exit 1
 PY="$PWD/.venv/bin/python"
 bash scripts/make-dock-app.sh "$PY" \

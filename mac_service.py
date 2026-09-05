@@ -135,6 +135,7 @@ class Service:
         self.erasing = False
         self.recovery_error = None
         self.on_erased = None
+        self.last_operation = None
 
     def recover(self):
         self.vault.prepare()
@@ -318,6 +319,7 @@ class Service:
                 "notes": notes, "message": safe(engine.read_message, ""),
                 "attachments": safe(engine.read_attachments, []),
                 "schedule": self.schedule(), "job": self.job["kind"] if self.job else None,
+                "last_operation": self.last_operation,
                 "events": [event for event in self.events if event["id"] > after],
                 "sequence": self.sequence,
                 "interrupted": asdict(interrupted) if interrupted else None,
@@ -358,11 +360,14 @@ class Service:
             proc.stdout.close()
             self.job = None
             raise
+        self.last_operation = None
+        self._event("started", kind)
         threading.Thread(target=self._read_job, args=(job,), daemon=True).start()
         return {"started": kind}
 
     def _read_job(self, job):
         proc = job["proc"]
+        returncode = None
         try:
             for line in proc.stdout:
                 try:
@@ -374,15 +379,17 @@ class Service:
                         continue
                     if event["kind"] == "link_broken" and event["value"] is True:
                         self.link_broken = True
-                    if event["kind"] in {"log", "progress", "results", "qr", "error", "done", "receive_status"}:
+                    if event["kind"] in {"log", "progress", "results", "qr", "error", "done", "phase", "receive_status"}:
                         self._event(event["kind"], event["value"])
-            proc.wait()
+            returncode = proc.wait()
         finally:
             proc.stdout.close()
             with self.mutex:
                 if self.job is job:
                     terminate_group(proc, seconds=0.1)
                     self.job = None
+                    self.last_operation = {"kind": job["kind"],
+                                           "outcome": "completed" if returncode == 0 else "failed"}
                     (self.vault.root / "worker.json").unlink(missing_ok=True)
                     if job["kind"] == "link":
                         self.link_broken = False
@@ -431,7 +438,11 @@ class Service:
             if op == "job":
                 return self._start_job(request.get("kind"))
             if op == "stop":
+                kind = self.job["kind"] if self.job else None
                 self.stop_job()
+                if kind:
+                    self.last_operation = {"kind": kind, "outcome": "stopped"}
+                    self._event("stopped", kind)
                 return {"stopped": True}
             if op == "save":
                 if self.job and self.job["kind"] in ("send", "resume"):

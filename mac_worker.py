@@ -76,13 +76,16 @@ def run(request):
             if engine.detect_account(require_single=True) != account:
                 raise engine.AccountSelectionError("The linked account does not match the saved configuration.")
             if kind == "sync":
+                emit("phase", "sync")
                 emit("groups", engine.sync_groups(account, on_log=lambda text: emit("receive_status", text)))
             else:
+                emit("phase", "notes")
                 report = engine.fetch_notes(account, on_log=lambda text: emit("receive_status", text))
                 emit("notes", report)
                 if not report.get("complete", True):
                     raise engine.ReceiveError(report["warning"])
     elif kind in ("send", "resume"):
+        emit("phase", "preparing")
         cfg = engine.load_config()
         groups = engine.read_groups()
         message = engine.read_message()
@@ -95,6 +98,7 @@ def run(request):
             if interrupted.fingerprint != fingerprint:
                 raise engine.BroadcastError("Draft changed. Discard the interrupted run before a new send.")
             groups = interrupted.remaining
+        emit("phase", "sending")
         results = engine.broadcast(config=cfg, groups=groups, message=message,
             attachments=attachments, on_log=lambda text: emit("log", text),
             should_stop=lambda: (root.parents[1] / "erase.json").exists(),
