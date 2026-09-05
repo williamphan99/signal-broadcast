@@ -30,11 +30,13 @@ If migration cannot finish, normal access remains blocked and the originals need
 for recovery are retained. Restore any missing attachments and unlock again to
 retry. Do not delete your old files manually while migration is incomplete.
 
-Keep the clone in its original location. If you move it, run Setup again. After
-unlocking, use **Update** in the header, then **Finish update**. Code-only updates
+Keep the clone in its original location. If you move it, run Setup again. Use
+**Update** on the password screen or in the unlocked header, then **Finish update**. Checking
+and downloading updates does not unlock the vault or sign you out. Code-only updates
 restart the app and service; dependency changes open Setup. Active operations must
 finish first. Downloaded updates pause scheduled sends until installation finishes.
-Unlock again after restarting. Older installations without the button need one
+Your Signal link, drafts, photos and schedule are kept. Enter the local password
+again after restarting; no QR scan or relinking is needed. Older installations without the button need one
 manual `git pull --ff-only` followed by `Setup.command` to receive it.
 
 ## Locking, closing and erasing

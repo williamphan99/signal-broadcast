@@ -44,11 +44,15 @@ screen explicitly reports. Already-dispatched messages may still arrive after St
 The follow-up restores the omitted controls identified by comparing `gui.py` and
 `mac_app.py` after commit `0a84160`:
 
-- Update in the authenticated header, with Finish update for restart or Setup.
+- Update on the password screen and in the authenticated header, with Finish update for restart or Setup.
   Updates cannot interrupt a worker. A downloaded update pauses new manual jobs
   and scheduled jobs until installation/restart completes. Git failures are shown
   separately from an already-current result. Native helper, installer and dependency
   changes require Setup.
+  The locked-screen updater only fetches app code; it does not open the vault.
+  Public status exposes update flags, never Git diagnostics or private snapshots.
+  Downloading keeps the current session. Finishing restarts the service and requires
+  the local password again, while preserving the Signal link and saved data.
 - Whole-message formatting saved with the draft.
 - Failed-only retry, persisted inside the vault and tied to saved text, attachment
   order and formatting. Sent, skipped and unconfirmed recipients are excluded.
@@ -140,7 +144,7 @@ checks skipped**. The final skipped-first-send progress adjustment also passed a
 11 focused restoration tests. Python compilation and `git diff --check` passed.
 
 The regression suite includes disposable service tests for formatting persistence,
-retry eligibility, update/schedule exclusion, authenticated restart and progress
+retry eligibility, update/schedule exclusion, guarded restart and progress
 persistence across locking. Simulated sends verify out-of-order completion counts
 and clearing stale retry recipients before dispatch.
 

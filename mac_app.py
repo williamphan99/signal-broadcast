@@ -153,6 +153,7 @@ class App(tk.Tk):
         self.notice = tk.StringVar()
         self.group_choices = {}
         self.update_prompted = False
+        self.login_state = {}
 
     def show_login(self, text=""):
         self.clear()
@@ -171,7 +172,11 @@ class App(tk.Tk):
         self.confirm = ttk.Entry(self.container, show="•", width=40)
         self.login_button = ttk.Button(self.container, text="Unlock", command=self.login, state="disabled")
         self.login_button.pack(anchor="w", pady=12)
-        ttk.Label(self.container, text="Unlock to check for app updates.").pack(anchor="w")
+        self.update_button = ttk.Button(self.container, text="Update", command=self.check_update, state="disabled")
+        self.update_button.pack(anchor="w")
+        self.login_update_text = tk.StringVar()
+        ttk.Label(self.container, textvariable=self.login_update_text, wraplength=640).pack(anchor="w", pady=8)
+        self.login_update_progress = ttk.Progressbar(self.container, mode="indeterminate")
         ttk.Label(self.container, textvariable=self.notice, wraplength=640).pack(anchor="w", pady=10)
         ttk.Separator(self.container).pack(fill="x", pady=12)
         ttk.Label(self.container, text="Three consecutive incorrect passwords erase this installation.\n"
@@ -184,6 +189,8 @@ class App(tk.Tk):
     def login_status(self, state):
         if self.auth_pending:
             return
+        self.login_state = state
+        self.refresh_login_update()
         self.setup_required = state["setup_required"]
         if state["state"] == "erasing":
             self.notice.set("Erasure is incomplete. Use Log out and erase to retry cleanup.")
@@ -199,6 +206,35 @@ class App(tk.Tk):
         else:
             self.login_description.configure(text=f"Enter your password. {state['attempts_remaining']} attempts remain.")
             self.login_button.configure(text="Unlock", state="normal")
+        if state.get("updating") or self.pending_action == "update":
+            self.login_button.configure(state="disabled")
+
+    def refresh_login_update(self):
+        state = self.login_state
+        active = state.get("updating") or self.pending_action == "update"
+        blocked = active or self.auth_pending or state.get("background_running") or state.get("state") == "erasing"
+        update = state.get("update") or {}
+        if active:
+            self.login_update_text.set("Checking and downloading app updates… Your Signal link and saved data are kept.")
+            if not self.login_update_progress.winfo_manager():
+                self.login_update_progress.pack(fill="x", before=self.update_button, pady=8)
+                self.login_update_progress.start(16)
+        else:
+            self.login_update_progress.stop()
+            self.login_update_progress.pack_forget()
+            self.login_update_text.set("Wait for the background operation to finish before updating."
+                                       if state.get("background_running") else "Updates keep your Signal link and saved data.")
+            self.show_update_result(update)
+        self.update_button.configure(text="Finish update" if update.get("changed") and not active else "Update",
+                                     state="disabled" if blocked else "normal")
+
+    def show_update_result(self, update):
+        if update and not self.update_prompted:
+            self.update_prompted = True
+            self.notice.set("Update downloaded. Click Finish update to install it." if update.get("changed")
+                            else ("Could not download the update. Check your connection and try again." if update.get("error")
+                                  else "You are on the latest version."))
+            self.update_button.configure(text="Finish update" if update.get("changed") else "Update", state="normal")
 
     def login(self):
         if self.auth_pending or str(self.login_button.cget("state")) == "disabled":
@@ -212,10 +248,12 @@ class App(tk.Tk):
         self.confirm.delete(0, "end")
         self.login_button.configure(state="disabled")
         self.auth_pending = True
+        self.update_button.configure(state="disabled")
         self.notice.set("Opening protected storage…")
         self.request("setup" if self.setup_required else "unlock", self.authenticated, password=password)
 
     def authenticated(self, result):
+        self.auth_pending = False
         self.client.token = result["token"]
         self.request("snapshot", self.initial_snapshot)
 
@@ -468,12 +506,8 @@ class App(tk.Tk):
                     self.add_activity(operation_status(data))
         self.sequence = data["sequence"]
         update = data.get("update")
-        if update and not data.get("job") and not self.update_prompted:
-            self.update_prompted = True
-            self.notice.set("Update downloaded. Click Finish update to install it." if update.get("changed")
-                            else ("Could not download the update. Check your connection and try again." if update.get("error")
-                                  else "You are on the latest version."))
-            self.update_button.configure(text="Finish update" if update.get("changed") else "Update", state="normal")
+        if update and not data.get("job"):
+            self.show_update_result(update)
         if self.screen == "main":
             self.refresh_controls()
 
@@ -566,11 +600,16 @@ class App(tk.Tk):
         if self.screen == "main":
             self.add_activity(self.notice.get())
             self.refresh_controls()
+        elif self.screen == "login":
+            self.refresh_login_update()
 
     def action_snapshot(self, _=None):
         def apply(data):
+            stopped = self.pending_action == "stop" and not data.get("job")
             self.pending_action = None
             self.apply_snapshot(data)
+            if stopped:
+                self.notice.set(operation_status(data))
         self.request("snapshot", apply, on_error=self.action_failed, after=self.sequence)
 
     def job(self, kind):
@@ -715,21 +754,29 @@ class App(tk.Tk):
             self.job("retry")
 
     def check_update(self):
-        if self.pending_action or self.data.get("job"):
+        state = self.login_state if self.screen == "login" else self.data
+        if self.pending_action or state.get("job") or state.get("background_running") or self.auth_pending:
             self.notice.set("Wait for the active operation before updating.")
             return
-        update = self.data.get("update") or {}
+        update = state.get("update") or {}
         if update.get("changed"):
             if update.get("needs_setup"):
                 if messagebox.askyesno("Finish installing update?", "Open the installer to update dependencies and restart the app? Your vault and Signal link are kept.", parent=self):
                     subprocess.Popen(["/usr/bin/open", "-a", "Terminal", str(Path(__file__).with_name("Setup.command"))])
                     self.close()
-            elif messagebox.askyesno("Restart to update?", "Restart the app and its background service now? You will need to unlock again.", parent=self):
+            elif messagebox.askyesno("Restart to update?", "Restart the app and its background service now? Your Signal link and saved data are kept. Enter your local password after restarting; no QR code or relinking is needed.", parent=self):
                 self.request("restart_update", self.restart_updated_app, on_error=self.action_failed)
             return
         self.update_prompted = False
         self.pending_action = "update"
-        if self.screen == "main":
+        if self.screen == "login":
+            self.refresh_login_update()
+            self.login_button.configure(state="disabled")
+            def started(_):
+                self.pending_action = None
+                self.request("status", self.login_status)
+            self.request("update", started, on_error=self.action_failed)
+        elif self.screen == "main":
             self.refresh_controls()
             self.save(lambda _: self.job("update"))
         else:

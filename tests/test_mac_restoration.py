@@ -114,14 +114,58 @@ class ServiceRestorationTests(unittest.TestCase):
         with self.assertRaises(SecurityError):
             self.request("settings", values={"concurrent_sends": 2})
 
-    def test_setup_changes_and_locked_clients_cannot_directly_restart(self):
+    def test_setup_changes_require_installer_even_when_locked(self):
         self.setup()
         self.service.update_state = {"changed": True, "needs_setup": True}
         with self.assertRaisesRegex(SecurityError, "Setup"):
             self.request("restart_update")
         self.service.lock()
-        with self.assertRaisesRegex(SecurityError, "Locked"):
+        with self.assertRaisesRegex(SecurityError, "Setup"):
             self.request("restart_update")
+
+    def test_locked_update_restart_preserves_vault_and_link(self):
+        self.setup()
+        engine.set_config_value("account", "+19999999999")
+        self.request("save", message="Keep this draft", attachments=[])
+        record = self.store.load()
+        self.service.lock()
+        self.service.update_state = {"changed": True, "needs_setup": False, "message": "PRIVATE DIAGNOSTIC"}
+        with mock.patch.object(self.service, "erase") as erase:
+            self.assertEqual(self.service.handle({"op": "restart_update"}), {"restarting": True})
+            erase.assert_not_called()
+        self.assertEqual(self.store.load(), record)
+        self.assertIsNone(self.service.token)
+        self.assertEqual(engine.load_config().account, "+19999999999")
+        self.assertEqual(engine.read_message(), "Keep this draft")
+        self.assertNotIn("PRIVATE DIAGNOSTIC", json.dumps(self.service.handle({"op": "status"})))
+        with self.assertRaisesRegex(SecurityError, "Locked"):
+            self.service.handle({"op": "snapshot"})
+
+    def test_public_update_only_starts_updater_and_does_not_revoke_session(self):
+        self.setup()
+        with mock.patch.object(self.service, "_start_job", return_value={"started": "update"}) as start:
+            self.assertEqual(self.service.handle({"op": "update", "kind": "send"}), {"started": "update"})
+            start.assert_called_once_with("update")
+        self.assertEqual(self.service.token, self.token)
+        self.assertTrue(self.service.open)
+        self.service.lock()
+        with mock.patch.object(self.service, "_start_job", return_value={"started": "update"}) as start:
+            self.service.handle({"op": "update"})
+            start.assert_called_once_with("update")
+        for operation in ("snapshot", "job", "save"):
+            with self.assertRaisesRegex(SecurityError, "Locked"):
+                self.service.handle({"op": operation, "kind": "send"})
+
+    def test_public_update_cannot_interrupt_send_or_erasure(self):
+        self.setup()
+        self.service.job = {"kind": "send"}
+        with self.assertRaisesRegex(SecurityError, "busy"):
+            self.service.handle({"op": "update"})
+        self.service.job = None
+        self.service.erasing = True
+        for operation in ("update", "restart_update"):
+            with self.assertRaisesRegex(SecurityError, "erasing"):
+                self.service.handle({"op": operation})
 
     def test_progress_survives_window_lock_and_reopen(self):
         self.setup()
@@ -135,6 +179,14 @@ class ServiceRestorationTests(unittest.TestCase):
 
 
 class UpdateTests(unittest.TestCase):
+    def test_updater_never_opens_vault_even_without_setup(self):
+        with mock.patch.object(engine, "git_pull", return_value=engine.UpdateResult(False, "Current")), \
+             mock.patch.object(mac_worker, "configure_storage") as storage, \
+             mock.patch.object(mac_worker, "emit") as emit:
+            mac_worker.run({"job": "update"})
+        storage.assert_not_called()
+        emit.assert_called_once_with("update", {"changed": False, "message": "Current", "needs_setup": False, "error": False})
+
     def test_failed_dependency_diff_requires_setup(self):
         responses = [mock.Mock(returncode=0, stdout="old", stderr=""),
                      mock.Mock(returncode=0, stdout="Updated", stderr=""),

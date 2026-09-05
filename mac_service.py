@@ -181,7 +181,10 @@ class Service:
         else:
             state = "sealed"
         return {"state": state, "attempts_remaining": max(0, 3 - record["failures"]) if record else 3,
-                "background_running": bool(self.job), "setup_required": not record and not exists}
+                "background_running": bool(self.job), "setup_required": not record and not exists,
+                "updating": bool(self.job and self.job["kind"] == "update"),
+                "update": ({key: bool(self.update_state.get(key)) for key in ("changed", "needs_setup", "error")}
+                           if self.update_state else None)}
 
     def authenticate(self, password: str, setup=False):
         if self.recovery_error:
@@ -456,6 +459,17 @@ class Service:
                 return {"erased": True}
             if op == "status":
                 return self.status()
+            if op in ("update", "restart_update"):
+                if self.erasing or self.vault.marker.exists():
+                    raise SecurityError("Finish erasing before updating.")
+                if op == "update":
+                    return self._start_job("update")
+                if self.job or not self.update_state or not self.update_state.get("changed"):
+                    raise SecurityError("Wait for the update to finish before restarting.")
+                if self.update_state.get("needs_setup"):
+                    raise SecurityError("Finish installing this update with Setup first.")
+                self.restart_requested = True
+                return {"restarting": True}
             if op in ("unlock", "setup"):
                 return self.authenticate(request.get("password", ""), setup=op == "setup")
             self._authorized(request)
@@ -466,13 +480,6 @@ class Service:
                 return self.snapshot(int(request.get("after", 0)))
             if op == "change_password":
                 return self.change_password(request.get("current", ""), request.get("new", ""))
-            if op == "restart_update":
-                if self.job or not self.update_state or not self.update_state.get("changed"):
-                    raise SecurityError("Wait for the update to finish before restarting.")
-                if self.update_state.get("needs_setup"):
-                    raise SecurityError("Finish installing this update with Setup first.")
-                self.restart_requested = True
-                return {"restarting": True}
             if op == "job":
                 return self._start_job(request.get("kind"))
             if op == "stop":
@@ -611,7 +618,7 @@ def serve(service: Service, path: Path):
                     if "error" in response and (service.erasing or service.vault.marker.exists()):
                         response["error_code"] = "locked"
                         payload = json.dumps(response).encode() + b"\n"
-                    if "result" in response and request["op"] not in ("status", "lock", "erase"):
+                    if "result" in response and request["op"] not in ("status", "lock", "erase", "update", "restart_update"):
                         # Serialization can race a lock or logout. Recheck at delivery
                         # and keep revocation serialized with the socket write.
                         authorization = ({"token": result["token"]} if request["op"] in ("setup", "unlock") else request)

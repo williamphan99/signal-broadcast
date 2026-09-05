@@ -72,6 +72,19 @@ class ResponseRevocationTests(unittest.TestCase):
     def test_pending_snapshot_is_rejected_after_lock(self):
         self.response_during_lock({"op": "snapshot", "token": self.token}, lambda result: "message" in result)
 
+    def test_locked_update_response_is_public_but_snapshot_is_not(self):
+        self.service.lock()
+        self.service.update_state = {"changed": True, "needs_setup": False}
+        for operation, expected in (("update", {"started": "update"}), ("restart_update", {"restarting": True})):
+            with self.subTest(operation=operation), mock.patch.object(self.service, "_start_job", return_value={"started": "update"}):
+                handler = object.__new__(self.handler)
+                handler.connection = mock.Mock()
+                handler.connection.getpeereid.return_value = (os.getuid(), 0)
+                handler.rfile = io.BytesIO(json.dumps({"op": operation}).encode() + b"\n")
+                handler.wfile = io.BytesIO()
+                handler.handle()
+                self.assertEqual(json.loads(handler.wfile.getvalue()), {"result": expected})
+
     def test_pending_authentication_token_is_rejected_after_lock(self):
         self.response_during_lock({"op": "unlock", "password": PASSWORD}, lambda result: "token" in result)
 

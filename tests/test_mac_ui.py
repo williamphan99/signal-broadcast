@@ -128,6 +128,7 @@ class MacUITests(unittest.TestCase):
                     "events": [{"id": 4, "kind": "stopped", "value": "send"}]}
                 app.callbacks["stop"]({"stopped": True})
                 self.assertIn("Broadcast stopped", app.operation_text.get())
+                self.assertIn("Broadcast stopped", app.notice.get())
                 self.assertFalse(app.operation_progress.winfo_manager())
                 self.assertFalse(app.stop_button.winfo_manager())
                 self.assertTrue(app.recovery.winfo_manager())
@@ -149,6 +150,23 @@ class MacUITests(unittest.TestCase):
                 self.assertIsNotNone(strip._tips[0].window)
                 app.show_login()
                 app.update()
+                app.login_status({"state": "sealed", "setup_required": False, "attempts_remaining": 3,
+                                  "background_running": False, "updating": False, "update": None})
+                self.assertTrue(app.update_button.winfo_viewable())
+                self.assertEqual(str(app.update_button.cget("state")), "normal")
+                app.check_update()
+                self.assertEqual(app.requests[-1][0], "update")
+                self.assertEqual(str(app.login_button.cget("state")), "disabled")
+                self.assertTrue(app.login_update_progress.winfo_manager())
+                app.callbacks["update"]({"started": "update"})
+                app.callbacks["status"]({"state": "sealed", "setup_required": False, "attempts_remaining": 3,
+                    "background_running": False, "updating": False, "update": {"changed": True, "needs_setup": False}})
+                self.assertEqual(app.update_button.cget("text"), "Finish update")
+                self.assertFalse(app.login_update_progress.winfo_manager())
+                with mock.patch("mac_app.messagebox.askyesno", return_value=True):
+                    app.check_update()
+                self.assertEqual(app.requests[-1][0], "restart_update")
+                self.assertFalse(any(op == "erase" for op, _ in app.requests))
                 self.assertIsNone(strip._tips[0].window)
                 self.assertEqual(app.images, [])
                 self.assertFalse(strip._photos)
