@@ -80,6 +80,20 @@ old background jobs. Unplugging the Mac no longer erases data.
 - **Schedule**: save daily times and enable background sends of the saved draft.
 - **Security**: change the password, lock, erase, clear logs or adjust sending pace.
 
+Photos appear as numbered thumbnails. Drag them into send order, use Earlier/Later,
+or double-click a photo to preview it. Large albums scroll inside the photo strip.
+Thumbnails and previews are decoded in memory and cleared when the interface locks.
+
+During a broadcast, a moving indicator, elapsed time and friendly activity updates
+show that work is continuing. Stop changes to **Stopping…** while the service waits
+for its workers to exit. **Broadcast stopped** appears only after confirmation.
+Already-dispatched messages may still arrive. Stopping a broadcast leaves any saved
+schedule enabled. Resume and Discard appear only when there is an interrupted run.
+
+After updating to this version, run `Setup.command` once when no broadcast is running.
+It builds the new native image decoder and restarts the service with the new status
+reporting. No password reset or relinking is required for this update.
+
 Importing images is a **move**, not just an attachment reference. The app explains
 this before import, copies and verifies each image, then deletes its selected
 original. If verification or deletion fails, it reports an incomplete import.
@@ -151,7 +165,7 @@ The app must not report erasure as complete while cleanup has failed.
 ## Development and verification
 
 The Mac virtual environment needs Tk and the pinned dependency in
-`requirements-macos.txt`. The Swift helper uses Apple's Security and AppKit APIs.
+`requirements-macos.txt`. The Swift helpers use Apple's Security, AppKit and ImageIO APIs.
 
 ```sh
 .venv/bin/python -m unittest discover -s tests
