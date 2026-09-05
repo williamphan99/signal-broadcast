@@ -287,6 +287,9 @@ class SecurityTests(unittest.TestCase):
 
     def test_locked_schedule_runs_once_per_due_minute(self):
         self.setup()
+        engine.set_config_value("account", "+19999999999")
+        engine.GROUPS_FILE.write_text("fixture\tFixture\n")
+        engine.write_message("Disposable scheduled draft")
         self.request("schedule", times=["09:00"], enabled=True)
         self.request("lock")
         started = []
@@ -304,6 +307,9 @@ class SecurityTests(unittest.TestCase):
 
     def test_unpadded_schedule_times_execute_while_locked(self):
         self.setup()
+        engine.set_config_value("account", "+19999999999")
+        engine.GROUPS_FILE.write_text("fixture\tFixture\n")
+        engine.write_message("Disposable scheduled draft")
         self.request("schedule", times=["9:0"], enabled=True)
         self.assertEqual(self.service.schedule()["times"], ["09:00"])
         self.request("lock")
@@ -493,6 +499,9 @@ class SecurityTests(unittest.TestCase):
 
     def test_clock_rollback_does_not_repeat_a_consumed_schedule(self):
         self.setup()
+        engine.set_config_value("account", "+19999999999")
+        engine.GROUPS_FILE.write_text("fixture\tFixture\n")
+        engine.write_message("Disposable scheduled draft")
         self.request("schedule", times=["09:00", "09:10"], enabled=True)
         self.request("lock")
         started = []

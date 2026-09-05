@@ -63,6 +63,14 @@ class MacUITests(unittest.TestCase):
                 app.preview_style()
                 app.save()
                 self.assertEqual(app.requests[-1][1]["message_style"], "bold")
+                app.tabs.select(3)
+                app.refresh_schedule({"enabled": True, "times": ["12:00"], "pending": "2026-09-05 12:00",
+                                      "history": [{"at": "2026-09-05T12:01:00", "state": "waiting",
+                                                   "message": "Waiting for the current operation to finish."}]})
+                app.update()
+                self.assertIn("Pending send", app.schedule_status.get())
+                self.assertIn("Waiting for the current operation", app.schedule_history.get("1.0", "end"))
+                app.tabs.select(0)
                 strip = app.photo_strip
                 deadline = time.monotonic() + 10
                 while strip._pending and time.monotonic() < deadline:

@@ -396,15 +396,27 @@ class App(tk.Tk):
         schedule = frames["Schedule"]
         self.last_send_text = tk.StringVar()
         ttk.Label(schedule, textvariable=self.last_send_text, wraplength=600).pack(anchor="w", pady=8)
-        ttk.Label(schedule, text="Daily times, separated by commas. Background sends continue while locked.", wraplength=600).pack(anchor="w", pady=10)
+        self.schedule_status = tk.StringVar()
+        ttk.Label(schedule, textvariable=self.schedule_status, wraplength=600).pack(anchor="w", pady=8)
+        ttk.Label(schedule, text="Daily send times on this Mac, in 24-hour HH:MM, separated by commas.", wraplength=600).pack(anchor="w", pady=6)
         self.times = ttk.Entry(schedule, width=45)
         self.times.pack(anchor="w")
         self.times.insert(0, ", ".join(self.data["schedule"]["times"]))
         self.schedule_enabled = tk.BooleanVar(value=self.data["schedule"]["enabled"])
-        ttk.Checkbutton(schedule, text="Enable saved schedule", variable=self.schedule_enabled).pack(anchor="w", pady=12)
+        ttk.Checkbutton(schedule, text="Enable saved schedule", variable=self.schedule_enabled).pack(anchor="w", pady=8)
         ttk.Button(schedule, text="Save schedule", command=self.save_schedule).pack(anchor="w")
-        ttk.Label(schedule, text="The Mac must be awake and the service unlocked once after a restart. "
-            "Missed jobs are not replayed after restarting the service.", wraplength=600).pack(anchor="w", pady=20)
+        ttk.Label(schedule, text="Uses the saved message, photos and group selection. Save draft changes in Send first. "
+            "Only one broadcast runs at a time. Missed times combine into one pending send, which expires after one hour. "
+            "Sending pace and cooldown in Security can delay it.", wraplength=600).pack(anchor="w", pady=8)
+        ttk.Label(schedule, text="Locking or closing the window keeps scheduling active. Log out and erase stops it. "
+            "Keep the Mac awake for on-time sends. Active broadcasts prevent idle sleep. "
+            "After a service restart, unlock once; pending sends still within the one-hour limit can run.",
+            wraplength=600).pack(anchor="w", pady=8)
+        ttk.Label(schedule, text="Schedule activity").pack(anchor="w")
+        self.schedule_history = tk.Text(schedule, height=5, state="disabled", wrap="word",
+            background=PALETTE["text_bg"], foreground=PALETTE["text_fg"])
+        self.schedule_history.pack(fill="both", expand=True)
+        self.schedule_history_signature = None
 
         security = frames["Security"]
         ttk.Label(security, text="Manual locking only. There is no inactivity timer.\n"
@@ -530,6 +542,7 @@ class App(tk.Tk):
                 self.operation_progress.pack_forget()
         self.refresh_elapsed()
         schedule = self.data["schedule"]
+        self.refresh_schedule(schedule)
         suffix = " Scheduled sends remain enabled." if schedule["enabled"] else ""
         self.recipient_text.set(f"{count} groups selected · {len(self.images)} photos.{suffix}")
         self.send_button.configure(text=f"Send to {count} groups", state="disabled" if blocked or not count or self.data.get("interrupted") else "normal")
@@ -566,6 +579,36 @@ class App(tk.Tk):
             self.recovery.pack(fill="x", before=self.activity_label, pady=(4, 8))
         else:
             self.recovery.pack_forget()
+
+    def refresh_schedule(self, schedule):
+        if schedule.get("error"):
+            text = schedule["error"]
+        elif not schedule["enabled"]:
+            text = "Schedule is off. An already-running broadcast continues until stopped."
+        elif schedule.get("pending"):
+            text = f"Pending send from {schedule['pending']}. "
+            if schedule.get("history"):
+                text += schedule["history"][-1]["message"]
+        elif schedule.get("running"):
+            text = f"Running the send scheduled for {schedule['running']}."
+        else:
+            from datetime import timedelta
+            now = datetime.now()
+            candidates = [datetime.combine((now + timedelta(days=day)).date(), datetime.min.time()).replace(
+                hour=int(value.split(':')[0]), minute=int(value.split(':')[1]))
+                for day in (0, 1) for value in schedule["times"]]
+            upcoming = [at for at in candidates if at > now]
+            text = f"Next scheduled time: {min(upcoming):%d %b %H:%M} (Mac local time)." if upcoming else "Add a daily time."
+        self.schedule_status.set(text)
+        history = schedule.get("history", [])
+        if history != self.schedule_history_signature:
+            self.schedule_history_signature = list(history)
+            self.schedule_history.configure(state="normal")
+            self.schedule_history.delete("1.0", "end")
+            for entry in history[-30:]:
+                self.schedule_history.insert("end", f"{entry['at']}  {entry['message']}\n")
+            self.schedule_history.see("end")
+            self.schedule_history.configure(state="disabled")
 
     def refresh_elapsed(self):
         if self.activity_started is None:

@@ -10,6 +10,7 @@ import secrets
 import signal
 import socket
 import mac_retry
+import mac_schedule
 import socketserver
 import subprocess
 import sys
@@ -26,6 +27,11 @@ from mac_worker import configure_storage
 
 LABEL = "com.user.signal-broadcast.service"
 MAX_REQUEST = 1024 * 1024
+
+
+class WorkerStartError(SecurityError):
+    """The OS did not create a worker; dispatch cannot have happened."""
+
 
 
 def socket_path(root: Path = ROOT) -> Path:
@@ -143,6 +149,8 @@ class Service:
         self.version = engine.app_version()
         self.send_progress = None
         self.phase = None
+        self.schedule_error = None
+        self.schedule_retry_at = None
 
     def recover(self):
         self.vault.prepare()
@@ -328,7 +336,7 @@ class Service:
                 "groups": [asdict(group) for group in engine.read_group_entries()],
                 "notes": notes, "message": safe(engine.read_message, ""),
                 "attachments": safe(engine.read_attachments, []),
-                "schedule": self.schedule(), "job": self.job["kind"] if self.job else None,
+                "schedule": self.schedule_snapshot(), "job": self.job["kind"] if self.job else None,
                 "last_operation": self.last_operation,
                 "update": self.update_state, "version": self.version,
                 "retry_count": mac_retry.available_count(),
@@ -339,8 +347,58 @@ class Service:
                 "summary": asdict(summary) if (summary := engine.read_run_summary()) else None}
 
     def schedule(self):
-        path = self.vault.data / "schedule.json"
-        return json.loads(path.read_text()) if path.exists() else {"enabled": False, "times": [], "last": ""}
+        return mac_schedule.read(self.vault.data / "schedule.json")
+
+    def schedule_snapshot(self):
+        try:
+            result = self.schedule()
+        except (OSError, ValueError, KeyError, TypeError, engine.BroadcastError):
+            result = {"enabled": False, "times": [], "last": "",
+                      "error": "Schedule could not be read. Save the schedule again to repair it."}
+        if self.schedule_error:
+            result["error"] = self.schedule_error
+        return result
+
+    def save_schedule_state(self, data, previous_history):
+        mac_schedule.save(self.vault.data / "schedule.json", data)
+        for entry in data.get("history", []):
+            if entry not in previous_history:
+                self._event("schedule_status", entry["message"])
+                try:
+                    mac_schedule.append_log(engine.LOGS_DIR, entry)
+                except OSError:
+                    self.schedule_error = "Schedule history is saved, but its log file could not be written."
+
+    def schedule_result(self, state, message):
+        try:
+            data = self.schedule()
+            slot = data.get("running")
+            if not slot:
+                return
+            previous = list(data.get("history", []))
+            data["running"] = None
+            mac_schedule.record(data, state, message, datetime.now(), slot)
+            self.save_schedule_state(data, previous)
+        except (OSError, ValueError, KeyError, TypeError, engine.BroadcastError):
+            self.schedule_error = "Could not save the scheduled run result. Review the previous broadcast."
+
+    def send_preflight(self, kind):
+        cfg = engine.load_config()
+        if self.link_broken:
+            raise SecurityError("This Signal link is broken. Erase and link again.")
+        blocked = engine.cooldown_blocks_run(cfg.cooldown_hours)
+        if blocked and kind != "retry":
+            raise SecurityError("Waiting for the broadcast cooldown. " + blocked)
+        engine.read_groups()
+        try:
+            engine.read_message()
+            engine.read_attachments()
+        except engine.BroadcastError:
+            raise SecurityError("The saved draft is empty or its attachments are missing. Save a complete draft.") from None
+        if kind in ("send", "retry") and engine.read_interrupted_run():
+            raise SecurityError("Review and resume or discard the interrupted broadcast first.")
+        if kind == "retry":
+            mac_retry.groups()
 
     def _start_job(self, kind):
         if self.job:
@@ -350,21 +408,15 @@ class Service:
         if kind not in {"link", "sync", "notes", "send", "resume", "retry", "health", "update"}:
             raise SecurityError("Unsupported job.")
         if kind in ("send", "resume", "retry"):
-            cfg = engine.load_config()
-            if self.link_broken:
-                raise SecurityError("This Signal link is broken. Erase and link again.")
-            blocked = engine.cooldown_blocks_run(cfg.cooldown_hours)
-            if blocked and kind != "retry":
-                raise SecurityError(blocked)
-            if not engine.read_groups():
-                raise SecurityError("Choose at least one group.")
-            if kind in ("send", "retry") and engine.read_interrupted_run():
-                raise SecurityError("Review and resume or discard the interrupted broadcast first.")
-            if kind == "retry":
-                mac_retry.groups()
-        proc = self.spawn([sys.executable, str(PROJECT / "mac_worker.py")],
-                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                          text=True, start_new_session=True)
+            self.send_preflight(kind)
+        command = [sys.executable, str(PROJECT / "mac_worker.py")]
+        if sys.platform == "darwin" and kind in ("send", "resume", "retry"):
+            command = ["/usr/bin/caffeinate", "-i", *command]
+        try:
+            proc = self.spawn(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+        except OSError as exc:
+            raise WorkerStartError("Could not start the send process. Will retry shortly.") from exc
         job = {"kind": kind, "proc": proc}
         if kind == "update":
             self.update_state = {"changed": True, "needs_setup": True,
@@ -421,6 +473,12 @@ class Service:
                     (self.vault.root / "worker.json").unlink(missing_ok=True)
                     if job["kind"] == "link":
                         self.link_broken = False
+                    if job.get("scheduled"):
+                        summary = engine.read_run_summary() if returncode == 0 else None
+                        message = (f"Scheduled broadcast finished: {summary.sent} sent, {summary.failed} failed, "
+                                   f"{summary.skipped} skipped, {summary.uncertain} unconfirmed." if summary else
+                                   "Scheduled broadcast stopped or failed. Review before resending.")
+                        self.schedule_result("completed" if returncode == 0 else "failed", message)
                     self._event("finished", job["kind"])
 
     def tick(self, now: datetime | None = None):
@@ -429,23 +487,63 @@ class Service:
                 if self.on_restart:
                     self.on_restart()
                 return
-            if not self.open or self.job or self.vault.marker.exists() or self.shutting_down:
+            if not self.open or self.vault.marker.exists() or self.shutting_down:
                 return
-            if self.update_state and self.update_state.get("changed"):
-                return
-            schedule = self.schedule()
             now = now or datetime.now()
-            slot = now.strftime("%Y-%m-%d %H:%M")
-            if not schedule["enabled"] or now.strftime("%H:%M") not in schedule["times"] or schedule["last"] == slot or slot in schedule.get("consumed", []):
-                return
-            # Consume the slot before dispatch, even if a preflight fails. No crash replay.
-            schedule["last"] = slot
-            schedule["consumed"] = [*schedule.get("consumed", []), slot][-10080:]
-            atomic_json(self.vault.data / "schedule.json", schedule)
             try:
-                self._start_job("send")
-            except (SecurityError, engine.BroadcastError):
-                self._event("log", "Scheduled send skipped. Review the draft and previous run.")
+                self._schedule_tick(now)
+            except (OSError, ValueError, KeyError, TypeError, SecurityError, engine.BroadcastError):
+                message = "Schedule needs attention. Check the saved schedule and available disk space."
+                if self.schedule_error != message:
+                    self._event("schedule_status", message)
+                self.schedule_error = message
+
+    def _schedule_tick(self, now):
+        data = self.schedule()
+        before = json.dumps(data, sort_keys=True)
+        previous = list(data.get("history", []))
+        if data.get("running") and not (self.job and self.job.get("scheduled")):
+            # A reserved dispatch may already have reached Signal before a crash.
+            mac_schedule.record(data, "interrupted", "Service restarted during a scheduled send. Review before resending.",
+                                now, data.pop("running"))
+        mac_schedule.advance(data, now)
+        pending = data.get("pending")
+        if pending:
+            reason = None
+            if self.job:
+                reason = "Waiting for the current operation to finish."
+            elif self.update_state and self.update_state.get("changed"):
+                reason = "Waiting for the downloaded update to be installed."
+            elif self.schedule_retry_at and now < self.schedule_retry_at:
+                reason = "Waiting to retry starting the send process."
+            else:
+                try:
+                    self.send_preflight("send")
+                except (SecurityError, engine.BroadcastError) as exc:
+                    reason = str(exc)
+            if reason:
+                mac_schedule.record(data, "waiting", reason, now, pending)
+            else:
+                data["pending"], data["running"] = None, pending
+                mac_schedule.record(data, "starting", "Starting the scheduled broadcast.", now, pending)
+                self.save_schedule_state(data, previous)
+                previous = list(data.get("history", []))
+                try:
+                    self._start_job("send")
+                    if self.job:
+                        self.job["scheduled"] = True
+                    self.schedule_retry_at = None
+                except WorkerStartError:
+                    from datetime import timedelta
+                    self.schedule_retry_at = now + timedelta(seconds=60)
+                    data["pending"], data["running"] = pending, None
+                    mac_schedule.record(data, "waiting", "Waiting to retry starting the send process.", now, pending)
+                except (OSError, SecurityError, engine.BroadcastError):
+                    data["running"] = None
+                    mac_schedule.record(data, "failed", "Could not confirm dispatch. Review before resending.", now, pending)
+        self.schedule_error = None
+        if json.dumps(data, sort_keys=True) != before:
+            self.save_schedule_state(data, previous)
 
     def handle(self, request):
         with self.mutex:
@@ -484,7 +582,10 @@ class Service:
                 return self._start_job(request.get("kind"))
             if op == "stop":
                 kind = self.job["kind"] if self.job else None
+                scheduled = bool(self.job and self.job.get("scheduled"))
                 self.stop_job()
+                if scheduled:
+                    self.schedule_result("stopped", "Scheduled broadcast stopped by the user.")
                 if kind:
                     self.last_operation = {"kind": kind, "outcome": "stopped"}
                     self._event("stopped", kind)
@@ -510,16 +611,26 @@ class Service:
                 path = self.vault.import_image(Path(request["path"]))
                 return {"path": path}
             if op == "groups":
+                if self.job and self.job["kind"] in ("send", "resume", "retry"):
+                    raise SecurityError("Wait for the broadcast before changing its recipients.")
                 engine.write_group_selection(set(request["enabled"]))
                 return {"saved": True}
             if op == "schedule":
                 times = request["times"]
                 if request["enabled"] or times:
                     times = [f"{entry['Hour']:02d}:{entry['Minute']:02d}" for entry in engine.parse_times(times)]
-                previous = self.schedule()
-                atomic_json(self.vault.data / "schedule.json", {
-                    "enabled": bool(request["enabled"]), "times": times, "last": previous["last"],
-                    "consumed": previous.get("consumed", [])})
+                try:
+                    previous = self.schedule()
+                except (OSError, ValueError, KeyError, TypeError, engine.BroadcastError):
+                    previous = {"last": ""}
+                history = list(previous.get("history", []))
+                previous.update(enabled=bool(request["enabled"]), times=sorted(set(times)),
+                                checked=datetime.now().strftime(mac_schedule.SLOT_FORMAT), pending=None)
+                mac_schedule.record(previous, "enabled" if previous["enabled"] else "disabled",
+                                    "Schedule saved. Pending sends cancelled; new times use the saved draft." if previous["enabled"]
+                                    else "Schedule disabled. Pending sends cancelled; an active broadcast continues.", datetime.now())
+                self.save_schedule_state(previous, history)
+                self.schedule_error = None
                 return {"saved": True}
             if op == "settings":
                 for key, value in request["values"].items():
