@@ -77,9 +77,12 @@ class UpdateResult:
     changed: bool
     message: str
     needs_setup: bool = False
+    error: bool = False
 
 
-UPDATE_SETUP_FILES = ("Setup.command", "scripts/make-dock-app.sh")
+UPDATE_SETUP_FILES = ("Setup.command", "scripts/make-dock-app.sh", "requirements-macos.txt",
+                      "scripts/install-mac-service.py", "scripts/mac-security.swift",
+                      "scripts/mac-thumbnail.swift")
 
 
 def _git_head() -> str | None:
@@ -100,10 +103,10 @@ def git_pull() -> UpdateResult:
         proc = subprocess.run(["git", "-C", str(PROJECT_DIR), "pull", "--ff-only"],
                               capture_output=True, text=True, errors="replace", timeout=60)
     except (OSError, subprocess.SubprocessError) as exc:
-        return UpdateResult(False, f"Couldn't run git: {exc}")
+        return UpdateResult(False, f"Couldn't run git: {exc}", error=True)
     out = (proc.stdout + proc.stderr).strip()
     if proc.returncode != 0:
-        return UpdateResult(False, out or "git pull failed.")
+        return UpdateResult(False, out or "git pull failed.", error=True)
     after = _git_head()
     changed = before != after if before and after else "Already up to date" not in out
     if not changed:
@@ -115,9 +118,11 @@ def git_pull() -> UpdateResult:
                 ["git", "-C", str(PROJECT_DIR), "diff", "--name-only", before, after, "--",
                  *UPDATE_SETUP_FILES],
                 capture_output=True, text=True, errors="replace", timeout=10)
-            needs_setup = changed_files.returncode == 0 and bool(changed_files.stdout.strip())
+            needs_setup = changed_files.returncode != 0 or bool(changed_files.stdout.strip())
         except (OSError, subprocess.SubprocessError):
-            pass
+            needs_setup = True
+    else:
+        needs_setup = True
     return UpdateResult(True, out or "Updated.", needs_setup)
 
 

@@ -9,6 +9,7 @@ import resource
 import secrets
 import signal
 import socket
+import mac_retry
 import socketserver
 import subprocess
 import sys
@@ -136,6 +137,12 @@ class Service:
         self.recovery_error = None
         self.on_erased = None
         self.last_operation = None
+        self.update_state = None
+        self.restart_requested = False
+        self.on_restart = None
+        self.version = engine.app_version()
+        self.send_progress = None
+        self.phase = None
 
     def recover(self):
         self.vault.prepare()
@@ -320,6 +327,9 @@ class Service:
                 "attachments": safe(engine.read_attachments, []),
                 "schedule": self.schedule(), "job": self.job["kind"] if self.job else None,
                 "last_operation": self.last_operation,
+                "update": self.update_state, "version": self.version,
+                "retry_count": mac_retry.available_count(),
+                "send_progress": self.send_progress, "phase": self.phase,
                 "events": [event for event in self.events if event["id"] > after],
                 "sequence": self.sequence,
                 "interrupted": asdict(interrupted) if interrupted else None,
@@ -332,23 +342,30 @@ class Service:
     def _start_job(self, kind):
         if self.job:
             raise SecurityError("Signal is busy. Wait for the current operation.")
-        if kind not in {"link", "sync", "notes", "send", "resume", "health"}:
+        if self.update_state and self.update_state.get("changed"):
+            raise SecurityError("Restart or finish installing the downloaded update first.")
+        if kind not in {"link", "sync", "notes", "send", "resume", "retry", "health", "update"}:
             raise SecurityError("Unsupported job.")
-        if kind in ("send", "resume"):
+        if kind in ("send", "resume", "retry"):
             cfg = engine.load_config()
             if self.link_broken:
                 raise SecurityError("This Signal link is broken. Erase and link again.")
             blocked = engine.cooldown_blocks_run(cfg.cooldown_hours)
-            if blocked:
+            if blocked and kind != "retry":
                 raise SecurityError(blocked)
             if not engine.read_groups():
                 raise SecurityError("Choose at least one group.")
-            if kind == "send" and engine.read_interrupted_run():
+            if kind in ("send", "retry") and engine.read_interrupted_run():
                 raise SecurityError("Review and resume or discard the interrupted broadcast first.")
+            if kind == "retry":
+                mac_retry.groups()
         proc = self.spawn([sys.executable, str(PROJECT / "mac_worker.py")],
                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                           text=True, start_new_session=True)
         job = {"kind": kind, "proc": proc}
+        if kind == "update":
+            self.update_state = {"changed": True, "needs_setup": True,
+                                 "message": "Update interrupted. Run Setup before continuing."}
         self.job = job
         try:
             atomic_json(self.vault.root / "worker.json", {"pid": proc.pid})
@@ -361,6 +378,8 @@ class Service:
             self.job = None
             raise
         self.last_operation = None
+        self.send_progress = None
+        self.phase = None
         self._event("started", kind)
         threading.Thread(target=self._read_job, args=(job,), daemon=True).start()
         return {"started": kind}
@@ -377,6 +396,12 @@ class Service:
                 with self.mutex:
                     if self.job is not job or self.vault.marker.exists():
                         continue
+                    if event["kind"] == "send_status":
+                        self.send_progress = event["value"]
+                    if event["kind"] == "phase":
+                        self.phase = event["value"]
+                    if event["kind"] == "update":
+                        self.update_state = event["value"]
                     if event["kind"] == "link_broken" and event["value"] is True:
                         self.link_broken = True
                     if event["kind"] in {"log", "progress", "results", "qr", "error", "done", "phase", "receive_status"}:
@@ -397,7 +422,13 @@ class Service:
 
     def tick(self, now: datetime | None = None):
         with self.mutex:
+            if self.restart_requested:
+                if self.on_restart:
+                    self.on_restart()
+                return
             if not self.open or self.job or self.vault.marker.exists() or self.shutting_down:
+                return
+            if self.update_state and self.update_state.get("changed"):
                 return
             schedule = self.schedule()
             now = now or datetime.now()
@@ -435,6 +466,13 @@ class Service:
                 return self.snapshot(int(request.get("after", 0)))
             if op == "change_password":
                 return self.change_password(request.get("current", ""), request.get("new", ""))
+            if op == "restart_update":
+                if self.job or not self.update_state or not self.update_state.get("changed"):
+                    raise SecurityError("Wait for the update to finish before restarting.")
+                if self.update_state.get("needs_setup"):
+                    raise SecurityError("Finish installing this update with Setup first.")
+                self.restart_requested = True
+                return {"restarting": True}
             if op == "job":
                 return self._start_job(request.get("kind"))
             if op == "stop":
@@ -445,7 +483,7 @@ class Service:
                     self._event("stopped", kind)
                 return {"stopped": True}
             if op == "save":
-                if self.job and self.job["kind"] in ("send", "resume"):
+                if self.job and self.job["kind"] in ("send", "resume", "retry", "update"):
                     raise SecurityError("Wait for the broadcast before replacing its saved draft.")
                 paths = request.get("attachments", [])
                 if not isinstance(paths, list) or len(paths) > 100:
@@ -456,6 +494,8 @@ class Service:
                         raise SecurityError("Import each attachment into the vault first.")
                 engine.write_message(str(request.get("message", "")))
                 engine.write_attachments(paths)
+                if "message_style" in request:
+                    engine.set_config_value("message_style", engine.normalize_message_style(request["message_style"]))
                 return {"saved": True}
             if op == "import":
                 if self.job:
@@ -476,6 +516,8 @@ class Service:
                 return {"saved": True}
             if op == "settings":
                 for key, value in request["values"].items():
+                    if self.job:
+                        raise SecurityError("Wait for the active operation before changing settings.")
                     if key == "message_style":
                         engine.set_config_value(key, engine.normalize_message_style(value))
                     elif key in ("base_delay_seconds", "jitter_seconds", "cooldown_hours", "max_retries", "concurrent_sends"):
@@ -609,6 +651,7 @@ def main():
             service.shutting_down = True
             stop.set()  # launchd starts a fresh process without the old Python heap.
         service.on_erased = restart_after_erasure
+        service.on_restart = restart_after_erasure
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
         signal.signal(signal.SIGINT, lambda *_: stop.set())
         threading.Thread(target=server.serve_forever, daemon=True).start()

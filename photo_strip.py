@@ -10,6 +10,36 @@ from tkinter import messagebox, ttk
 import thumbs
 
 
+class _Tooltip:
+    def __init__(self, widget, text):
+        self.widget, self.text = widget, text
+        self.pending = self.window = None
+        widget.bind("<Enter>", self.schedule, add="+")
+        for event in ("<Leave>", "<ButtonPress>", "<Destroy>"):
+            widget.bind(event, self.hide, add="+")
+
+    def schedule(self, _=None):
+        self.hide()
+        self.pending = self.widget.after(550, self.show)
+
+    def show(self):
+        self.pending = None
+        self.window = tk.Toplevel(self.widget)
+        self.window.overrideredirect(True)
+        x = min(self.widget.winfo_rootx(), self.widget.winfo_screenwidth() - 290)
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 5
+        self.window.geometry(f"+{max(0, x)}+{y}")
+        ttk.Label(self.window, text=self.text, padding=8, wraplength=270).pack()
+
+    def hide(self, _=None):
+        if self.pending is not None:
+            self.widget.after_cancel(self.pending)
+            self.pending = None
+        if self.window is not None:
+            self.window.destroy()
+            self.window = None
+
+
 class PhotoStrip(ttk.Frame):
     """The attached photos as a wrapping strip of numbered thumbnails, dragged to
     reorder.
@@ -85,14 +115,19 @@ class PhotoStrip(ttk.Frame):
         self.row = row = ttk.Frame(self)
         self.done_btn = ttk.Button(row, text="Done", command=lambda: self.set_open(False))
         self.done_btn.pack(side="left", padx=(0, 12))
-        self.left_btn = ttk.Button(row, text="◀ Earlier", command=lambda: self._nudge(-1))
-        self.right_btn = ttk.Button(row, text="Later ▶", command=lambda: self._nudge(1))
-        self.rm_btn = ttk.Button(row, text="Remove", command=self._remove_selected)
+        self.left_btn = ttk.Button(row, text="Move earlier", command=lambda: self._nudge(-1))
+        self.right_btn = ttk.Button(row, text="Move later", command=lambda: self._nudge(1))
+        self.rm_btn = ttk.Button(row, text="Remove photo", command=self._remove_selected)
         self.view_btn = ttk.Button(row, text="Preview", command=self._preview_selected)
         for b in (self.left_btn, self.right_btn, self.rm_btn, self.view_btn):
             b.pack(side="left", padx=(0, 6))
-        self.hint = ttk.Label(row, foreground=self.palette["muted"], text="")
-        self.hint.pack(side="left", padx=(6, 0))
+        self.hint = ttk.Label(self, foreground=self.palette["muted"], text="", wraplength=520)
+        self._tips = [
+            _Tooltip(self.left_btn, "Move the selected photo one place earlier in the send order."),
+            _Tooltip(self.right_btn, "Move the selected photo one place later in the send order."),
+            _Tooltip(self.rm_btn, "Remove the selected photo from this message. The image file is kept."),
+            _Tooltip(self.view_btn, "Open a larger view of the selected photo. Double-clicking a photo also opens it."),
+        ]
         self._sync_layout()
         self._drain_after = self.after(120, self._drain_thumbs)
         self._resize_binding = self.winfo_toplevel().bind("<Configure>", self._window_resized, add="+")
@@ -139,10 +174,12 @@ class PhotoStrip(ttk.Frame):
         if self._open:
             self.well.pack(fill="x", pady=(6, 0))
             self.row.pack(fill="x", pady=(5, 0))
+            self.hint.pack(fill="x", pady=(3, 0))
             self.toggle_btn.configure(text="Hide ▾")
         else:
             self.well.pack_forget()
             self.row.pack_forget()
+            self.hint.pack_forget()
             self.toggle_btn.configure(text="Reorder photos ▸")
         # With nothing attached there is nothing to reorder, so the button would only be
         # a dead control — the summary line says what to do instead.
@@ -252,7 +289,7 @@ class PhotoStrip(ttk.Frame):
         rows = max(1, -(-len(self._paths) // self._cols))
         height = (self.EMPTY_H if not self._paths
                   else 2 * self.PAD + rows * self.IMG + (rows - 1) * self.GAP)
-        visible_rows = 1 if self.winfo_toplevel().winfo_height() < 740 else 2
+        visible_rows = 1 if self.winfo_toplevel().winfo_height() < 900 else 2
         viewport = min(height, 2 * self.PAD + visible_rows * self.IMG + (visible_rows - 1) * self.GAP)
         self.canvas.configure(scrollregion=(0, 0, width, height))
         if self.canvas.winfo_height() != viewport:
@@ -310,12 +347,12 @@ class PhotoStrip(ttk.Frame):
         elif not self._paths:
             self.hint.configure(text="")
         elif self._sel is None:
-            self.hint.configure(text="Drag to reorder.")
+            self.hint.configure(text="Drag photos to change their send order. Click a photo to use the controls.")
         else:
             name = Path(self._paths[self._sel]).name
             if len(name) > 26:                     # keep the row from stretching the window
                 name = name[:23] + "…"
-            self.hint.configure(text=f"#{self._sel + 1}: {name}")
+            self.hint.configure(text=f"Photo {self._sel + 1}: {name}. Move changes send order; Remove detaches it from this message.")
 
     # ------------------------------------------------------------ interaction
     def _hit(self, x: int, y: int) -> tuple[int | None, bool]:
@@ -469,6 +506,8 @@ class PhotoStrip(ttk.Frame):
         win.focus_set()
 
     def destroy(self):
+        for tooltip in self._tips:
+            tooltip.hide()
         self.winfo_toplevel().unbind("<Configure>", self._resize_binding)
         self.after_cancel(self._drain_after)
         with self._result_lock:

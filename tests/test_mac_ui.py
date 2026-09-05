@@ -44,10 +44,25 @@ class MacUITests(unittest.TestCase):
                         "base_delay_seconds": 1, "jitter_seconds": 0,
                         "cooldown_hours": 0, "concurrent_sends": 1},
                     "groups": [{"group_id": "fixture", "name": "Fixture", "enabled": True}],
-                    "notes": [], "job": None, "events": [], "sequence": 0}
+                    "notes": [{"ts": 1, "text": "Full note " * 30, "photos": []}], "job": None, "events": [], "sequence": 0}
             try:
                 app.initial_snapshot(data)
                 app.update()
+                app.fixture_snapshot = data
+                self.assertEqual(app.note_preview.get("1.0", "end-1c"), "Full note " * 30)
+                self.assertEqual(app.update_button.cget("text"), "Update")
+                app.group_query.set("No match")
+                app.save_groups()
+                self.assertIn(("groups", {"enabled": ["fixture"]}), app.requests)
+                app.group_query.set("")
+                app.select_groups(False)
+                app.save_groups()
+                self.assertEqual(app.requests[-1], ("groups", {"enabled": []}))
+                app.select_groups(True)
+                app.style.set("Bold")
+                app.preview_style()
+                app.save()
+                self.assertEqual(app.requests[-1][1]["message_style"], "bold")
                 strip = app.photo_strip
                 deadline = time.monotonic() + 10
                 while strip._pending and time.monotonic() < deadline:
@@ -81,6 +96,10 @@ class MacUITests(unittest.TestCase):
                 self.assertEqual(app.operation_text.get(), "Sending…")
                 self.assertTrue(app.operation_progress.winfo_manager())
                 self.assertEqual(str(app.stop_button.cget("state")), "normal")
+                self.assertEqual(str(app.update_button.cget("state")), "disabled")
+                app.data["send_progress"] = {"active": 2, "completed": 1, "total": 3}
+                app.refresh_elapsed()
+                self.assertIn("2 sends in progress", app.activity_hint.get())
                 before = app.operation_progress.cget("value")
                 deadline = time.monotonic() + 0.15
                 while time.monotonic() < deadline:
@@ -126,8 +145,11 @@ class MacUITests(unittest.TestCase):
                     for button in (app.send_button, app.save_button):
                         self.assertTrue(button.winfo_viewable(), geometry)
                         self.assertLess(button.winfo_rooty() + button.winfo_height(), app.winfo_rooty() + app.winfo_height())
+                strip._tips[0].show()
+                self.assertIsNotNone(strip._tips[0].window)
                 app.show_login()
                 app.update()
+                self.assertIsNone(strip._tips[0].window)
                 self.assertEqual(app.images, [])
                 self.assertFalse(strip._photos)
                 self.assertFalse(strip._previews)
