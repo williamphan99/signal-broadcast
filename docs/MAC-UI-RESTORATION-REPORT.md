@@ -39,26 +39,35 @@ temporary directory.
 Stopping affects the current operation. Saved schedules remain enabled, which the
 screen explicitly reports. Already-dispatched messages may still arrive after Stop.
 
-## Other functionality lost in the earlier rewrite
+## Follow-up functionality restoration
 
-These are confirmed by comparing the controls in the legacy `gui.py` with the
-protected app. This change restores the photo workflow and operation feedback;
-the following omissions remain for a separate pass.
+The follow-up restores the omitted controls identified by comparing `gui.py` and
+`mac_app.py` after commit `0a84160`:
 
-| Customer capability | Current limitation | Source comparison |
-|---|---|---|
-| Choose message formatting | The Mac app has no Normal/Bold/Italic/etc. picker. The engine and service still support a saved style. | `gui.App._build_send_tab`, `mac_service.Service.handle` settings |
-| Retry only failed groups | No equivalent of the old Resend failed button. Resume handles an interrupted run, which is a different case. | `gui.App._on_resend`, `mac_worker.run` |
-| Search groups and select all/none | The new Groups tab has individual toggles and Save but no search or bulk selection. This matters for large group lists. | `gui.App._build_groups_tab`, `mac_app.App.build_tabs` |
-| Read a whole note before using it | The Notes tab shows an 80-character snippet and photo count. The old full-text pane, Copy text button and double-click shortcut are missing. Use as message still transfers the full text. | `gui.App._build_notes_tab`, `mac_app.App.use_note` |
-| Update from inside the app | The Update button is gone. Customers must pull the repository and run Setup. | `gui.App._check_update`, `README.md` |
-| See the last scheduled send | The old Schedule tab's last-send summary is absent. The service still exposes a saved run summary; this change shows results for completed operations during its lifetime. | `gui.App._build_schedule_tab`, `mac_service.Service.snapshot` |
-| Manage diagnostic logging | The debug-log toggle and Open logs folder action are absent. Clear logs remains. | `gui.App._build_security_tab`, `mac_app.App.build_tabs` |
-| Clear all attached photos at once | Customers can remove individual thumbnails, but the old Clear-all attachment action is absent. | `gui.App._build_send_tab`, `mac_app.App.build_tabs` |
+- Update in the authenticated header, with Finish update for restart or Setup.
+  Updates cannot interrupt a worker. A downloaded update pauses new manual jobs
+  and scheduled jobs until installation/restart completes. Git failures are shown
+  separately from an already-current result. Native helper, installer and dependency
+  changes require Setup.
+- Whole-message formatting saved with the draft.
+- Failed-only retry, persisted inside the vault and tied to saved text, attachment
+  order and formatting. Sent, skipped and unconfirmed recipients are excluded.
+  An interrupted broadcast must be resolved first. The old retry list is cleared
+  before dispatch so a crash cannot reuse successes from a preceding attempt.
+- Group search and select/deselect visible matches. Saving retains hidden selections.
+- Complete note text, Copy text and double-click to use it. Incomplete notes remain
+  blocked from use; selecting a note survives list refresh by timestamp.
+- Persisted last-send counts on Schedule and Clear all photos on Send.
+- Photo-control help explaining send order and removal from the current message.
+- Actual active-send and completed-group counts. Completion counts stay monotonic
+  when parallel workers finish out of order. Preparing continues until dispatch
+  starts, with animation indicating active work rather than successful delivery.
+- Send and Save positioned ahead of the draft so large albums cannot hide them.
 
-The highest-priority remaining customer losses are group search/bulk selection,
-failed-only retry, and the complete Notes preview. Restoring failed-only retry must
-preserve the engine's treatment of unconfirmed deliveries to avoid duplicates.
+The user-visible activity/logs box and logging controls are unchanged in this
+follow-up, as requested. Diagnostic controls omitted by the earlier rewrite remain
+outside this restoration. Existing failed runs without the new retry record cannot
+be reconstructed as a failed-only retry.
 
 The removals of wipe-on-quit and unplug-to-wipe were intentional requirements.
 Manual locking replaced them. The unauthenticated Mac web interface was also
@@ -126,27 +135,24 @@ erase customer data.
 
 ## Verification
 
-Final combined run: **331 tests discovered, 325 passed, 6 optional native vault
-integration checks skipped**, in 25.679 seconds.
+Full suite: **342 tests discovered, 336 passed, 6 optional hardware integration
+checks skipped**. The final skipped-first-send progress adjustment also passed all
+11 focused restoration tests. Python compilation and `git diff --check` passed.
+
+The regression suite includes disposable service tests for formatting persistence,
+retry eligibility, update/schedule exclusion, authenticated restart and progress
+persistence across locking. Simulated sends verify out-of-order completion counts
+and clearing stale retry recipients before dispatch.
+
+Native Tk tests cover the update control, formatting save, complete note text,
+filtered group selection, actual concurrency labels, tooltip cleanup, thumbnail
+rendering, dragging, previews, Stop handling, animation and Send/Save visibility at
+760×780 and 620×650. No live Signal sends or customer vault changes were performed.
+The optional APFS/Keychain/launchd integration suite was not repeated.
+
+Run with:
 
 ```sh
 SB_RUN_MAC_UI=1 SB_RUN_MAC_PHOTOS=1 SB_RUN_MAC_IPC=1 SB_RUN_MAC_PROCESSES=1 \
   .venv/bin/python -m unittest discover -s tests
 ```
-
-The new native UI regression first failed because the replacement app had no photo
-strip. It now passes real Tk thumbnail rendering, drag events, preview windows,
-the ordered save/send request, animation movement, duplicate Stop prevention,
-failed-stop feedback, confirmed Stop, stale-snapshot rejection, 15-photo layouts at
-760×780 and 620×650, and image cleanup on lock.
-
-Additional checks cover real PNG/JPEG/HEIC decoding, decoder cancellation and
-timeouts, saved order after lock/unlock, a disposable worker exiting before Stopped
-is recorded, and worker failures remaining distinct from successful completion.
-Shell syntax, Python compilation and `git diff --check` passed.
-
-The unchanged APFS/Keychain/launchd hardware integration suite was not repeated for
-this interface change. No live Signal delivery, customer vault migration or
-customer erasure was performed. The UI fixture and disposable service tests confirm
-request and saved order; actual delivery order remains part of the recipient-side
-customer test.

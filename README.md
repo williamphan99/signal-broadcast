@@ -30,10 +30,12 @@ If migration cannot finish, normal access remains blocked and the originals need
 for recovery are retained. Restore any missing attachments and unlock again to
 retry. Do not delete your old files manually while migration is incomplete.
 
-Keep the clone in its original location. If you move it, run Setup again. Update
-with `git pull --ff-only`, then run Setup. Setup restarts the background service;
-finish active broadcasts before upgrading. Unlock after the restart and review any
-interrupted broadcast before resuming it.
+Keep the clone in its original location. If you move it, run Setup again. After
+unlocking, use **Update** in the header, then **Finish update**. Code-only updates
+restart the app and service; dependency changes open Setup. Active operations must
+finish first. Downloaded updates pause scheduled sends until installation finishes.
+Unlock again after restarting. Older installations without the button need one
+manual `git pull --ff-only` followed by `Setup.command` to receive it.
 
 ## Locking, closing and erasing
 
@@ -76,16 +78,26 @@ old background jobs. Unplugging the Mac no longer erases data.
   were skipped by an older version must be forwarded to Note to Self again.
   The app keeps the latest 300 unexpired notes. Debug summaries in
   `logs/notes-debug.txt` record counts, duration and completion status inside the vault.
-- **Groups**: refresh the list, toggle selected groups and save the selection.
-- **Schedule**: save daily times and enable background sends of the saved draft.
+- **Groups**: search, toggle groups, select/deselect visible matches and save.
+  Selections outside the current search are retained.
+- **Schedule**: save daily times, enable background sends and see the last result.
 - **Security**: change the password, lock, erase, clear logs or adjust sending pace.
 
-Photos appear as numbered thumbnails. Drag them into send order, use Earlier/Later,
-or double-click a photo to preview it. Large albums scroll inside the photo strip.
+Choose formatting beside the message. Notes show the complete text before you
+use or copy it. **Retry failed groups** uses the unchanged saved draft and excludes
+successful, skipped and unconfirmed deliveries. Changing the saved text, photo
+list or formatting disables that retry.
+
+Photos appear as numbered thumbnails. Drag them into send order, use Move earlier
+or Move later, or double-click a photo to preview it. Hover over the controls for
+help. Remove photo and Clear all photos detach images from the draft; they keep
+the stored files. Large albums scroll inside the photo strip.
 Thumbnails and previews are decoded in memory and cleared when the interface locks.
 
 During a broadcast, a moving indicator, elapsed time and friendly activity updates
-show that work is continuing. Stop changes to **Stopping…** while the service waits
+show that work is continuing. A live count shows sends in progress and completed
+groups, including when parallel sends finish out of order. Preparation and waiting
+are separate from successful delivery. Stop changes to **Stopping…** while the service waits
 for its workers to exit. **Broadcast stopped** appears only after confirmation.
 Already-dispatched messages may still arrive. Stopping a broadcast leaves any saved
 schedule enabled. Resume and Discard appear only when there is an interrupted run.
