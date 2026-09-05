@@ -68,6 +68,14 @@ old background jobs. Unplugging the Mac no longer erases data.
   the send. Locking or closing the window does not stop it.
 - **Notes**: check Signal's Note to Self, select a note and use its text and complete
   attachments as the draft. Deleting a note removes only the local copy.
+  Both Notes and group refresh download attachments and save each received note
+  immediately. A receive operation allows up to one hour for large files and shows
+  progress every five seconds. Unrelated pending messages and their attachments can
+  add to the wait. An interrupted check keeps saved notes and reports that it is
+  incomplete; check again to receive the remaining queue. Notes whose attachments
+  were skipped by an older version must be forwarded to Note to Self again.
+  The app keeps the latest 300 unexpired notes. Debug summaries in
+  `logs/notes-debug.txt` record counts, duration and completion status inside the vault.
 - **Groups**: refresh the list, toggle selected groups and save the selection.
 - **Schedule**: save daily times and enable background sends of the saved draft.
 - **Security**: change the password, lock, erase, clear logs or adjust sending pace.

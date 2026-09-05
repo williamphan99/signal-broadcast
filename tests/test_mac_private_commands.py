@@ -59,6 +59,23 @@ class PrivateCommandTests(unittest.TestCase):
                     sync.assert_not_called()
                     notes.assert_not_called()
 
+    def test_incomplete_notes_job_fails_with_the_safe_receive_warning(self):
+        with tempfile.TemporaryDirectory(prefix="sb-private-notes-") as temporary:
+            root = Path(temporary) / "mounted" / "store"
+            root.mkdir(parents=True)
+            def receive(_account, on_log):
+                on_log("Receiving: 1 message processed.")
+                return {"complete": False, "warning": "Receiving reached the one-hour limit."}
+            with mock.patch("pathlib.Path.is_mount", return_value=True), \
+                 mock.patch.dict(mac_worker.os.environ), \
+                 mock.patch.object(engine, "load_config", return_value=mock.Mock(account="+19999999999")), \
+                 mock.patch.object(engine, "detect_account", return_value="+19999999999"), \
+                 mock.patch.object(engine, "fetch_notes", side_effect=receive), \
+                 mock.patch.object(mac_worker, "emit") as emit:
+                with self.assertRaisesRegex(engine.ReceiveError, "one-hour"):
+                    mac_worker.run({"root": str(root), "job": "notes"})
+                emit.assert_any_call("receive_status", "Receiving: 1 message processed.")
+
     def test_private_account_detection_rejects_ambiguous_legacy_store(self):
         accounts = '[{"number":"+19999999999"},{"number":"+18888888888"}]'
         with mock.patch.object(engine, "signal_cli_bin", return_value="/disposable/signal-cli"), \

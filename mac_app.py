@@ -317,7 +317,9 @@ class App(tk.Tk):
             if kind == "qr" and self.screen == "link":
                 self.qr_image = tk.PhotoImage(data=value)
                 self.qr.configure(image=self.qr_image)
-            elif kind in ("error", "log", "finished", "progress"):
+            elif kind == "finished" and value in ("notes", "sync"):
+                continue  # Keep the receive summary or warning visible.
+            elif kind in ("error", "log", "finished", "progress", "receive_status"):
                 text = (f"{value['done']}/{value['total']} {value['status']}" if kind == "progress" else str(value))
                 self.notice.set(text)
                 if self.screen == "main":
@@ -385,7 +387,7 @@ class App(tk.Tk):
         note = self.data["notes"][selected[0]]
         paths = [photo["path"] for photo in note.get("photos", []) if photo.get("path")]
         if note.get("missing_photos") or note.get("missing_body") or len(paths) != len(note.get("photos", [])):
-            self.notice.set("Some note attachments are missing. Check for new notes before using this message.")
+            self.notice.set("Some note attachments are missing. Forward the original note again, then check for new notes.")
             return
         self.message.delete("1.0", "end")
         self.message.insert("1.0", note.get("text", ""))

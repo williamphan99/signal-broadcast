@@ -309,6 +309,33 @@ class NotesStatusTests(unittest.TestCase):
         app._log.assert_called_once_with(
             "Notes check: 253 processed, 1 note(s) to self, 0 new.", "muted")
 
+    def test_incomplete_check_keeps_warning_instead_of_nothing_new(self):
+        app = gui.App.__new__(gui.App)
+        for attribute in ("notes_progress", "notes_btn", "notes_status", "notes_list",
+                          "_render_notes", "_log", "_show_note"):
+            setattr(app, attribute, mock.Mock())
+        app._finish_notes({"new": 0, "complete": False, "warning": "Receiving timed out. Try again."})
+        self.assertEqual(app.notes_status.configure.call_args.kwargs["text"],
+                         "Receiving timed out. Try again.")
+
+    def test_mac_completion_does_not_overwrite_receive_warning(self):
+        from mac_app import App as MacApp
+        for operation in ("notes", "sync"):
+            with self.subTest(operation=operation):
+                app = MacApp.__new__(MacApp)
+                app.screen = "main"
+                app.sequence = 0
+                app.group_signature = app.notes_signature = []
+                app.notice = mock.Mock()
+                app.activity = mock.Mock()
+                app.add_activity = mock.Mock()
+                app.refresh_controls = mock.Mock()
+                app.apply_snapshot({"job": None, "groups": [], "notes": [], "sequence": 2,
+                                    "events": [{"id": 1, "kind": "receive_status", "value": "Receiving was incomplete."},
+                                               {"id": 2, "kind": "finished", "value": operation}]})
+                app.notice.set.assert_called_once_with("Receiving was incomplete.")
+                self.assertEqual(app.sequence, 2)
+
     def test_missing_long_text_and_photos_have_plain_recovery_copy(self):
         app = gui.App.__new__(gui.App)
         app._notes = [{

@@ -1236,7 +1236,8 @@ class App(tk.Tk):
 
         def work():
             try:
-                self.events.put(("notes_done", engine.fetch_notes(account)))
+                self.events.put(("notes_done", engine.fetch_notes(
+                    account, on_log=lambda text: self.events.put(("notes_progress", text)))))
             except engine.BroadcastError as exc:
                 self.events.put(("notes_done", str(exc)))
             except Exception as exc:  # noqa: BLE001 — the event MUST be posted: it's
@@ -1256,12 +1257,17 @@ class App(tk.Tk):
             self.notes_status.configure(text=result, foreground=PALETTE["error"])
             self._log(f"Notes check failed: {result}", "error")
             return
+        if result.get("warning") or result.get("complete") is False:
+            warning = result.get("warning") or "Receiving was incomplete. Saved notes are kept; try again."
+            self.notes_status.configure(text=warning, foreground=PALETTE["error"])
+            self._log(warning, "error")
+            return
         new = result.get("new", 0)
         self._log(f"Notes check: {result.get('envelopes', 0)} processed, "
                   f"{result.get('notes', 0)} note(s) to self, {new} new.", "muted")
         if new:
             self.notes_status.configure(
-                text=f"{new} new note{'' if new == 1 else 's'}.", foreground=PALETTE["ok"])
+                text=f"{new} new or updated note{'' if new == 1 else 's'}.", foreground=PALETTE["ok"])
             self.notes_list.selection_clear(0, "end")
             self.notes_list.selection_set(0)     # newest first — land on what just arrived
             self.notes_list.see(0)
@@ -2083,7 +2089,7 @@ class App(tk.Tk):
     # the work they'd report on belongs to a screen that no longer exists.
     _MAIN_SCREEN_EVENTS = frozenset({
         "log", "group_start", "progress", "send_done",
-        "refresh_status", "refresh_done", "group_perms", "notes_done", "verify_link_retry",
+        "refresh_status", "refresh_done", "group_perms", "notes_done", "notes_progress", "verify_link_retry",
     })
 
     def _handle(self, kind: str, payload) -> None:
@@ -2165,6 +2171,8 @@ class App(tk.Tk):
                 self.groups_sync_label.configure(text=payload)
         elif kind == "refresh_done":
             self._finish_refresh(payload)
+        elif kind == "notes_progress":
+            self.notes_status.configure(text=payload, foreground=PALETTE["muted"])
         elif kind == "notes_done":
             self._finish_notes(payload)
         elif kind == "update_done":

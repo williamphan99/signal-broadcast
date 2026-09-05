@@ -170,7 +170,7 @@ CONFIRM_GRACE_S = 60             # after a send times out, how long to keep list
 # receive, so we drain in short bursts until the count stops growing (or the cap).
 SYNC_BURST_S = 5                 # one receive burst while draining the phone's sync
 SYNC_MAX_S = 60                  # budget once no more progress is being made
-SYNC_HARD_CAP_S = 240            # ceiling on the receive/list LOOP, checked between
+SYNC_HARD_CAP_S = 3600           # ceiling on the receive/list LOOP, checked between
                                  # signal-cli calls. A catalog read already in flight is
                                  # never cut short by it — that read has its own
                                  # progress-based limits below, and on a large account it
@@ -222,6 +222,10 @@ MESSAGE_STYLE_LABELS: tuple[tuple[str, str], ...] = (
 
 class BroadcastError(Exception):
     """Recoverable, user-facing problem (bad config, missing file, no signal-cli)."""
+
+
+class ReceiveError(BroadcastError):
+    """Content-free receive failure safe to display in the protected Mac client."""
 
 
 class AccountSelectionError(BroadcastError):
@@ -1096,14 +1100,12 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
     _sync_log(f"--- sync start (runtime={runtime}) ---")
     _request_sync(binary, account)
     on_log("Syncing your groups from your phone…")
-    recv_timeout = SYNC_BURST_S + 10
     deadline = time.monotonic() + SYNC_MAX_S
     hard_cap = time.monotonic() + SYNC_HARD_CAP_S   # ceiling even while draining a backlog
     last, stable = -1, 0     # last == -1 means "no listGroups has EVER succeeded"
     last_error = ""
     last_list_error = ""
     list_failures = 0
-    dead_timeouts = 0        # receive timeouts that produced NO output (real connect hang)
     connected = False        # did receive ever reach the server (produce any output)?
     catalog_stall: GroupCatalogStalled | None = None
     rounds = 0
@@ -1122,71 +1124,14 @@ def _sync_groups_unlocked(account: str, on_log: LogFn = lambda *_: None) -> int:
         if last <= 0 and rounds > 1 and rounds % SYNC_RENUDGE_EVERY == 1:
             _sync_log(f"re-nudging phone (sendSyncRequest), round {rounds}")
             _request_sync(binary, account)
-        try:
-            # --timeout is signal-cli's own idle cap; the outer subprocess timeout is a
-            # hard kill-switch. A burst can hit that ceiling two ways: hung on connect
-            # (no output), or busy downloading a large message backlog (lots of output).
-            #
-            # We only want the group list, so tell receive NOT to download any message
-            # CONTENT — attachments, avatars, stickers, stories. On an account with a big
-            # media backlog that's the whole bottleneck; the group/contacts sync that
-            # populates listGroups is a small control message that still comes through.
-            # This makes the drain many times faster without changing what we learn.
-            #
-            # -o json so the drain is parseable on the way past: this queue also
-            # carries the phone's notes-to-self, and each message is delivered to this
-            # device exactly once, so anything we don't keep here is lost.
-            recv = subprocess.run(_cli(binary, "--config", str(DATA_DIR), *_account_args(account),
-                                       "-o", "json",
-                                       "receive", "--timeout", str(SYNC_BURST_S),
-                                       "--ignore-attachments", "--ignore-avatars",
-                                       "--ignore-stickers", "--ignore-stories"),
-                                  capture_output=True, text=True, errors="replace",
-                                  timeout=recv_timeout, env=_signal_env(binary))
-        except subprocess.TimeoutExpired as exc:
-            out_raw = exc.output or b""
-            _save_notes_seen_during(out_raw.decode("utf-8", "replace")
-                                    if isinstance(out_raw, bytes) else str(out_raw))
-            raw = exc.stderr or exc.output or b""
-            partial = (raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)).strip()
-            if partial and ACCOUNT_UNUSABLE_PATTERN.search(partial):
-                last_error = partial   # dead account, surfaced even mid-timeout
-                break
-            if partial:
-                # receive was actively downloading (backlog) — it CONNECTED, it's just
-                # busy. That's progress, not a connection failure. Give it more total
-                # time and fall through to listGroups: the group sync may already be in.
-                connected = True
-                round_active = True
-                deadline = min(hard_cap, time.monotonic() + SYNC_MAX_S)
-                _sync_log(
-                    f"receive busy-timeout ({recv_timeout}s), "
-                    "still downloading (output received)")
-            else:
-                # No output at all → genuinely stuck reaching the server.
-                dead_timeouts += 1
-                last_error = (f"signal-cli couldn't connect to Signal (timed out after "
-                              f"{recv_timeout}s). This is a network/connection problem — "
-                              "check the internet connection, and any VPN, firewall, or "
-                              "proxy on this machine.")
-                _sync_log(f"receive DEAD-timeout {dead_timeouts} ({recv_timeout}s), no output")
-                if dead_timeouts >= 2:   # one retry for a cold-connect blip, then give up
-                    break
-                continue
-        else:
-            _save_notes_seen_during(recv.stdout or "")
-            round_active = bool((recv.stdout or "").strip())
-            out = ((recv.stderr or "") + (recv.stdout or "")).strip()
-            if recv.returncode != 0:
-                _sync_log(f"receive rc={recv.returncode}: {_sync_error_summary(out)}")
-                if out:
-                    last_error = out
-                # A permanent account problem won't fix itself — stop and report it.
-                # (Don't set `connected`: an error reply is not a healthy connection.)
-                if ACCOUNT_UNUSABLE_PATTERN.search(out):
-                    break
-            elif out:
-                connected = True   # clean receive with output → we reached the server
+        report = _receive_messages(binary, account, SYNC_BURST_S, on_log)
+        if not report["complete"]:
+            _sync_log(f"receive incomplete: {report['warning']}")
+            raise ReceiveError(report["warning"])
+        connected = True
+        round_active = bool(report["envelopes"])
+        if round_active:
+            deadline = min(hard_cap, time.monotonic() + SYNC_MAX_S)
         list_started = time.monotonic()
         try:
             on_log("Reading your group list… Large accounts can take several minutes.")
@@ -1532,7 +1477,8 @@ def _notes_transaction() -> Iterator[None]:
             finally:
                 fcntl.flock(fh, fcntl.LOCK_UN)
 NOTES_BURST_S = 10        # signal-cli's own idle cap for one notes drain
-NOTES_TIMEOUT_S = 600     # hard ceiling for large notes with many full-size images
+RECEIVE_TIMEOUT_S = 3600  # one hour for large attachments, shared by Notes and Groups
+RECEIVE_PROGRESS_S = 5    # report counts even while signal-cli is downloading a file
 NOTES_KEEP = 300          # most recent notes retained
 LONG_MESSAGE_MIME = "text/x-signal-plain"
 
@@ -1579,13 +1525,8 @@ def _mark_note_attachment_missing(note: dict, att: dict) -> None:
         note["missing_photos"] += 1
 
 
-def _note_from_envelope(envelope: dict, media_downloaded: bool) -> dict | None:
-    """One stored note from one received envelope, or None if it isn't a note.
-
-    ``media_downloaded`` says whether this drain was allowed to fetch attachments. The
-    group sync deliberately isn't (it would pull the whole media backlog), so a note
-    that arrives during one keeps its text and records that its photos never landed —
-    better than showing a note with silently missing images."""
+def _note_from_envelope(envelope: dict) -> dict | None:
+    """Build a note using attachments downloaded by every receive operation."""
     sync = envelope.get("syncMessage")
     sent = sync.get("sentMessage") if isinstance(sync, dict) else None
     if not isinstance(sent, dict) or not _is_note_to_self(envelope, sent):
@@ -1617,7 +1558,7 @@ def _note_from_envelope(envelope: dict, media_downloaded: bool) -> dict | None:
                 pass
         else:
             path = _attachment_path(att)
-            if media_downloaded and path is not None and path.is_file():
+            if path is not None and path.is_file():
                 _apply_downloaded_note_attachment(note, att, path)
             else:
                 _mark_note_attachment_missing(note, att)
@@ -1627,12 +1568,10 @@ def _note_from_envelope(envelope: dict, media_downloaded: bool) -> dict | None:
     return note
 
 
-def harvest_notes(receive_output: str, media_downloaded: bool = True) -> list[dict]:
-    """Every note-to-self in one `receive -o json` run, oldest first. Tolerant by
-    design: a malformed line is skipped, never fatal — this runs inside the group sync,
-    which must not fail because of an odd envelope."""
+def harvest_notes(receive_output: str) -> list[dict]:
+    """Parse received notes oldest first, skipping malformed envelopes."""
     found, _, _ = _inspect_receive(
-        (receive_output or "").splitlines(), media_downloaded=media_downloaded,
+        (receive_output or "").splitlines(),
         collect_notes=True, log_summary=False)
     return found
 
@@ -1666,11 +1605,14 @@ def _tail(value) -> str:
 
 
 def _inspect_receive(
-    receive_lines: Iterable[str], *, media_downloaded: bool,
-    collect_notes: bool, log_summary: bool,
+    receive_lines: Iterable[str], *, collect_notes: bool, log_summary: bool,
+    on_note: Callable[[dict], None] | None = None,
+    counters: dict | None = None,
 ) -> tuple[list[dict], dict, bool]:
     """Classify a receive stream once, retaining only notes and bounded diagnostics."""
     found = []
+    counters = counters if counters is not None else {}
+    counters.update(envelopes=0, transcripts=0, notes=0, invalid=0)
     envelopes = transcripts = notes = 0
     samples = collections.deque(maxlen=5)
     had_output = False
@@ -1682,11 +1624,13 @@ def _inspect_receive(
         try:
             value = json.loads(line)
         except ValueError:
+            counters["invalid"] += 1
             continue
         envelope = value.get("envelope") if isinstance(value, dict) else None
         if not isinstance(envelope, dict):
             continue
         envelopes += 1
+        counters["envelopes"] = envelopes
         sync = envelope.get("syncMessage")
         sent = sync.get("sentMessage") if isinstance(sync, dict) else None
         if not isinstance(sent, dict):
@@ -1694,10 +1638,18 @@ def _inspect_receive(
         transcripts += 1
         matched = _is_note_to_self(envelope, sent)
         notes += int(matched)
+        counters.update(transcripts=transcripts, notes=notes)
         if collect_notes and matched:
-            note = _note_from_envelope(envelope, media_downloaded)
+            try:
+                note = _note_from_envelope(envelope)
+            except (TypeError, ValueError, OverflowError, AttributeError):
+                counters["invalid"] += 1
+                continue
             if note:
-                found.append(note)
+                if on_note is not None:
+                    on_note(note)
+                else:
+                    found.append(note)
         if log_summary:
             attachments = sent.get("attachments")
             samples.append((
@@ -1735,7 +1687,7 @@ def describe_receive(receive_output: str) -> dict:
     it was you sending anything; transcripts but no notes means you sent messages —
     to other people, not to yourself."""
     _, report, _ = _inspect_receive(
-        (receive_output or "").splitlines(), media_downloaded=False,
+        (receive_output or "").splitlines(),
         collect_notes=False, log_summary=True)
     return report
 
@@ -1792,21 +1744,30 @@ def write_notes(notes: list[dict]) -> None:
 def _write_notes_locked(notes: list[dict]) -> None:
     NOTES_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = NOTES_FILE.with_name(f"{NOTES_FILE.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(prune_notes(notes), indent=1), encoding="utf-8")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(prune_notes(notes), fh, indent=1)
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, NOTES_FILE)
+    directory = os.open(NOTES_FILE.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def store_notes(found: list[dict]) -> int:
-    """Add freshly-received notes to the stored ones and return how many were new.
+    """Save freshly received notes and return how many were new or improved.
 
     The read, the merge and the write are one operation under the lock — separately
     they're a lost update: the group sync's worker thread and the window can both be
     part-way through a read-modify-write at the same moment, and whoever writes last
     silently discards what the other did."""
     with _notes_transaction():
-        merged, new = merge_notes(_read_notes_locked(), found)
-        _write_notes_locked(merged)
-        return new
+        merged, changed = merge_notes(_read_notes_locked(), found)
+        if changed:
+            _write_notes_locked(merged)
+        return changed
 
 
 def delete_note(timestamp: int) -> None:
@@ -1817,109 +1778,142 @@ def delete_note(timestamp: int) -> None:
 
 
 def merge_notes(existing: list[dict], found: list[dict]) -> tuple[list[dict], int]:
-    """Add newly-received notes to the stored ones. Returns (merged, new_count).
-    Deduped on the send timestamp, which is unique per message, so re-running a drain
-    can't double up a note."""
-    seen = {n["ts"] for n in existing}
-    fresh = [n for n in found if n["ts"] not in seen]
-    return prune_notes(list(existing) + fresh), len(fresh)
+    """Merge new or more complete notes without downgrading saved text or photos."""
+    merged = {note["ts"]: note for note in existing}
+    changed = set()
+    for note in found:
+        timestamp = note["ts"]
+        previous = merged.get(timestamp)
+        if previous is None:
+            merged[timestamp] = note
+            changed.add(timestamp)
+            continue
+        updated = dict(previous)
+        if previous.get("missing_body") and not note.get("missing_body"):
+            updated["text"] = note.get("text", "")
+            updated.pop("missing_body", None)
+        old_photos, new_photos = previous.get("photos", []), note.get("photos", [])
+        if (len(new_photos) >= len(old_photos)
+                and note.get("missing_photos", 0) < previous.get("missing_photos", 0)):
+            updated["photos"] = new_photos
+            updated["missing_photos"] = note.get("missing_photos", 0)
+        if updated != previous:
+            merged[timestamp] = updated
+            changed.add(timestamp)
+    return prune_notes(list(merged.values())), len(changed)
 
 
 def fetch_notes(account: str, on_log: LogFn = lambda *_: None) -> dict:
-    """Drain what's waiting for this device and keep the notes.
-
-    Returns a report — new/envelopes/transcripts/notes/seconds — not just a count, so
-    the screen can explain a check that found nothing rather than leaving you guessing
-    whether the note, the phone, or the app is at fault.
-
-    Deliberately a one-shot the user asks for, not a poll: it holds the same lock as a
-    broadcast (one signal-cli operation per account). This explicit Notes check allows
-    signal-cli to download message attachments in the same receive pass: its later
-    getAttachment command can only read files that were already downloaded. Group sync
-    remains the fast metadata-only path for clearing a large backlog."""
+    """Receive with full attachments, saving each note before reading the next one."""
     binary = signal_cli_bin()
-    started = time.monotonic()
     with signal_cli_operation("checking notes"):
+        return _receive_messages(binary, account, NOTES_BURST_S, on_log)
+
+
+def _receive_messages(binary: str, account: str, idle_seconds: int,
+                      on_log: LogFn = lambda *_: None) -> dict:
+    """Shared receive path. Caller holds the Signal lock; no attachment-skipping mode."""
+    started = time.monotonic()
+    counters = {"envelopes": 0, "transcripts": 0, "notes": 0, "invalid": 0, "new": 0,
+                "missing_attachments": 0}
+    on_log("Receiving messages and downloading attachments. Large files can take up to an hour.")
+    _notes_log("receive start: attachment downloads enabled")
+    try:
+        proc = subprocess.Popen(
+            _cli(binary, "--config", str(DATA_DIR), *_account_args(account), "-o", "json",
+                 "receive", "--timeout", str(idle_seconds),
+                 "--ignore-avatars", "--ignore-stickers", "--ignore-stories"),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+            errors="replace", env=_signal_env(binary))
+    except (OSError, subprocess.SubprocessError):
+        _notes_log("receive failed: could not start signal-cli")
+        raise ReceiveError("Couldn't start Signal to receive messages. Check the installation and try again.") from None
+
+    stderr_parts = collections.deque(maxlen=200)
+    read_failed = threading.Event()
+    finished = threading.Event()
+
+    def save_note(note):
+        counters["new"] += store_notes([note])
+        counters["missing_attachments"] += note.get("missing_photos", 0) + bool(note.get("missing_body"))
+
+    def read_stdout():
         try:
-            proc = subprocess.Popen(
-                _cli(binary, "--config", str(DATA_DIR), *_account_args(account), "-o", "json",
-                     "receive", "--timeout", str(NOTES_BURST_S),
-                     "--ignore-avatars", "--ignore-stickers", "--ignore-stories"),
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
-                errors="replace", env=_signal_env(binary))
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise BroadcastError(f"Couldn't run signal-cli to check for notes: {exc}")
+            if proc.stdout is not None:
+                _inspect_receive(proc.stdout, collect_notes=True, log_summary=True,
+                                 on_note=save_note, counters=counters)
+        except Exception:
+            read_failed.set()
+            proc.kill()
 
-        parsed = []
-        read_errors = []
-        stderr_parts = collections.deque(maxlen=200)
-
-        def read_stdout() -> None:
-            try:
-                if proc.stdout is not None:
-                    parsed.append(_inspect_receive(
-                        proc.stdout, media_downloaded=True, collect_notes=True,
-                        log_summary=True))
-            except Exception as exc:  # noqa: BLE001 — reported on the calling thread
-                read_errors.append(exc)
-
-        def read_stderr() -> None:
-            try:
-                if proc.stderr is not None:
-                    stderr_parts.extend(proc.stderr)
-            except Exception as exc:  # noqa: BLE001 — reported on the calling thread
-                read_errors.append(exc)
-
-        stdout_reader = threading.Thread(target=read_stdout, daemon=True)
-        stderr_reader = threading.Thread(target=read_stderr, daemon=True)
-        stdout_reader.start()
-        stderr_reader.start()
-        timed_out = False
+    def read_stderr():
         try:
-            proc.wait(timeout=NOTES_TIMEOUT_S)
+            if proc.stderr is not None:
+                for line in proc.stderr:
+                    stderr_parts.append(line[-2000:])
+        except Exception:
+            read_failed.set()
+            proc.kill()
+
+    def progress():
+        while not finished.wait(RECEIVE_PROGRESS_S):
+            on_log(f"Receiving: {counters['envelopes']} messages processed, "
+                   f"{counters['new']} notes saved, {int(time.monotonic() - started)}s elapsed. "
+                   "A large attachment may still be downloading.")
+
+    readers = [threading.Thread(target=read_stdout, daemon=True),
+               threading.Thread(target=read_stderr, daemon=True)]
+    reporter = threading.Thread(target=progress, daemon=True)
+    for thread in [*readers, reporter]:
+        thread.start()
+    timed_out = False
+    try:
+        try:
+            proc.wait(timeout=RECEIVE_TIMEOUT_S)
         except subprocess.TimeoutExpired:
-            # Keep whatever the streaming reader already received: Signal delivers each
-            # envelope once, so throwing away a partial note here would lose it forever.
             timed_out = True
             proc.kill()
             proc.wait()
-        stdout_reader.join()
-        stderr_reader.join()
+        for thread in readers:
+            thread.join()
+    finally:
+        finished.set()
+        reporter.join()
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
 
-    if read_errors:
-        raise BroadcastError(f"Couldn't read Signal's notes response: {read_errors[0]}")
-    found, report, had_output = parsed[0] if parsed else (
-        [], {"envelopes": 0, "transcripts": 0, "notes": 0}, False)
-    err = "".join(stderr_parts).strip()
-    failed = proc.returncode != 0 and not timed_out
-    if failed and not had_output:
+    warnings = []
+    err = "".join(stderr_parts)
+    if read_failed.is_set():
+        warnings.append("Receiving stopped because a message could not be read or saved. "
+                        "Check available disk space before retrying; resend any missing note from your phone.")
+    elif timed_out:
+        warnings.append("Receiving reached the one-hour limit. Saved notes are kept. "
+                        "Check again to continue receiving pending messages.")
+    elif proc.returncode != 0:
         if ACCOUNT_UNUSABLE_PATTERN.search(err):
-            raise BroadcastError("Signal says this Mac isn't linked any more — link "
-                                 "again from the phone, then check for notes.")
-        raise BroadcastError(err or "Couldn't check for notes. Try again.")
-    new = store_notes(found)
-    report.update(new=new, seconds=round(time.monotonic() - started, 1))
-    on_log(f"Notes check: {report['envelopes']} message(s) from Signal, "
-           f"{report['transcripts']} sent from your phone, {report['notes']} note(s) to "
-           f"self, {new} new — {report['seconds']}s")
+            warnings.append("This Signal device is no longer linked. Link it again from your phone.")
+        else:
+            warnings.append("Signal stopped receiving before completion. Saved notes are kept. "
+                            "Check the connection and try again.")
+    if counters["invalid"]:
+        warnings.append(f"Skipped {counters['invalid']} malformed message(s). "
+                        "Valid notes were saved; resend any missing note from your phone.")
+    if counters["missing_attachments"]:
+        warnings.append(f"{counters['missing_attachments']} note attachment(s) were unavailable. "
+                        "Forward the original note again to download them.")
+    report = dict(counters, complete=not warnings, warning=" ".join(warnings),
+                  seconds=round(time.monotonic() - started, 1))
+    _notes_log(f"receive end: messages={report['envelopes']} notes={report['notes']} "
+               f"saved={report['new']} invalid={report['invalid']} "
+               f"missing={report['missing_attachments']} timeout={timed_out} "
+               f"rc={proc.returncode} complete={report['complete']} seconds={report['seconds']}")
+    on_log(f"Notes check: {report['envelopes']} message(s), {report['notes']} note(s), "
+           f"{report['new']} new or updated, {report['seconds']}s.")
+    if report["warning"]:
+        on_log(report["warning"])
     return report
-
-
-def _save_notes_seen_during(receive_output: str) -> None:
-    """Keep any notes that turn up in the group sync's drain.
-
-    The sync consumes the same queue and used to throw all of it away, so a note that
-    happened to arrive during an "Update list from phone" was gone for good — the
-    server delivers a message to this device once. That sync can't download media
-    (the whole point of it is to skip the media backlog), so those notes keep their
-    text and are marked as having photos we never got. Best-effort: this must never
-    raise into a group sync."""
-    try:
-        found = harvest_notes(receive_output, media_downloaded=False)
-        if found:
-            store_notes(found)
-    except Exception:  # noqa: BLE001 — a notes problem can never break the group sync
-        pass
 
 
 # --------------------------------------------------------------------------- #

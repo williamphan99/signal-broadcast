@@ -133,6 +133,7 @@ class _State:
         self.notes_running = False
         self.notes_result: dict | None = None
         self.notes_error: str | None = None
+        self.notes_status = ""
 
 
 @functools.lru_cache(maxsize=2)
@@ -539,10 +540,15 @@ self.addEventListener('fetch',event=>{
 
     def _run_notes(account: str) -> None:
         try:
-            report = engine.fetch_notes(account, on_log=lambda *_: None)
+            def progress(message):
+                with st.lock:
+                    st.notes_status = message
+            report = engine.fetch_notes(account, on_log=progress)
             with st.lock:
                 st.notes_result = {key: int(report.get(key, 0))
                                    for key in ("transcripts", "notes", "new")}
+                st.notes_result["complete"] = report.get("complete", True)
+                st.notes_result["warning"] = report.get("warning", "")
         except Exception as exc:
             with st.lock:
                 st.notes_error = str(exc)
@@ -569,7 +575,7 @@ self.addEventListener('fetch',event=>{
     def api_notes_refresh_status():
         with st.lock:
             return jsonify(running=st.notes_running, result=st.notes_result,
-                           error=st.notes_error)
+                           error=st.notes_error, status=st.notes_status)
 
     @app.post("/api/notes/use")
     def api_notes_use():
@@ -1690,13 +1696,17 @@ function watchNotesRefresh(){
   checkNotesRefresh(); notesTimer=setInterval(checkNotesRefresh,1000);
 }
 async function checkNotesRefresh(){
-  const s=await api('/api/notes/refresh'); if(s.__neterr||s.running)return;
+  const s=await api('/api/notes/refresh'); if(s.__neterr)return;
+  if(s.running){ $('#notesStatus').textContent=s.status||'Receiving messages and downloading attachments…'; return; }
   if(notesTimer)clearInterval(notesTimer); notesTimer=null;
   $('#notesBtn').disabled=false; $('#notesBtn').textContent='Check for new notes';
   await loadNotes();
   if(s.error){ $('#notesStatus').innerHTML='<span class="err">'+esc(s.error)+'</span>'; return; }
   const result=s.result||{}, fresh=result.new||0;
-  if(fresh)$('#notesStatus').innerHTML='<span class="ok">'+fresh+' new note'+(fresh===1?'':'s')+'.</span>';
+  if(result.warning||result.complete===false){
+    $('#notesStatus').innerHTML='<span class="err">'+esc(result.warning||'Receiving was incomplete. Saved notes are kept; try again.')+'</span>'; return;
+  }
+  if(fresh)$('#notesStatus').innerHTML='<span class="ok">'+fresh+' new or updated note'+(fresh===1?'':'s')+'.</span>';
   else if(result.notes)$('#notesStatus').textContent='Nothing new — those notes are already here.';
   else if(result.transcripts)$('#notesStatus').textContent='Messages arrived, but none were notes to yourself.';
   else $('#notesStatus').textContent='Signal had nothing waiting. Write a note on your phone, wait a few seconds, then check again.';

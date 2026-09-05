@@ -124,7 +124,7 @@ class WhatCountsAsANote(unittest.TestCase):
             }))
         messages.extend(envelope(note(f"kept note {i}", ts=30_000 + i)) for i in range(3))
 
-        found = engine.harvest_notes("\n".join(messages), media_downloaded=False)
+        found = engine.harvest_notes("\n".join(messages))
 
         self.assertEqual([item["text"] for item in found],
                          ["kept note 0", "kept note 1", "kept note 2"])
@@ -244,7 +244,7 @@ class FetchingNotes(unittest.TestCase):
         self.assertEqual(report["envelopes"], 2)
         self.assertEqual(report["transcripts"], 2)
         self.assertEqual(report["notes"], 1)
-        self.assertEqual(process.wait_timeouts, [engine.NOTES_TIMEOUT_S])
+        self.assertEqual(process.wait_timeouts, [engine.RECEIVE_TIMEOUT_S])
         self.assertEqual(engine.NOTES_BURST_S, 10)
         command = popen.call_args.args[0]
         self.assertEqual(command[command.index("--timeout") + 1], "10")
@@ -278,8 +278,10 @@ class FetchingNotes(unittest.TestCase):
     def test_cli_failure_without_received_output_is_reported(self):
         process = self.Process("", error="Connection closed!", returncode=3)
 
-        with self.assertRaisesRegex(engine.BroadcastError, "Connection closed"):
-            self._fetch(process)
+        report, stored, _ = self._fetch(process)
+        self.assertFalse(report["complete"])
+        self.assertIn("connection", report["warning"])
+        self.assertEqual(stored, [])
 
 
 class NothingToSend(unittest.TestCase):
@@ -324,11 +326,8 @@ class NotesWithPhotos(unittest.TestCase):
         found = engine.harvest_notes(envelope(note(None, attachments=[self.att])))
         self.assertEqual(found[0]["text"], "")
 
-    def test_the_group_sync_keeps_the_text_and_flags_the_missing_photos(self):
-        """The sync can't download media, so a note arriving during one keeps its words
-        and admits the photos never landed, rather than pretending it had none."""
-        found = engine.harvest_notes(envelope(note("see this", attachments=[self.att])),
-                                     media_downloaded=False)
+    def test_an_unavailable_photo_is_reported_with_its_note_text(self):
+        found = engine.harvest_notes(envelope(note("see this", attachments=[self.att])))
         self.assertEqual(found[0]["text"], "see this")
         self.assertEqual(found[0]["photos"], [])
         self.assertEqual(found[0]["missing_photos"], 1)
@@ -586,13 +585,13 @@ class NotesSurviveTheGroupSync(unittest.TestCase):
         self.addCleanup(lambda: setattr(engine, "NOTES_LOCK_FILE", self._real_lock))
 
     def test_a_note_seen_during_a_sync_is_saved(self):
-        engine._save_notes_seen_during(envelope(note("written mid-sync", ts=42)))
+        engine.store_notes(engine.harvest_notes(envelope(note("written mid-sync", ts=42))))
         self.assertEqual([n["text"] for n in engine.read_notes()], ["written mid-sync"])
 
     def test_a_dm_seen_during_a_sync_is_not_saved(self):
         dm = {"destination": FRIEND_UUID, "destinationUuid": FRIEND_UUID,
               "destinationNumber": None, "timestamp": 7, "message": "private"}
-        engine._save_notes_seen_during(envelope(dm))
+        engine.store_notes(engine.harvest_notes(envelope(dm)))
         self.assertEqual(engine.read_notes(), [])
 
     def test_two_writers_at_once_never_lose_a_note(self):
@@ -613,12 +612,6 @@ class NotesSurviveTheGroupSync(unittest.TestCase):
         for t in threads:
             t.join()
         self.assertEqual(len(engine.read_notes()), 8)
-
-    def test_a_notes_failure_can_never_break_a_sync(self):
-        engine.NOTES_FILE = Path(self.tmp.name) / "no-such-dir" / "notes.json"
-        engine._save_notes_seen_during(envelope(note("x")))   # must not raise
-
-
 
 # These tests must never use the installer's live Signal store.
 from runtime import isolated_engine

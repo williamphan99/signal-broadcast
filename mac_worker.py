@@ -76,9 +76,12 @@ def run(request):
             if engine.detect_account(require_single=True) != account:
                 raise engine.AccountSelectionError("The linked account does not match the saved configuration.")
             if kind == "sync":
-                emit("groups", engine.sync_groups(account, on_log=lambda text: emit("log", text)))
+                emit("groups", engine.sync_groups(account, on_log=lambda text: emit("receive_status", text)))
             else:
-                emit("notes", engine.fetch_notes(account, on_log=lambda text: emit("log", text)))
+                report = engine.fetch_notes(account, on_log=lambda text: emit("receive_status", text))
+                emit("notes", report)
+                if not report.get("complete", True):
+                    raise engine.ReceiveError(report["warning"])
     elif kind in ("send", "resume"):
         cfg = engine.load_config()
         groups = engine.read_groups()
@@ -108,7 +111,7 @@ if __name__ == "__main__":
     try:
         run(json.load(sys.stdin))
         emit("done", True)
-    except engine.AccountSelectionError as exc:
+    except (engine.AccountSelectionError, engine.ReceiveError) as exc:
         emit("error", str(exc))
         raise SystemExit(1)
     except Exception:

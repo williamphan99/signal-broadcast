@@ -551,7 +551,24 @@ class WebUITests(unittest.TestCase):
                     break
                 time.sleep(0.01)
         self.assertFalse(s["running"])
-        self.assertEqual(s["result"], {"transcripts": 3, "notes": 2, "new": 1})
+        self.assertEqual(s["result"], {"transcripts": 3, "notes": 2, "new": 1,
+                                         "complete": True, "warning": ""})
+
+    def test_notes_refresh_exposes_incomplete_status_and_progress(self):
+        def receive(_account, on_log):
+            on_log("Receiving: 8 messages processed, 1 note saved.")
+            return {"new": 1, "complete": False, "warning": "Receiving timed out. Try again."}
+        with mock.patch.object(engine, "fetch_notes", side_effect=receive):
+            self.c.post("/api/notes/refresh")
+            end = time.time() + 5
+            while time.time() < end:
+                status = self.c.get("/api/notes/refresh").get_json()
+                if not status["running"]:
+                    break
+                time.sleep(0.01)
+        self.assertFalse(status["result"]["complete"])
+        self.assertEqual(status["result"]["warning"], "Receiving timed out. Try again.")
+        self.assertIn("8 messages", status["status"])
 
     def test_notes_refresh_waits_for_group_sync(self):
         with self.state.lock:

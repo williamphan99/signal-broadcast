@@ -246,8 +246,11 @@ class GroupSnapshotTests(unittest.TestCase):
             calls.append(argv)
             return mock.Mock(returncode=0, stdout="", stderr="")
 
-        def fake_popen(argv, **_kwargs):   # listGroups is the only Popen in a sync
+        def fake_popen(argv, **_kwargs):
             calls.append(argv)
+            if "receive" in argv:
+                import io
+                return mock.Mock(returncode=0, stdout=io.StringIO(""), stderr=io.StringIO(""))
             return _FakeCatalogProc('[{"id":"g1","name":"One"}]')
 
         with tempfile.TemporaryDirectory() as directory, \
@@ -541,9 +544,10 @@ class SyncGroupsTests(unittest.TestCase):
     """sync_groups must never report a total failure as '0 groups' — that made a dead
     account look identical to an account with no groups, which was the reported bug."""
 
-    class _Recv:
+    class _Recv(dict):
         def __init__(self, rc=0, err=""):
-            self.returncode, self.stderr, self.stdout = rc, err, ""
+            warning = "This Signal device is no longer linked." if rc else ""
+            super().__init__(complete=rc == 0, warning=warning, envelopes=int(bool(err)))
 
     def _sync(self, recv, pull_side_effect):
         """Run sync_groups with receive + pull_groups stubbed. pull_side_effect is a
@@ -560,7 +564,7 @@ class SyncGroupsTests(unittest.TestCase):
              mock.patch.object(engine, "_request_sync", lambda *a, **k: None), \
              mock.patch.object(engine, "_catalog_progress", lambda *_a: None), \
              mock.patch.object(engine, "pull_groups", fake_pull), \
-             mock.patch.object(engine.subprocess, "run", lambda *a, **k: recv):
+             mock.patch.object(engine, "_receive_messages", lambda *a, **k: recv):
             return engine.sync_groups("+1", on_log=lambda *_: None)
 
     def test_all_failures_raise_with_reason(self):
@@ -603,7 +607,7 @@ class SyncGroupsTests(unittest.TestCase):
              mock.patch.object(engine, "_request_sync", lambda *a, **k: None), \
              mock.patch.object(engine, "_catalog_progress", lambda *_a: (118, 640)), \
              mock.patch.object(engine, "pull_groups", fake_pull), \
-             mock.patch.object(engine.subprocess, "run", lambda *a, **k: self._Recv()):
+             mock.patch.object(engine, "_receive_messages", lambda *a, **k: self._Recv()):
             with self.assertRaises(engine.GroupCatalogStalled) as ctx:
                 engine.sync_groups("+61400000000", on_log=lambda *_: None)
             debug = engine.SYNC_DEBUG_FILE.read_text(encoding="utf-8")
@@ -622,30 +626,17 @@ class SyncGroupsTests(unittest.TestCase):
         transient = engine.BroadcastError("connection reset by peer")
         self.assertEqual(self._sync(self._Recv(), [transient, 2, 2, 2]), 2)
 
-    def test_sync_debug_does_not_store_receive_sender_metadata(self):
-        private_output = (
-            '{"envelope":{"source":"+61400000000",'
-            '"sourceUuid":"private-uuid","sourceName":"Private Person"}}')
-
-        def busy_receive(*_args, **_kwargs):
-            raise engine.subprocess.TimeoutExpired(
-                cmd="receive", timeout=15, stderr=private_output)
-
-        with tempfile.TemporaryDirectory() as directory, \
-             mock.patch.object(engine, "SYNC_DEBUG_FILE", Path(directory) / "sync-debug.txt"), \
-             mock.patch.object(engine, "signal_cli_bin", return_value="/bin/true"), \
-             mock.patch.object(engine, "_request_sync", lambda *_a, **_k: None), \
-             mock.patch.object(engine, "pull_groups", return_value=1), \
-             mock.patch.object(engine, "_save_notes_seen_during", lambda *_a, **_k: None), \
-             mock.patch.object(engine.subprocess, "run", side_effect=busy_receive):
-            self.assertEqual(engine._sync_groups_unlocked("+1"), 1)
-            debug = engine.SYNC_DEBUG_FILE.read_text(encoding="utf-8")
-
-        self.assertIn("receive busy-timeout", debug)
-        self.assertNotIn("+61400000000", debug)
-        self.assertNotIn("private-uuid", debug)
-        self.assertNotIn("Private Person", debug)
-        self.assertNotIn("envelope", debug)
+    def test_incomplete_receive_stops_sync_before_reporting_success(self):
+        warning = "Receiving reached the one-hour limit. Saved notes are kept."
+        with mock.patch.object(engine, "signal_cli_bin", return_value="/bin/true"), \
+             mock.patch.object(engine, "_request_sync"), \
+             mock.patch.object(engine, "_catalog_progress", return_value=None), \
+             mock.patch.object(engine, "pull_groups") as pull, \
+             mock.patch.object(engine, "_receive_messages", return_value={
+                 "complete": False, "warning": warning, "envelopes": 8}):
+            with self.assertRaisesRegex(engine.ReceiveError, "one-hour"):
+                engine.sync_groups("+1")
+        pull.assert_not_called()
 
     def test_sync_debug_redacts_account_from_catalog_errors(self):
         private_error = engine.BroadcastError(
@@ -658,7 +649,7 @@ class SyncGroupsTests(unittest.TestCase):
              mock.patch.object(engine, "signal_cli_bin", return_value="/bin/true"), \
              mock.patch.object(engine, "_request_sync", lambda *_a, **_k: None), \
              mock.patch.object(engine, "pull_groups", side_effect=private_error), \
-             mock.patch.object(engine.subprocess, "run", return_value=recv):
+             mock.patch.object(engine, "_receive_messages", return_value=recv):
             with self.assertRaises(engine.BroadcastError):
                 engine._sync_groups_unlocked("+61400000000")
             debug = engine.SYNC_DEBUG_FILE.read_text(encoding="utf-8")
@@ -678,51 +669,11 @@ class SyncGroupsTests(unittest.TestCase):
         with mock.patch.object(engine, "signal_cli_bin", lambda: "/bin/true"), \
              mock.patch.object(engine, "_request_sync", lambda *a, **k: None), \
              mock.patch.object(engine, "pull_groups", fake_pull), \
-             mock.patch.object(engine.subprocess, "run", lambda *a, **k: self._Recv()):
+             mock.patch.object(engine, "_receive_messages", lambda *a, **k: self._Recv()):
             with self.assertRaises(engine.BroadcastError):
                 engine.sync_groups("+1", on_log=lambda *_: None)
         self.assertLessEqual(calls["n"], 2)  # bailed, did not churn
 
-    def _sync_recv_raises(self, exc_factory, pull_side_effect):
-        """Like _sync but the `receive` subprocess RAISES (e.g. TimeoutExpired) each
-        call. pull_groups still runs from pull_side_effect."""
-        seq = iter(pull_side_effect)
-
-        def fake_pull(_acct, *_on_log):
-            item = next(seq, pull_side_effect[-1])
-            if isinstance(item, Exception):
-                raise item
-            return item
-
-        def fake_run(*a, **k):
-            raise exc_factory()
-
-        with mock.patch.object(engine, "signal_cli_bin", lambda: "/bin/true"), \
-             mock.patch.object(engine, "_request_sync", lambda *a, **k: None), \
-             mock.patch.object(engine, "_catalog_progress", lambda *_a: None), \
-             mock.patch.object(engine, "pull_groups", fake_pull), \
-             mock.patch.object(engine.subprocess, "run", fake_run):
-            return engine.sync_groups("+1", on_log=lambda *_: None)
-
-    def test_busy_receive_timeout_is_progress_not_a_connection_error(self):
-        # receive keeps hitting its outer timeout WHILE producing output (downloading a
-        # backlog). That must be treated as progress: keep draining, and the eventual
-        # group count wins — NOT reported as "couldn't connect".
-        def busy_timeout():
-            return engine.subprocess.TimeoutExpired(
-                cmd="receive", timeout=15,
-                stderr="INFO IncomingMessageHandler - server timestamp received")
-        # groups arrive after a couple of busy bursts, then hold steady
-        self.assertEqual(self._sync_recv_raises(busy_timeout, [0, 4, 4, 4]), 4)
-
-    def test_silent_receive_timeout_reports_connection_problem(self):
-        # receive times out with NO output at all → a real connect hang → surface the
-        # network/connection message, not a groups count.
-        def silent_timeout():
-            return engine.subprocess.TimeoutExpired(cmd="receive", timeout=15, stderr="")
-        with self.assertRaises(engine.BroadcastError) as ctx:
-            self._sync_recv_raises(silent_timeout, [0])
-        self.assertIn("connect", str(ctx.exception).lower())
 
 
 class MessageStyleTests(unittest.TestCase):

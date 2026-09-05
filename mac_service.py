@@ -374,7 +374,7 @@ class Service:
                         continue
                     if event["kind"] == "link_broken" and event["value"] is True:
                         self.link_broken = True
-                    if event["kind"] in {"log", "progress", "results", "qr", "error", "done"}:
+                    if event["kind"] in {"log", "progress", "results", "qr", "error", "done", "receive_status"}:
                         self._event(event["kind"], event["value"])
             proc.wait()
         finally:
