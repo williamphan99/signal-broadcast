@@ -459,7 +459,7 @@ class Service:
                         self.update_state = event["value"]
                     if event["kind"] == "link_broken" and event["value"] is True:
                         self.link_broken = True
-                    if event["kind"] in {"log", "progress", "results", "qr", "error", "done", "phase", "receive_status"}:
+                    if event["kind"] in {"log", "progress", "results", "qr", "error", "done", "phase", "receive_status", "send_diagnostic"}:
                         self._event(event["kind"], event["value"])
             returncode = proc.wait()
         finally:

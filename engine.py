@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import tomllib
+import uuid
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -294,7 +295,7 @@ class Config:
     cooldown_hours: float
     max_retries: int
     send_times: list[str]
-    debug: bool = False  # write raw signal-cli errors to logs/debug-*.txt
+    debug: bool = False  # legacy setting; send diagnostics are always sanitised
     wipe_on_close: bool = False  # erase all data when the app is quit (armed in Security)
     concurrent_sends: int = 1  # whole-group sends in flight at once (1 = safe default; up to 5)
     message_style: str = DEFAULT_MESSAGE_STYLE  # style applied to the whole message
@@ -1063,7 +1064,7 @@ def _sync_error_summary(output: str) -> str:
 def _sync_log(msg: str) -> None:
     """Always-on status breadcrumb for group sync, without Signal message metadata.
 
-    Unlike append_debug this is not gated on debug=true, because it diagnoses sync on
+    This is always enabled, because it diagnoses sync on
     a machine we cannot reach. Callers log only counts and classified error names, not
     raw signal-cli output. Unlink and station-mode wipe erase it with the other logs.
     Best-effort: logging never raises into the sync.
@@ -2275,9 +2276,35 @@ def _is_uncertain_send(err: str) -> bool:
                 or SENT_NO_REPLY_PATTERN.search(err))
 
 
+_SEND_DIAGNOSTIC_LOCK = threading.Lock()
+
+
+def _send_diagnostic(*, run: str, position: int, attempt: int, seconds: float,
+                     ok: bool, err: str, on_diagnostic: Callable) -> None:
+    # Fixed categories only: never serialize provider errors or recipients.
+    entry = {"at": datetime.now().isoformat(timespec="seconds"), "run": run,
+             "position": position, "attempt": attempt, "seconds": round(seconds, 2),
+             "status": "sent" if ok else "uncertain" if _is_uncertain_send(err) else "error",
+             "reason": "" if ok else classify_error(err)}
+    try:
+        with _SEND_DIAGNOSTIC_LOCK:
+            LOGS_DIR.mkdir(parents=True, exist_ok=True)
+            path = LOGS_DIR / "send-diagnostics.jsonl"
+            if path.exists() and path.stat().st_size >= 256 * 1024:
+                path.replace(LOGS_DIR / "send-diagnostics.previous.jsonl")
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(entry) + "\n")
+    except OSError:
+        on_diagnostic({**entry, "log_write_failed": True})
+    else:
+        on_diagnostic(entry)
+
+
 def _deliver_to_group(send_one: SendFn, group_id: str,
                       message: str, attachments: list[str], max_retries: int,
-                      on_log: LogFn, should_stop: StopFn, debug: bool = False) -> tuple[str, str]:
+                      on_log: LogFn, should_stop: StopFn, debug: bool = False,
+                      *, run: str = "", position: int = 0,
+                      on_diagnostic: Callable = lambda _entry: None) -> tuple[str, str]:
     """Try one group with retries via ``send_one`` (one-shot or daemon — same shape).
     Returns (status, reason): status is "sent", "failed", or "uncertain"; reason is a
     short, PII-safe category for non-sent outcomes ("" when sent) used for the run's
@@ -2287,12 +2314,16 @@ def _deliver_to_group(send_one: SendFn, group_id: str,
     group name, id, or raw signal-cli output — only counts, retry timing, and a category."""
     throttle_attempt = 0
     quick_attempt = 0
+    attempt = 0
     while not should_stop():
+        attempt += 1
+        started = time.monotonic()
         ok, throttled, err = send_one(group_id, message, attachments)
+        _send_diagnostic(run=run, position=position, attempt=attempt,
+                         seconds=time.monotonic() - started, ok=ok, err=err,
+                         on_diagnostic=on_diagnostic)
         if ok:
             return "sent", ""
-        if debug and err:
-            append_debug(f"group {group_id} (throttled={throttled}): {err}")
         if _is_uncertain_send(err):
             # We lost contact before signal-cli confirmed — it may have delivered.
             on_log("Send unconfirmed — it may have gone through; not retrying, to avoid a duplicate.")
@@ -2333,16 +2364,12 @@ def _start_daemon(account: str, on_log: LogFn, debug: bool) -> "SignalCliDaemon 
     try:
         return SignalCliDaemon(account)
     except (BroadcastError, OSError) as exc:
-        detail = str(exc)
-        if debug:
-            append_debug(f"daemon start failed: {detail}")
+        detail = classify_error(str(exc))
         if _reap_orphan_signal_cli(on_log):
             try:
                 return SignalCliDaemon(account)
             except (BroadcastError, OSError) as exc2:
-                detail = str(exc2)
-                if debug:
-                    append_debug(f"daemon start failed after cleanup: {detail}")
+                detail = classify_error(str(exc2))
         on_log(f"Running signal-cli per send (daemon unavailable: {detail}).")
         return None
 
@@ -2396,12 +2423,14 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
               on_log: LogFn = lambda *_: None,
               on_progress: ProgressFn = lambda *_: None,
               on_group_start: StartFn = lambda *_: None,
-              should_stop: StopFn = lambda: False) -> list[GroupSendResult]:
+              should_stop: StopFn = lambda: False,
+              on_diagnostic: Callable = lambda _entry: None) -> list[GroupSendResult]:
     """Send ``message`` (+ attachments) to every group, slowly. Returns a result
     per attempted group. Honours ``should_stop`` between and during sends."""
     binary = signal_cli_bin()
     delay = base_delay if base_delay is not None else config.base_delay_seconds
     results: list[GroupSendResult] = []
+    run_id = uuid.uuid4().hex
     # Computed once for the run: the message text is identical for every group, so the
     # ranges are too. Empty unless the user picked a style, so a plain send is byte-for
     # -byte what it always was.
@@ -2560,7 +2589,8 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
                     t0 = time.monotonic()
                     status, reason = _deliver_to_group(send_fn, gid, message, attachments,
                                                        config.max_retries, on_log, should_stop,
-                                                       config.debug)
+                                                       config.debug, run=run_id, position=pos,
+                                                       on_diagnostic=on_diagnostic)
                     secs = time.monotonic() - t0
                     with prog_lock:
                         record(gid, name, status, reason)
@@ -2607,7 +2637,8 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
                     on_group_start(i, name)  # now in flight — show it in the live view
                     t0 = time.monotonic()
                     status, reason = _deliver_to_group(send_one, gid, message, attachments,
-                                                       config.max_retries, on_log, should_stop, config.debug)
+                                                       config.max_retries, on_log, should_stop, config.debug,
+                                                       run=run_id, position=i, on_diagnostic=on_diagnostic)
                     secs = time.monotonic() - t0  # wall time for this group (includes any retries)
                     record(gid, name, status, reason)
                     record_group_progress(gid, status)  # persisted now, so a crash here is recoverable
@@ -2783,17 +2814,6 @@ def append_activity(line: str) -> None:
     categories), never group names/ids, numbers, message text, or raw output."""
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     out = LOGS_DIR / f"activity-{datetime.now():%Y-%m-%d}.txt"
-    with out.open("a", encoding="utf-8") as fh:
-        fh.write(f"{datetime.now():%H:%M:%S}  {line}\n")
-
-
-def append_debug(line: str) -> None:
-    """Append raw signal-cli output to a debug log for troubleshooting — only when
-    config.toml has debug = true. Unlike the activity log this CAN contain group ids
-    or numbers, which is why it's opt-in; it lives in logs/, so unlink and a
-    station-mode unplug still erase it."""
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    out = LOGS_DIR / f"debug-{datetime.now():%Y-%m-%d}.txt"
     with out.open("a", encoding="utf-8") as fh:
         fh.write(f"{datetime.now():%H:%M:%S}  {line}\n")
 

@@ -217,3 +217,20 @@ credentials, a vault, its Keychain items, or legacy runtime files.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+### Send diagnostics
+
+Every broadcast, retry and resume writes `logs/send-diagnostics.jsonl` inside the
+Mac encrypted vault, regardless of the legacy `debug` setting. Each completed
+attempt records a timestamp, random run ID, group position, attempt number,
+duration, status and a fixed error category. It never records message text,
+attachments, group names, group IDs, phone numbers or raw provider errors.
+Failures also appear in the Mac Recent activity feed. An `error` entry is one
+attempt, which may be retried; `uncertain` means delivery was not confirmed.
+The file rotates at 256 KiB, retaining one previous file. Clear logs and vault
+erasure remove these files. A disk write failure is shown in Recent activity
+and does not interrupt sending. Existing raw debug files are not removed by an
+update; use Clear logs when no send is running if you want to delete them.
+
+Changes apply to newly started jobs after updating and restarting the app/service.
+They cannot recover failure reasons from earlier broadcasts.

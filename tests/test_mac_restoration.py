@@ -54,6 +54,7 @@ class RetryTests(unittest.TestCase):
         events = []
         def broadcast(**kwargs):
             self.assertEqual(mac_retry.available_count(), 0)
+            kwargs["on_diagnostic"]({"status": "error", "reason": "rate limited"})
             kwargs["on_progress"](3, 3, "Skip", "skipped", 0)
             kwargs["on_group_start"](1, "First")
             kwargs["on_group_start"](2, "Second")
@@ -70,6 +71,7 @@ class RetryTests(unittest.TestCase):
                  mock.patch.object(engine, "broadcast", side_effect=broadcast), \
                  mock.patch.object(mac_worker, "emit", side_effect=lambda kind, value: events.append((kind, value))):
                 mac_worker.run({"root": str(root), "job": "send"})
+        self.assertIn(("send_diagnostic", {"status": "error", "reason": "rate limited"}), events)
         self.assertEqual([v["done"] for k, v in events if k == "progress"], [1, 2, 3])
         self.assertEqual([v["active"] for k, v in events if k == "send_status"], [0, 1, 2, 1, 0])
         self.assertEqual([v for k, v in events if k == "phase"], ["preparing", "sending"])

@@ -502,6 +502,12 @@ class App(tk.Tk):
                 elif kind == "started":
                     self.progress_caption = ""
                     self.add_activity(operation_status({"job": value}))
+                elif kind == "send_diagnostic":
+                    if value.get("log_write_failed"):
+                        self.add_activity("Could not save send diagnostics. Check disk space and log folder permissions.")
+                    if value["status"] != "sent":
+                        self.add_activity(f"Group position {value['position']}, attempt {value['attempt']}: "
+                                          f"{value['status']} after {value['seconds']}s. {value['reason']}.")
                 elif kind == "progress":
                     result = {"sent": "Message sent", "failed": "Send failed", "skipped": "Group skipped",
                               "uncertain": "Delivery not confirmed"}.get(value["status"], "Group processed")

@@ -136,6 +136,7 @@ def run(request):
                 status()
         results = engine.broadcast(config=cfg, groups=groups, message=message,
             attachments=attachments, on_log=lambda text: emit("log", text),
+            on_diagnostic=lambda entry: emit("send_diagnostic", entry),
             should_stop=lambda: (root.parents[1] / "erase.json").exists(),
             on_group_start=started, on_progress=progressed)
         engine.stamp_run()
