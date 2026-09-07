@@ -147,6 +147,7 @@ class App(tk.Tk):
         self.after(80, self.drain)
 
     def clear(self):
+        self.unbind("<MouseWheel>")
         if getattr(self, "thumbnailer", None):
             self.thumbnailer.close()
             self.thumbnailer = None
@@ -315,6 +316,27 @@ class App(tk.Tk):
             self.activity_hint = tk.StringVar()
             ttk.Label(status, textvariable=self.activity_hint, wraplength=650).pack(anchor="w", pady=(4, 0))
 
+    def send_text_section(self, parent, title):
+        header = ttk.Frame(parent)
+        header.pack(fill="x", pady=(8, 0))
+        ttk.Label(header, text=title).pack(side="left")
+        body = ttk.Frame(parent)
+        body.pack(fill="x", pady=(6, 0))
+        text = tk.Text(body, height=4, width=1, wrap="word", relief="flat",
+                       background=PALETTE["text_bg"], foreground=PALETTE["text_fg"],
+                       insertbackground=PALETTE["text_fg"])
+        scrollbar = ttk.Scrollbar(body, orient="vertical", command=text.yview)
+        scrollbar.pack(side="right", fill="y")
+        text.configure(yscrollcommand=scrollbar.set)
+        text.pack(fill="both", expand=True)
+        def toggle():
+            expanded = int(text.cget("height")) == 4
+            text.configure(height=16 if expanded else 4)
+            button.configure(text="Collapse" if expanded else "Expand")
+        button = ttk.Button(header, text="Expand", command=toggle)
+        button.pack(side="right")
+        return header, text, button
+
     def build_tabs(self):
         self.tabs = ttk.Notebook(self.container)
         self.tabs.pack(fill="both", expand=True, pady=12)
@@ -323,7 +345,16 @@ class App(tk.Tk):
             frame = ttk.Frame(self.tabs, padding=12)
             self.tabs.add(frame, text=name)
             frames[name] = frame
-        send = frames["Send"]
+        viewport = frames["Send"]
+        self.send_canvas = tk.Canvas(viewport, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(viewport, orient="vertical", command=self.send_canvas.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.send_canvas.configure(yscrollcommand=scrollbar.set)
+        self.send_canvas.pack(fill="both", expand=True)
+        send = ttk.Frame(self.send_canvas)
+        content = self.send_canvas.create_window((0, 0), window=send, anchor="nw")
+        send.bind("<Configure>", lambda _: self.send_canvas.configure(scrollregion=self.send_canvas.bbox("all")))
+        self.send_canvas.bind("<Configure>", lambda event: self.send_canvas.itemconfigure(content, width=event.width))
         self.recipient_text = tk.StringVar()
         ttk.Label(send, textvariable=self.recipient_text).pack(anchor="w", pady=(0, 8))
         row = ttk.Frame(send)
@@ -333,9 +364,7 @@ class App(tk.Tk):
         self.save_button = ttk.Button(row, text="Save draft", command=self.save)
         self.save_button.pack(side="right")
         self.retry_button = ttk.Button(row, text="Retry failed groups", command=self.retry_failed)
-        ttk.Label(send, text="Message").pack(anchor="w")
-        self.message = tk.Text(send, height=4, wrap="word", background=PALETTE["text_bg"], foreground=PALETTE["text_fg"], insertbackground=PALETTE["text_fg"])
-        self.message.pack(fill="both", expand=True)
+        _, self.message, self.message_expand = self.send_text_section(send, "Message")
         self.message.insert("1.0", self.data["message"])
         style_row = ttk.Frame(send)
         style_row.pack(fill="x", pady=(4, 0))
@@ -365,10 +394,16 @@ class App(tk.Tk):
         self.resume_button.pack(side="left", pady=(8, 0))
         self.discard_button = ttk.Button(self.recovery, text="Discard this run…", command=self.discard)
         self.discard_button.pack(side="left", padx=8, pady=(8, 0))
-        self.activity_label = ttk.Label(send, text="Recent activity")
-        self.activity_label.pack(anchor="w", pady=(8, 0))
-        self.activity = tk.Text(send, height=4, state="disabled", wrap="word", relief="flat", background=PALETTE["text_bg"], foreground=PALETTE["text_fg"])
-        self.activity.pack(fill="x", pady=(6, 0))
+        self.activity_label, self.activity, self.activity_expand = self.send_text_section(send, "Activity")
+        self.activity.configure(state="disabled")
+
+        def scroll_send(event):
+            if str(self.tabs.select()) != str(viewport) or not str(event.widget).startswith(str(viewport)):
+                return
+            if isinstance(event.widget, (tk.Text, tk.Canvas)) and event.widget is not self.send_canvas:
+                return
+            self.send_canvas.yview_scroll(-int(event.delta), "units")
+        self.bind("<MouseWheel>", scroll_send)
 
         notes = frames["Notes"]
         self.notes_button = ttk.Button(notes, text="Check for new notes", command=lambda: self.job("notes"))
