@@ -225,7 +225,7 @@ Mac encrypted vault, regardless of the legacy `debug` setting. Each completed
 attempt records a timestamp, random run ID, group position, attempt number,
 duration, status and a fixed error category. It never records message text,
 attachments, group names, group IDs, phone numbers or raw provider errors.
-Failures also appear in the Mac Recent activity feed. An `error` entry is one
+Failures and recovery transitions also appear in the Mac Recent activity feed. An `error` entry is one
 attempt, which may be retried; `uncertain` means delivery was not confirmed.
 The file rotates at 256 KiB, retaining one previous file. Clear logs and vault
 erasure remove these files. A disk write failure is shown in Recent activity
@@ -234,3 +234,19 @@ update; use Clear logs when no send is running if you want to delete them.
 
 Changes apply to newly started jobs after updating and restarting the app/service.
 They cannot recover failure reasons from earlier broadcasts.
+
+### Upload throttling and paused broadcasts
+
+Signal asking to retry later now pauses dispatch across all send workers. The app
+waits automatically, shows the cause and countdown in Recent activity, then tests
+recovery with one send. A successful probe restores the configured send pace and
+concurrency. If no send succeeds for 15 minutes during throttling, the broadcast
+pauses and keeps the unsent groups for **Resume remaining**. Requests already in
+flight are allowed to finish; unconfirmed sends are never automatically repeated.
+Scheduled runs cannot bypass the saved paused broadcast. Membership failures need
+review and are excluded from automatic retries.
+
+The old `max_retries` setting no longer limits throttling recovery; ordinary network
+errors still receive two short retries. Diagnostics record safe error categories
+and recovery transitions, never the raw provider error. See
+[recovery behavior and verification](docs/SEND-THROTTLE-RECOVERY.md).

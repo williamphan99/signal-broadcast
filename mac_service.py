@@ -148,6 +148,8 @@ class Service:
         self.on_restart = None
         self.version = engine.app_version()
         self.send_progress = None
+        self.send_recovery = None
+        self.recovery_until = 0.0
         self.phase = None
         self.schedule_error = None
         self.schedule_retry_at = None
@@ -341,6 +343,9 @@ class Service:
                 "update": self.update_state, "version": self.version,
                 "retry_count": mac_retry.available_count(),
                 "send_progress": self.send_progress, "phase": self.phase,
+                "send_recovery": ({**self.send_recovery,
+                                   "retry_after": max(0, self.recovery_until - time.monotonic())}
+                                  if self.send_recovery else None),
                 "events": [event for event in self.events if event["id"] > after],
                 "sequence": self.sequence,
                 "interrupted": asdict(interrupted) if interrupted else None,
@@ -397,6 +402,10 @@ class Service:
             raise SecurityError("The saved draft is empty or its attachments are missing. Save a complete draft.") from None
         if kind in ("send", "retry") and engine.read_interrupted_run():
             raise SecurityError("Review and resume or discard the interrupted broadcast first.")
+        if kind == "resume":
+            interrupted = engine.read_interrupted_run()
+            if not interrupted or not interrupted.remaining:
+                raise SecurityError("There are no safely resumable groups. Review unconfirmed sends or discard the saved run.")
         if kind == "retry":
             mac_retry.groups()
 
@@ -434,6 +443,8 @@ class Service:
             raise
         self.last_operation = None
         self.send_progress = None
+        self.send_recovery = None
+        self.recovery_until = 0.0
         self.phase = None
         self._event("started", kind)
         threading.Thread(target=self._read_job, args=(job,), daemon=True).start()
@@ -453,13 +464,19 @@ class Service:
                         continue
                     if event["kind"] == "send_status":
                         self.send_progress = event["value"]
+                    if event["kind"] == "send_diagnostic" and event["value"].get("event") in {
+                            "throttled", "retrying", "recovered", "paused"}:
+                        self.send_recovery = event["value"]
+                        self.recovery_until = time.monotonic() + event["value"]["retry_after"]
+                    if event["kind"] == "paused":
+                        job["paused"] = True
                     if event["kind"] == "phase":
                         self.phase = event["value"]
                     if event["kind"] == "update":
                         self.update_state = event["value"]
                     if event["kind"] == "link_broken" and event["value"] is True:
                         self.link_broken = True
-                    if event["kind"] in {"log", "progress", "results", "qr", "error", "done", "phase", "receive_status", "send_diagnostic"}:
+                    if event["kind"] in {"log", "progress", "results", "qr", "error", "done", "phase", "receive_status", "send_diagnostic", "paused"}:
                         self._event(event["kind"], event["value"])
             returncode = proc.wait()
         finally:
@@ -469,7 +486,8 @@ class Service:
                     terminate_group(proc, seconds=0.1)
                     self.job = None
                     self.last_operation = {"kind": job["kind"],
-                                           "outcome": "completed" if returncode == 0 else "failed"}
+                                           "outcome": ("paused" if job.get("paused") else "completed")
+                                                      if returncode == 0 else "failed"}
                     (self.vault.root / "worker.json").unlink(missing_ok=True)
                     if job["kind"] == "link":
                         self.link_broken = False
@@ -478,7 +496,10 @@ class Service:
                         message = (f"Scheduled broadcast finished: {summary.sent} sent, {summary.failed} failed, "
                                    f"{summary.skipped} skipped, {summary.uncertain} unconfirmed." if summary else
                                    "Scheduled broadcast stopped or failed. Review before resending.")
-                        self.schedule_result("completed" if returncode == 0 else "failed", message)
+                        outcome = self.last_operation["outcome"]
+                        if outcome == "paused":
+                            message = "Scheduled broadcast paused after persistent throttling. Review and resume the saved broadcast."
+                        self.schedule_result(outcome, message)
                     self._event("finished", job["kind"])
 
     def tick(self, now: datetime | None = None):

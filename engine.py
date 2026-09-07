@@ -157,6 +157,7 @@ RETRY_AFTER_PATTERN = re.compile(r"retry[ _-]?after[^0-9]*(\d+)", re.IGNORECASE)
 
 THROTTLE_BACKOFF_BASE_S = 30.0   # first throttle wait; doubles each retry
 THROTTLE_BACKOFF_CAP_S = 300.0   # never wait longer than 5 min between retries
+THROTTLE_RECOVERY_LIMIT_S = 15 * 60
 NON_THROTTLE_RETRIES = 2         # quick retries for transient (non-rate) errors
 NON_THROTTLE_WAIT_S = 5.0
 SEND_TIMEOUT_S = 900             # per-send ceiling (15 min). Very large groups can take
@@ -310,10 +311,17 @@ class GroupSendResult:
     uncertain: bool = False  # send timed out — may have delivered; never auto-retried/resent
     reason: str = ""        # short why, for skips/failures (PII-safe category)
     permanent: bool = False  # requires membership/permission repair, not an automatic retry
+    waiting: bool = False  # rejected by throttling or not yet attempted when the run paused
 
     @property
     def retryable(self) -> bool:
-        return not (self.ok or self.skipped or self.uncertain or self.permanent)
+        return not (self.ok or self.skipped or self.uncertain or self.permanent or self.waiting)
+
+
+class BroadcastPaused(BroadcastError):
+    def __init__(self, results: list[GroupSendResult]):
+        super().__init__("Broadcast paused after 15 minutes without a successful send during throttling. Resume when ready.")
+        self.results = results
 
 
 @dataclass
@@ -331,6 +339,8 @@ class RunSummary:
     failed: int
     skipped: int = 0  # admin-only groups not attempted
     uncertain: int = 0  # sends that timed out and may have delivered
+    pending: int = 0
+    paused: bool = False
 
 
 @dataclass
@@ -345,6 +355,8 @@ class InterruptedRun:
     # message MAY already have gone out, so they are never auto-resent — only surfaced
     # so the operator can check Signal and decide.
     uncertain: list[tuple[str, str]] = field(default_factory=list)
+    paused: bool = False
+    message_style: str | None = None
 
 
 _GROUPS_HEADER = (
@@ -2194,7 +2206,7 @@ class SignalCliDaemon:
 def _throttle_wait(attempt: int, stderr: str) -> float:
     """Exponential backoff, but honour an explicit retry-after if larger.
     ``attempt`` is 1-based (1 = first retry)."""
-    backoff = min(THROTTLE_BACKOFF_CAP_S, THROTTLE_BACKOFF_BASE_S * (2 ** (attempt - 1)))
+    backoff = min(THROTTLE_BACKOFF_CAP_S, THROTTLE_BACKOFF_BASE_S * (2 ** min(attempt - 1, 4)))
     hinted = RETRY_AFTER_PATTERN.search(stderr)
     return max(backoff, float(hinted.group(1))) if hinted else backoff
 
@@ -2286,13 +2298,8 @@ def _is_uncertain_send(err: str) -> bool:
 _SEND_DIAGNOSTIC_LOCK = threading.Lock()
 
 
-def _send_diagnostic(*, run: str, position: int, attempt: int, seconds: float,
-                     ok: bool, err: str, on_diagnostic: Callable) -> None:
-    # Fixed categories only: never serialize provider errors or recipients.
-    entry = {"at": datetime.now().isoformat(timespec="seconds"), "run": run,
-             "position": position, "attempt": attempt, "seconds": round(seconds, 2),
-             "status": "sent" if ok else "uncertain" if _is_uncertain_send(err) else "error",
-             "reason": "" if ok else classify_error(err)}
+def _write_send_diagnostic(entry: dict, on_diagnostic: Callable) -> None:
+    entry = {"at": datetime.now().isoformat(timespec="seconds"), **entry}
     try:
         with _SEND_DIAGNOSTIC_LOCK:
             LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -2307,25 +2314,127 @@ def _send_diagnostic(*, run: str, position: int, attempt: int, seconds: float,
         on_diagnostic(entry)
 
 
+def _send_diagnostic(*, run: str, position: int, attempt: int, seconds: float,
+                     ok: bool, err: str, on_diagnostic: Callable) -> None:
+    # Fixed categories only: never serialize provider errors or recipients.
+    entry = {"event": "attempt", "run": run,
+             "position": position, "attempt": attempt, "seconds": round(seconds, 2),
+             "status": "sent" if ok else "uncertain" if _is_uncertain_send(err) else "error",
+             "reason": "" if ok else classify_error(err)}
+    _write_send_diagnostic(entry, on_diagnostic)
+
+
+@dataclass(frozen=True)
+class SendPermit:
+    probe: bool
+
+
+class SendRecovery:
+    """One account-wide cooldown; drain admitted work before a single recovery probe."""
+
+    def __init__(self, should_stop: StopFn, on_event: Callable, *, clock=None, pace=lambda: 0.0):
+        self.condition = threading.Condition()
+        self.clock = clock or time.monotonic
+        self.should_stop = should_stop
+        self.on_event = on_event
+        self.pace = pace
+        self.next_admission = 0.0
+        self.inflight = 0
+        self.paused = False
+        self.since = None
+        self.until = 0.0
+        self.strikes = 0
+        self.reason = "rate limited"
+
+    def _event(self, event: str, retry_after: float = 0) -> None:
+        self.on_event({"event": event, "reason": self.reason,
+                       "retry_after": max(0, retry_after)})
+
+    def _expire(self, now: float) -> None:
+        if not self.paused and self.since is not None and now >= self.since + THROTTLE_RECOVERY_LIMIT_S:
+            self.paused = True
+            self._event("paused")
+
+    def acquire(self) -> SendPermit | None:
+        with self.condition:
+            while True:
+                if self.should_stop():
+                    return None
+                now = self.clock()
+                self._expire(now)
+                if self.paused:
+                    return None
+                recovering = self.since is not None
+                if now >= self.next_admission and (not recovering or (self.inflight == 0 and now >= self.until)):
+                    self.inflight += 1
+                    self.next_admission = now + self.pace()
+                    if recovering:
+                        self._event("retrying")
+                    return SendPermit(probe=recovering)
+                # Wake frequently for Stop/erase, but publish only state transitions.
+                self.condition.wait(0.25)
+
+    def finish(self, permit: SendPermit, *, ok: bool, err: str, throttled: bool = False) -> None:
+        with self.condition:
+            self.inflight -= 1
+            now = self.clock()
+            self._expire(now)
+            if not self.paused:
+                if ok and self.since is not None:
+                    self.since = now
+                    if permit.probe:
+                        self.since = None
+                        self.strikes = 0
+                        self.until = 0.0
+                        self._event("recovered")
+                elif (not ok and not _is_uncertain_send(err) and not NOT_MEMBER_PATTERN.search(err)
+                      and (throttled or THROTTLE_PATTERN.search(err))):
+                    if self.since is None:
+                        self.since = now
+                    self.strikes += 1
+                    self.reason = "attachment upload throttled" if "attachment" in err.lower() else "rate limited"
+                    self.until = max(self.until, now + _throttle_wait(self.strikes, err))
+                    self._event("throttled", min(self.until, self.since + THROTTLE_RECOVERY_LIMIT_S) - now)
+            self.condition.notify_all()
+
+    def abandon(self) -> None:
+        with self.condition:
+            self.inflight -= 1
+            self.condition.notify_all()
+
+
 def _deliver_to_group(send_one: SendFn, group_id: str,
                       message: str, attachments: list[str], max_retries: int,
                       on_log: LogFn, should_stop: StopFn, debug: bool = False,
                       *, run: str = "", position: int = 0,
-                      on_diagnostic: Callable = lambda _entry: None) -> tuple[str, str]:
+                      on_diagnostic: Callable = lambda _entry: None,
+                      recovery: SendRecovery | None = None,
+                      before_send: Callable = lambda: None,
+                      on_waiting: Callable = lambda: None) -> tuple[str, str]:
     """Try one group with retries via ``send_one`` (one-shot or daemon — same shape).
     Returns (status, reason): status is "sent", "failed", or "uncertain"; reason is a
     short, PII-safe category for non-sent outcomes ("" when sent) used for the run's
-    failure breakdown. "uncertain" is a client-side timeout: we don't know whether it
-    delivered, so we neither retry nor call it failed. Throttled sends back off
-    exponentially; other clean errors get a couple of quick retries. Log lines carry no
+    failure breakdown. Unconfirmed requests are never retried. Throttled sends use
+    the shared recovery window; other clean errors get a couple of quick retries.
+    "waiting" preserves pending work when recovery pauses. Log lines carry no
     group name, id, or raw signal-cli output — only counts, retry timing, and a category."""
-    throttle_attempt = 0
+    if recovery is None:
+        recovery = SendRecovery(should_stop, lambda event: _write_send_diagnostic({"run": run, **event}, on_diagnostic))
     quick_attempt = 0
     attempt = 0
     while not should_stop():
+        permit = recovery.acquire()
+        if permit is None:
+            return "waiting", "rate limited" if recovery.paused else "stopped before sending"
         attempt += 1
         started = time.monotonic()
-        ok, throttled, err = send_one(group_id, message, attachments)
+        try:
+            before_send()
+            ok, throttled, err = send_one(group_id, message, attachments)
+        except BaseException:
+            recovery.abandon()
+            raise
+        recovery.finish(permit, ok=ok, err=err, throttled=throttled)
         _send_diagnostic(run=run, position=position, attempt=attempt,
                          seconds=time.monotonic() - started, ok=ok, err=err,
                          on_diagnostic=on_diagnostic)
@@ -2338,14 +2447,8 @@ def _deliver_to_group(send_one: SendFn, group_id: str,
         if NOT_MEMBER_PATTERN.search(err):
             on_log("Send failed — not a member of this group. Review membership before sending again.")
             return "permanent", "not a member of this group"
-        if throttled:
-            throttle_attempt += 1
-            if throttle_attempt > max_retries:
-                on_log(f"Gave up after {max_retries} throttled retries")
-                return "failed", "rate limited"
-            wait = _throttle_wait(throttle_attempt, err)  # err parsed for retry-after, never logged
-            on_log(f"Throttled — backing off {wait:.0f}s (retry {throttle_attempt}/{max_retries})")
-            _interruptible_sleep(wait, should_stop)
+        if throttled or THROTTLE_PATTERN.search(err):
+            on_waiting()
         elif ADMIN_ONLY_PATTERN.search(err):
             # Non-admin in an announcement group — retrying can never succeed.
             on_log("Send failed — admin-only group (you can't post here).")
@@ -2434,7 +2537,8 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
               on_progress: ProgressFn = lambda *_: None,
               on_group_start: StartFn = lambda *_: None,
               should_stop: StopFn = lambda: False,
-              on_diagnostic: Callable = lambda _entry: None) -> list[GroupSendResult]:
+              on_diagnostic: Callable = lambda _entry: None,
+              resume: bool = False) -> list[GroupSendResult]:
     """Send ``message`` (+ attachments) to every group, slowly. Returns a result
     per attempted group. Honours ``should_stop`` between and during sends."""
     binary = signal_cli_bin()
@@ -2471,6 +2575,19 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
     # the app is mid-send — would fight over signal-cli's account lock and both
     # stall. send_lock() raises BroadcastError if a send is already running.
     with send_lock():
+        fingerprint = message_fingerprint(message, attachments)
+        if resume:
+            ledger = resume_run_progress(fingerprint, config.message_style)
+            groups = [(gid, "") for gid in ledger["groups"]
+                      if ledger["done"].get(gid) in (None, "failed", "waiting")]
+            total = len(groups)
+            run_id = ledger["run"]
+            if not groups:
+                raise BroadcastError("There are no safely resumable groups. Review unconfirmed sends or discard the saved run.")
+        else:
+            if RUN_PROGRESS_FILE.exists() and _read_run_progress().get("paused"):
+                raise BroadcastError("A broadcast is paused. Resume or discard it before starting another.")
+            ledger = None
         # Soft preflight: warn (don't block — the probe could be wrong) if we can't
         # reach Signal, so the user gets an early heads-up instead of N timeouts.
         unreachable = check_signal_reachable()
@@ -2485,9 +2602,17 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
             if n:
                 on_log(f"{n} selected group(s) are admin-only — you can't post there; skipping them.")
 
-        # Record the run so a crash mid-broadcast doesn't lose track of what was
-        # already sent (cleared in the finally on a normal return — see below).
-        begin_run_progress(groups, message_fingerprint(message, attachments))
+        # Keep the original ledger across resumes so completed and uncertain
+        # groups cannot be replayed by a later recovery attempt.
+        if ledger is None:
+            begin_run_progress(groups, fingerprint, run=run_id, message_style=config.message_style)
+            ledger = _read_run_progress()
+        positions = {gid: pos for pos, gid in enumerate(ledger["groups"], start=1)}
+        failed_worker = threading.Event()
+        stopping = lambda: should_stop() or failed_worker.is_set()
+        recovery = SendRecovery(stopping, lambda event: _write_send_diagnostic({"run": run_id, **event}, on_diagnostic),
+                                pace=lambda: _pace_delay(delay, config.jitter_seconds))
+        prog_lock = threading.Lock()
 
         # Keep one signal-cli process alive for the whole run: no per-group JVM
         # startup, warm encryption sessions. Clears a stale-lock orphan and retries
@@ -2538,8 +2663,38 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
                                                reason=reason or "may have sent (timed out)"))
             else:
                 results.append(GroupSendResult(gid, name, ok=(status == "sent"),
-                                               permanent=(status == "permanent"),
+                                               permanent=(status == "permanent"), waiting=(status == "waiting"),
                                                reason="" if status == "sent" else reason))
+
+        def deliver(pos: int, gid: str, name: str, send_fn: SendFn) -> None:
+            started = False
+            def before_send():
+                nonlocal started
+                with prog_lock:
+                    record_group_progress(gid, "attempting")
+                if not started:
+                    started = True
+                    on_group_start(pos, name)
+
+            def waiting():
+                with prog_lock:
+                    record_group_progress(gid, "waiting")
+
+            t0 = time.monotonic()
+            status, reason = _deliver_to_group(
+                send_fn, gid, message, attachments, config.max_retries, on_log, stopping, config.debug,
+                run=run_id, position=positions[gid], on_diagnostic=on_diagnostic,
+                recovery=recovery, before_send=before_send, on_waiting=waiting)
+            with prog_lock:
+                record(gid, name, status, reason)
+                record_group_progress(gid, status)
+            on_progress(pos, total, name, status, time.monotonic() - t0)
+
+        def skip(pos: int, gid: str, name: str) -> None:
+            with prog_lock:
+                results.append(GroupSendResult(gid, name, ok=False, skipped=True, reason="admin-only"))
+                record_group_progress(gid, "skipped")
+            on_progress(pos, total, name, "skipped", 0.0)
 
         def run_parallel() -> None:
             """Up to K whole-group sends in flight at once on the one account. New sends
@@ -2553,16 +2708,6 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
             d = daemon                                  # bind: the nonlocal can't change here
             def send_fn(gid: str, msg: str, atts: list[str]) -> tuple[bool, bool, str]:
                 return d.send(gid, msg, atts, text_styles)
-            prog_lock = threading.Lock()                # guards results + the progress file
-            launch_lock = threading.Lock()              # paces the launch of NEW sends
-            next_launch = [0.0]
-
-            def advance(pos: int, name: str, status: str, secs: float) -> None:
-                # pos = the group's STABLE 1-based position in the run, so each log line
-                # maps to a specific group by order even though sends finish out of order
-                # under concurrency. (The progress BAR is driven by the front-end's own
-                # completion counter, which stays monotonic.)
-                on_progress(pos, total, name, status, secs)
 
             # Every group — sendable AND blocked — goes on the queue in list order,
             # tagged with its stable position, so admin-only groups surface at their
@@ -2572,41 +2717,15 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
                 work.put((pos, gid, name))
 
             def worker() -> None:
-                while not should_stop():
+                while not stopping() and not recovery.paused:
                     try:
                         pos, gid, name = work.get_nowait()
                     except queue.Empty:
                         return
                     if gid in blocked:
-                        # Admin-only: no send, no pacing — record in place and move on.
-                        with prog_lock:
-                            results.append(GroupSendResult(gid, name, ok=False,
-                                                           skipped=True, reason="admin-only"))
-                        advance(pos, name, "skipped", 0.0)
+                        skip(pos, gid, name)
                         continue
-                    # Reserve a paced launch slot, then release the lock BEFORE sleeping
-                    # so other workers aren't blocked while this one waits out its gap.
-                    with launch_lock:
-                        start_at = max(time.monotonic(), next_launch[0])
-                        next_launch[0] = start_at + _pace_delay(delay, config.jitter_seconds)
-                    wait = start_at - time.monotonic()
-                    if wait > 0:
-                        _interruptible_sleep(wait, should_stop)
-                    if should_stop():
-                        return
-                    with prog_lock:
-                        record_group_progress(gid, "attempting")
-                    on_group_start(pos, name)  # now in flight — show it in the live view
-                    t0 = time.monotonic()
-                    status, reason = _deliver_to_group(send_fn, gid, message, attachments,
-                                                       config.max_retries, on_log, should_stop,
-                                                       config.debug, run=run_id, position=pos,
-                                                       on_diagnostic=on_diagnostic)
-                    secs = time.monotonic() - t0
-                    with prog_lock:
-                        record(gid, name, status, reason)
-                        record_group_progress(gid, status)  # persisted now — crash-recoverable
-                    advance(pos, name, status, secs)
+                    deliver(pos, gid, name, send_fn)
 
             errors = []
             def guarded_worker():
@@ -2614,6 +2733,7 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
                     worker()
                 except Exception as exc:
                     errors.append(exc)
+                    failed_worker.set()
             workers = [threading.Thread(target=guarded_worker, daemon=True) for _ in range(K)]
             for w in workers:
                 w.start()
@@ -2632,44 +2752,27 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
                 run_parallel()
             else:
                 for i, (gid, name) in enumerate(groups, start=1):
-                    if should_stop():
+                    if stopping() or recovery.paused:
                         on_log("Stopped.")
                         break
                     if gid in blocked:
-                        results.append(GroupSendResult(gid, name, ok=False, skipped=True, reason="admin-only"))
-                        on_progress(i, total, name, "skipped", 0.0)  # not a failure — never attempted
-                        continue  # no send, no pacing delay — nothing left the machine
-                    # Mark the group "attempting" BEFORE the send leaves the machine. If the
-                    # process is killed (station-mode unplug, force-quit) in the window between
-                    # a successful send and recording it, the marker stays "attempting" and a
-                    # resume treats it as uncertain — never auto-resending a message that may
-                    # already have gone out. Overwritten with the real status below.
-                    record_group_progress(gid, "attempting")
-                    on_group_start(i, name)  # now in flight — show it in the live view
-                    t0 = time.monotonic()
-                    status, reason = _deliver_to_group(send_one, gid, message, attachments,
-                                                       config.max_retries, on_log, should_stop, config.debug,
-                                                       run=run_id, position=i, on_diagnostic=on_diagnostic)
-                    secs = time.monotonic() - t0  # wall time for this group (includes any retries)
-                    record(gid, name, status, reason)
-                    record_group_progress(gid, status)  # persisted now, so a crash here is recoverable
-                    on_progress(i, total, name, status, secs)
-                    if i < total and not should_stop():
-                        # Adaptive pacing: the gap is a MINIMUM interval between sends, and the
-                        # time the send already took counts toward it. A send that took longer
-                        # than the target has already spaced itself out, so the next one goes
-                        # immediately; a fast send waits out only the remainder.
-                        wait = max(0.0, _pace_delay(delay, config.jitter_seconds) - secs)
-                        if wait > 0:
-                            _interruptible_sleep(wait, should_stop)
+                        skip(i, gid, name)
+                        continue
+                    deliver(i, gid, name, send_one)
         finally:
             if daemon is not None:
                 daemon.close()
-        # Reached only on a normal return (completed or stopped) — NOT if the loop
-        # raised, in which case the caller has no results and we keep the marker so a
-        # resume is still possible. A surviving file therefore means the run was
-        # killed or aborted by an error before finishing.
-        clear_run_progress()
+        if recovery.paused or resume:
+            ledger = _read_run_progress()
+            latest = {r.group_id: r for r in results}
+            results = [latest.get(r.group_id, r) for r in _progress_results(ledger)]
+        if recovery.paused:
+            ledger["paused"] = True
+            _write_run_progress(ledger)
+            raise BroadcastPaused(results)
+        # Preserve unresolved work across a resume, including earlier uncertain sends.
+        if not resume or not any(r.waiting or r.uncertain for r in results):
+            clear_run_progress()
     return results
 
 
@@ -2680,13 +2783,13 @@ def failure_breakdown(results: list[GroupSendResult]) -> str:
     failures are diagnosable without the old (useless, gibberish) failures-*.txt file."""
     counts: dict[str, int] = {}
     for r in results:
-        if not r.ok and not r.skipped and not r.uncertain:
+        if not r.ok and not r.skipped and not r.uncertain and not r.waiting:
             counts[r.reason or "unknown error"] = counts.get(r.reason or "unknown error", 0) + 1
     return ", ".join(f"{n} {cat}" for cat, n in
                      sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
-def write_run_summary(results: list[GroupSendResult]) -> None:
+def write_run_summary(results: list[GroupSendResult], *, paused: bool = False) -> None:
     """Record a counts-only summary of the last broadcast for the UI — no group
     names, ids, or message text, just totals. Lives in logs/ so it's wiped with
     everything else on unlink (incl. a station-mode trip) and never committed."""
@@ -2695,10 +2798,11 @@ def write_run_summary(results: list[GroupSendResult]) -> None:
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     skipped = sum(1 for r in results if r.skipped)
     uncertain = sum(1 for r in results if r.uncertain)
-    failed = sum(1 for r in results if not r.ok and not r.skipped and not r.uncertain)
+    failed = sum(1 for r in results if not r.ok and not r.skipped and not r.uncertain and not r.waiting)
     summary = {"at": datetime.now().isoformat(timespec="seconds"),
                "total": len(results), "sent": sum(1 for r in results if r.ok),
-               "failed": failed, "skipped": skipped, "uncertain": uncertain}
+               "failed": failed, "skipped": skipped, "uncertain": uncertain,
+               "pending": sum(1 for r in results if r.waiting), "paused": paused}
     LAST_SEND_FILE.write_text(json.dumps(summary), encoding="utf-8")
 
 
@@ -2710,7 +2814,8 @@ def read_run_summary() -> RunSummary | None:
         return RunSummary(at=str(d["at"]), total=int(d["total"]),
                           sent=int(d["sent"]), failed=int(d["failed"]),
                           skipped=int(d.get("skipped", 0)),
-                          uncertain=int(d.get("uncertain", 0)))
+                          uncertain=int(d.get("uncertain", 0)),
+                          pending=int(d.get("pending", 0)), paused=bool(d.get("paused", False)))
     except (ValueError, KeyError):
         return None
 
@@ -2732,7 +2837,8 @@ def message_fingerprint(message: str, attachments: list[str]) -> str:
     return h.hexdigest()[:16]
 
 
-def begin_run_progress(groups: list[tuple[str, str]], fingerprint: str) -> None:
+def begin_run_progress(groups: list[tuple[str, str]], fingerprint: str,
+                       *, run: str = "", message_style: str | None = None) -> None:
     # PII-safe on disk: store opaque group ids only — NO group names and NO message
     # text (just the fingerprint hash). The ids are unavoidable: after a crash + app
     # restart they're the only record of which groups the run covered, so resume needs
@@ -2740,7 +2846,7 @@ def begin_run_progress(groups: list[tuple[str, str]], fingerprint: str) -> None:
     # wrong one). Cleared on a normal finish, so a surviving file means the run died.
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     data = {"at": datetime.now().isoformat(timespec="seconds"), "fp": fingerprint,
-            "groups": [g for g, _ in groups], "done": {}}
+            "groups": [g for g, _ in groups], "done": {}, "run": run, "message_style": message_style}
     _write_run_progress(data)
 
 
@@ -2752,12 +2858,55 @@ def _write_run_progress(data):
         RUN_PROGRESS_FILE.write_text(json.dumps(data), encoding="utf-8")
 
 
+def _read_run_progress() -> dict:
+    try:
+        data = json.loads(RUN_PROGRESS_FILE.read_text(encoding="utf-8"))
+        groups, done = data["groups"], data["done"]
+        if (not isinstance(groups, list) or any(not isinstance(g, str) for g in groups)
+                or len(groups) != len(set(groups)) or not isinstance(done, dict)
+                or not set(done).issubset(groups)
+                or any(status not in {"attempting", "sent", "failed", "uncertain", "skipped", "permanent", "waiting"}
+                       for status in done.values())):
+            raise ValueError("Invalid checkpoint")
+        return data
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise BroadcastError("Broadcast progress is unreadable. Review or discard it before sending.") from exc
+
+
+def _progress_results(data: dict) -> list[GroupSendResult]:
+    results = []
+    for gid in data["groups"]:
+        status = data["done"].get(gid)
+        results.append(GroupSendResult(
+            gid, "", ok=status == "sent", skipped=status == "skipped", permanent=status == "permanent",
+            uncertain=status in ("attempting", "uncertain"), waiting=status in (None, "waiting"),
+            reason={"permanent": "not a member of this group", "failed": "previous send failed",
+                    "uncertain": "delivery not confirmed", "attempting": "delivery not confirmed",
+                    "waiting": "rate limited", "skipped": "admin-only"}.get(status, "")))
+    return results
+
+
+def resume_run_progress(fingerprint: str, message_style: str) -> dict:
+    data = _read_run_progress()
+    if data["fp"] != fingerprint or data.get("message_style") not in (None, message_style):
+        raise BroadcastError("Draft or formatting changed. Discard the interrupted run before a new send.")
+    if not any(data["done"].get(gid) in (None, "failed", "waiting") for gid in data["groups"]):
+        raise BroadcastError("There are no safely resumable groups. Review unconfirmed sends or discard the saved run.")
+    # An abandoned request stays uncertain even after another resume finishes.
+    data["done"] = {gid: "uncertain" if state == "attempting" else state for gid, state in data["done"].items()}
+    data.pop("paused", None)
+    data["run"] = data.get("run") or uuid.uuid4().hex
+    data["message_style"] = message_style
+    _write_run_progress(data)
+    return data
+
+
 def record_group_progress(group_id: str, status: str) -> None:
     """Mark one group's outcome ("sent"/"failed"/"uncertain"/"skipped"). Rewritten
     after every group so a crash leaves an accurate record. Best-effort."""
     try:
-        data = json.loads(RUN_PROGRESS_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        data = _read_run_progress()
+    except BroadcastError:
         if PRIVATE_TRANSPORT:
             raise BroadcastError("Broadcast progress is unreadable. Sending stopped.")
         return
@@ -2799,8 +2948,8 @@ def read_interrupted_run() -> InterruptedRun | None:
     if not RUN_PROGRESS_FILE.exists():
         return None
     try:
-        data = json.loads(RUN_PROGRESS_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        data = _read_run_progress()
+    except BroadcastError:
         if PRIVATE_TRANSPORT:
             raise BroadcastError("Interrupted progress is unreadable. Review or discard it before sending.")
         return None
@@ -2808,14 +2957,15 @@ def read_interrupted_run() -> InterruptedRun | None:
     # resume — the resend is keyed by id, and the UI shows counts, not names.
     gids = [str(g) for g in data.get("groups", [])]
     done = data.get("done", {})
-    remaining = [(g, "") for g in gids if done.get(g) in (None, "failed")]
+    remaining = [(g, "") for g in gids if done.get(g) in (None, "failed", "waiting")]
     # "attempting" = killed mid-send; "uncertain" = timed out. Both may have delivered.
     uncertain = [(g, "") for g in gids if done.get(g) in ("attempting", "uncertain")]
-    if not gids or (not remaining and not uncertain):
+    if not gids or (not remaining and not uncertain and not data.get("paused")):
         return None
     return InterruptedRun(fingerprint=str(data.get("fp", "")), total=len(gids),
                           done=len(gids) - len(remaining), remaining=remaining,
-                          uncertain=uncertain)
+                          uncertain=uncertain, paused=bool(data.get("paused")),
+                          message_style=data.get("message_style"))
 
 
 def append_activity(line: str) -> None:

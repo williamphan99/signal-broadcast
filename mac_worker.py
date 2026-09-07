@@ -112,6 +112,8 @@ def run(request):
             fingerprint = engine.message_fingerprint(message, attachments)
             if interrupted.fingerprint != fingerprint:
                 raise engine.BroadcastError("Draft changed. Discard the interrupted run before a new send.")
+            if interrupted.message_style not in (None, cfg.message_style):
+                raise engine.BroadcastError("Formatting changed. Discard the interrupted run before a new send.")
             groups = interrupted.remaining
         groups = list({gid: name for gid, name in groups}.items())
         mac_retry.save([], message, attachments, cfg.message_style)
@@ -131,18 +133,26 @@ def run(request):
         def progressed(position, total, _name, outcome, seconds):
             with progress_lock:
                 active.discard(position)
-                completed.add(position)
+                if outcome != "waiting":
+                    completed.add(position)
                 emit("progress", {"done": len(completed), "total": total, "status": outcome})
                 status()
-        results = engine.broadcast(config=cfg, groups=groups, message=message,
-            attachments=attachments, on_log=lambda text: emit("log", text),
-            on_diagnostic=lambda entry: emit("send_diagnostic", entry),
-            should_stop=lambda: (root.parents[1] / "erase.json").exists(),
-            on_group_start=started, on_progress=progressed)
-        engine.stamp_run()
-        engine.write_run_summary(results)
+        paused = False
+        try:
+            results = engine.broadcast(config=cfg, groups=groups, message=message,
+                attachments=attachments, on_log=lambda text: emit("log", text),
+                on_diagnostic=lambda entry: emit("send_diagnostic", entry),
+                should_stop=lambda: (root.parents[1] / "erase.json").exists(),
+                on_group_start=started, on_progress=progressed, resume=(kind == "resume"))
+        except engine.BroadcastPaused as exc:
+            paused, results = True, exc.results
+        if not paused:
+            engine.stamp_run()
+        engine.write_run_summary(results, paused=paused)
         mac_retry.save(results, message, attachments, cfg.message_style)
         emit("results", [asdict(result) for result in results])
+        if paused:
+            emit("paused", {"pending": sum(1 for result in results if result.waiting)})
     else:
         raise engine.BroadcastError("Unsupported job.")
 

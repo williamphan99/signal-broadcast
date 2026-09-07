@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=None, help="only send to the first N groups (testing)")
     p.add_argument("--dry-run", action="store_true", help="show what would send, send nothing")
     p.add_argument("--force", action="store_true", help="ignore the cooldown gate")
+    p.add_argument("--resume", action="store_true", help="explicitly resume a paused broadcast")
     args = p.parse_args()
     if args.delay is not None and args.delay < 0:
         p.error("--delay must be >= 0")  # a negative pace is meaningless and misreports dry-run
@@ -93,6 +94,12 @@ def run(args: argparse.Namespace) -> int:
     # of a GUI run that's mid-send; dry-run never mutates anything.
     interrupted = engine.read_interrupted_run()
     if interrupted:
+        if interrupted.paused and not args.dry_run and not getattr(args, "resume", False):
+            log.error("Broadcast paused after throttling. Review it and use --resume when ready.")
+            return 2
+        if getattr(args, "resume", False) and interrupted.fingerprint != engine.message_fingerprint(message, attachments):
+            log.error("The saved draft changed. Restore it before resuming the paused broadcast.")
+            return 2
         if interrupted.fingerprint == engine.message_fingerprint(message, attachments):
             if interrupted.uncertain:
                 log.warning("%d group(s) from the interrupted run may already have been sent "
@@ -125,6 +132,7 @@ def run(args: argparse.Namespace) -> int:
         base_delay=args.delay,
         on_log=log.info,
         on_progress=_log_progress,
+        resume=bool(interrupted and interrupted.fingerprint == engine.message_fingerprint(message, attachments)),
     )
     engine.stamp_run()
     engine.write_run_summary(results)
@@ -151,6 +159,10 @@ def main() -> int:
     configure_logging()
     try:
         return run(parse_args())
+    except engine.BroadcastPaused as exc:
+        engine.write_run_summary(exc.results, paused=True)
+        log.error("%s", exc)
+        return 2
     except engine.BroadcastError as exc:
         log.error("%s", exc)
         return 2

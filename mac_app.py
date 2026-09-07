@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import queue
+import math
 import os
 import subprocess
 import sys
@@ -21,11 +22,28 @@ from photo_strip import PhotoStrip
 from ui_theme import PALETTE
 
 
+def recovery_activity(event):
+    kind = event.get("event")
+    if kind == "throttled":
+        cause = ("Photo upload temporarily throttled" if event.get("reason") == "attachment upload throttled"
+                 else "Signal temporarily throttled this broadcast")
+        if event.get("retry_after", 0) <= 0:
+            return f"{cause}. Waiting for in-flight sends before retrying."
+        return f"{cause}. Waiting {math.ceil(event.get('retry_after', 0))} seconds before retrying."
+    return {"retrying": "Trying one send to check whether Signal has recovered.",
+            "recovered": "Signal sending recovered. Continuing the broadcast.",
+            "paused": "Pausing after 15 minutes without a successful send during throttling. Waiting for in-flight sends to finish."}.get(kind, "")
+
+
 def operation_status(data, pending=None):
     if pending == "stop":
         return "Stopping… Waiting for the background service to confirm."
     kind = data.get("job") or pending
     if kind:
+        if kind in ("send", "resume", "retry"):
+            recovery = data.get("send_recovery") or {}
+            if recovery.get("event") in ("throttled", "retrying", "paused"):
+                return recovery_activity(recovery)
         if kind in ("send", "resume", "retry") and data.get("phase") == "preparing":
             return "Preparing message and photos…"
         return {"send": "Sending…", "resume": "Sending remaining groups…",
@@ -41,6 +59,8 @@ def operation_status(data, pending=None):
         return f"{name} stopped.{suffix}"
     if last.get("outcome") == "failed":
         return f"{name} failed. Check the activity below before trying again."
+    if last.get("outcome") == "paused" or (data.get("interrupted") or {}).get("paused"):
+        return "Broadcast paused after persistent throttling. Review and resume the saved broadcast when ready."
     if last.get("outcome") == "completed":
         summary = data.get("summary")
         if last.get("kind") in ("send", "resume", "retry") and summary:
@@ -465,6 +485,7 @@ class App(tk.Tk):
             return
         self.data = data
         self.busy = bool(data["job"])
+        self.snapshot_time = time.monotonic()
         if self.screen == "main":
             signature = [(g["group_id"], g["name"], g["enabled"]) for g in data["groups"]]
             if signature != self.group_signature:
@@ -505,12 +526,15 @@ class App(tk.Tk):
                 elif kind == "send_diagnostic":
                     if value.get("log_write_failed"):
                         self.add_activity("Could not save send diagnostics. Check disk space and log folder permissions.")
-                    if value["status"] != "sent":
+                    if value.get("event", "attempt") != "attempt":
+                        self.add_activity(recovery_activity(value))
+                    elif value["status"] != "sent":
                         self.add_activity(f"Group position {value['position']}, attempt {value['attempt']}: "
                                           f"{value['status']} after {value['seconds']}s. {value['reason']}.")
                 elif kind == "progress":
                     result = {"sent": "Message sent", "failed": "Send failed", "skipped": "Group skipped",
-                              "uncertain": "Delivery not confirmed"}.get(value["status"], "Group processed")
+                              "uncertain": "Delivery not confirmed", "waiting": "Waiting to retry",
+                              "permanent": "Send failed; membership needs review"}.get(value["status"], "Group processed")
                     self.progress_caption = f"{value['done']} of {value['total']} groups processed."
                     self.add_activity(f"{result}. {self.progress_caption}")
                 elif kind == "phase":
@@ -520,7 +544,7 @@ class App(tk.Tk):
                             "notes": "Receiving notes and downloading their photos…"}.get(value)
                     if text:
                         self.add_activity(text)
-                elif kind in ("stopped", "finished"):
+                elif kind in ("stopped", "finished", "paused"):
                     self.add_activity(operation_status(data))
         self.sequence = data["sequence"]
         update = data.get("update")
@@ -564,8 +588,10 @@ class App(tk.Tk):
             self.retry_button.pack_forget()
         summary = self.data.get("summary")
         self.last_send_text.set("No completed broadcast yet." if not summary else
-            f"Last broadcast: {summary['at']}\n{summary['sent']} sent, {summary['failed']} failed, "
-            f"{summary.get('skipped', 0)} skipped, {summary.get('uncertain', 0)} unconfirmed.")
+            f"{'Paused broadcast' if summary.get('paused') else 'Last broadcast'}: {summary['at']}\n"
+            f"{summary['sent']} sent, {summary['failed']} failed, "
+            f"{summary.get('skipped', 0)} skipped, {summary.get('uncertain', 0)} unconfirmed, "
+            f"{summary.get('pending', 0)} pending.")
         self.notes_button.configure(state="disabled" if blocked else "normal")
         self.sync_button.configure(state="disabled" if blocked else "normal")
         self.message.configure(state="disabled" if sending else "normal")
@@ -581,7 +607,11 @@ class App(tk.Tk):
         interrupted = self.data.get("interrupted")
         if interrupted and not blocked:
             remaining = len(interrupted.get("remaining", []))
-            self.recovery_text.configure(text=f"{remaining} groups remain in the saved broadcast. Resume uses the saved draft.")
+            self.recovery.configure(text="Paused broadcast" if interrupted.get("paused") else "Interrupted broadcast")
+            uncertain = len(interrupted.get("uncertain", []))
+            self.recovery_text.configure(text=f"{remaining} groups remain in the saved broadcast. "
+                f"{uncertain} unconfirmed groups will not be resent. Resume uses the saved draft.")
+            self.resume_button.configure(state="normal" if remaining else "disabled")
             self.recovery.pack(fill="x", before=self.activity_label, pady=(4, 8))
         else:
             self.recovery.pack_forget()
@@ -629,6 +659,10 @@ class App(tk.Tk):
                       f"{status['completed']} of {status['total']} groups processed.")
             if not active and status["completed"] < status["total"]:
                 detail += " Waiting before the next send."
+            recovery = self.data.get("send_recovery") or {}
+            if recovery.get("event") in ("throttled", "retrying", "paused"):
+                remaining = max(0, recovery.get("retry_after", 0) - (time.monotonic() - self.snapshot_time))
+                detail = recovery_activity({**recovery, "retry_after": remaining})
         self.activity_hint.set(f"Working for {elapsed // 60}:{elapsed % 60:02d}. {detail}")
 
     def add_activity(self, text):

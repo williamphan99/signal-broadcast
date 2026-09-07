@@ -205,3 +205,91 @@ class UpdateTests(unittest.TestCase):
             result = engine.git_pull()
         self.assertTrue(result.error)
         self.assertFalse(result.changed)
+
+
+class ThrottlePauseTests(unittest.TestCase):
+    setUp = test_mac_security.SecurityTests.setUp
+    setup = test_mac_security.SecurityTests.setup
+    request = test_mac_security.SecurityTests.request
+
+    def prepare(self):
+        self.setup()
+        engine.set_config_value('account', '+19999999999')
+        engine.set_config_value('cooldown_hours', 0)
+        engine.GROUPS_FILE.write_text('fixture\tFixture\n')
+        engine.write_message('Saved draft')
+        engine.write_attachments([])
+
+    def test_worker_emits_partial_paused_summary_without_arming_cooldown(self):
+        self.prepare()
+        results = [engine.GroupSendResult('sent', '', True),
+                   engine.GroupSendResult('pending', '', False, waiting=True),
+                   engine.GroupSendResult('uncertain', '', False, uncertain=True),
+                   engine.GroupSendResult('member', '', False, permanent=True)]
+        events = []
+        with mock.patch('pathlib.Path.is_mount', return_value=True), \
+             mock.patch.dict(mac_worker.os.environ), \
+             mock.patch.object(mac_worker, 'configure_storage'), \
+             mock.patch.object(engine, 'broadcast', side_effect=engine.BroadcastPaused(results)), \
+             mock.patch.object(engine, 'stamp_run') as stamp, \
+             mock.patch.object(mac_worker, 'emit', side_effect=lambda kind, value: events.append((kind, value))):
+            mac_worker.run({'root': str(self.vault.data), 'job': 'send'})
+        stamp.assert_not_called()
+        self.assertIn(('paused', {'pending': 1}), events)
+        self.assertTrue(engine.read_run_summary().paused)
+        self.assertEqual(engine.read_run_summary().pending, 1)
+        self.assertEqual(mac_retry.available_count(), 0)
+
+    def test_service_records_pause_and_scheduler_cannot_bypass_it(self):
+        import io
+        from mac_service import Service
+        self.prepare()
+        self.request('schedule', enabled=True, times=['12:00'])
+        data = self.service.schedule()
+        data['running'] = '2026-09-07 12:00'
+        self.service.save_schedule_state(data, data.get('history', []))
+        engine.begin_run_progress([('fixture', '')], engine.message_fingerprint('Saved draft', []))
+        engine.record_group_progress('fixture', 'waiting')
+        ledger = engine._read_run_progress()
+        ledger['paused'] = True
+        engine._write_run_progress(ledger)
+        engine.write_run_summary([engine.GroupSendResult('fixture', '', False, waiting=True)], paused=True)
+        proc = mock.Mock()
+        proc.stdout = io.StringIO(json.dumps({'kind': 'paused', 'value': {'pending': 1}}) + '\n')
+        proc.wait.return_value = 0
+        job = {'kind': 'send', 'proc': proc, 'scheduled': True}
+        self.service.job = job
+        with mock.patch('mac_service.terminate_group'):
+            self.service._read_job(job)
+        self.assertEqual(self.service.last_operation['outcome'], 'paused')
+        self.assertEqual(self.service.schedule()['history'][-1]['state'], 'paused')
+        with mock.patch.object(self.service, '_start_job') as start:
+            self.service.tick(datetime(2026, 9, 8, 12, 0, 10))
+            start.assert_not_called()
+        self.assertTrue(self.service.snapshot()['interrupted']['paused'])
+        with self.assertRaisesRegex(Exception, 'resume or discard'):
+            self.service.send_preflight('send')
+
+    def test_service_recovery_countdown_survives_ui_lock_without_duplicate_events(self):
+        self.prepare()
+        self.service.job = {'kind': 'send'}
+        self.service.send_recovery = {'event': 'throttled', 'reason': 'attachment upload throttled', 'retry_after': 30}
+        self.service.recovery_until = 130
+        with mock.patch('mac_service.time.monotonic', return_value=110):
+            before = self.service.sequence
+            snapshot = self.service.snapshot()
+            self.assertEqual(snapshot['send_recovery']['retry_after'], 20)
+            self.service.lock()
+            self.token = self.service.authenticate(test_mac_security.PASSWORD)['token']
+            self.assertEqual(self.service.snapshot()['send_recovery']['retry_after'], 20)
+            self.assertEqual(self.service.sequence, before)
+        self.service.job = None
+
+    def test_mac_recovery_messages_explain_wait_recovery_and_pause_without_raw_text(self):
+        from mac_app import recovery_activity, operation_status
+        waiting = {'event': 'throttled', 'reason': 'attachment upload throttled', 'retry_after': 29.5}
+        self.assertEqual(recovery_activity(waiting), 'Photo upload temporarily throttled. Waiting 30 seconds before retrying.')
+        self.assertIn('recovered', recovery_activity({'event': 'recovered'}))
+        self.assertIn('resume', operation_status({'last_operation': {'kind': 'send', 'outcome': 'paused'}}))
+        self.assertIn('paused', operation_status({'interrupted': {'paused': True}}))
+        self.assertNotIn('private-data', recovery_activity({**waiting, 'reason': 'private-data'}))

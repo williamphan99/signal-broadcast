@@ -632,12 +632,10 @@ class App(tk.Tk):
             messagebox.showerror("Can't resume", str(exc))
             return
         if engine.message_fingerprint(message, attachments) != run.fingerprint:
-            if not messagebox.askyesno("Message changed",
-                    "The saved message has changed since the interrupted run.\n\n"
-                    "Resume and send the CURRENT message to the remaining groups?"):
-                return
+            messagebox.showerror("Message changed", "Restore the saved draft or discard the interrupted run before sending.")
+            return
         self.resume_bar.pack_forget()
-        self._begin_send(cfg, run.remaining, message, attachments)
+        self._begin_send(cfg, run.remaining, message, attachments, resume=True)
 
     def _discard_interrupted(self) -> None:
         engine.clear_run_progress()
@@ -1394,7 +1392,7 @@ class App(tk.Tk):
         self.stop_btn.configure(state="disabled", text="Stopping…")
         self._log("Stopping — finishing the current group first…", "muted")
 
-    def _begin_send(self, cfg, groups, message, attachments) -> None:
+    def _begin_send(self, cfg, groups, message, attachments, resume=False) -> None:
         # Single chokepoint for every send trigger (Send, Resend, Resume). Guard against
         # a second concurrent run: without it, Resend/Resume could re-enter while a send
         # is live and only the engine's flock would reject it (as a red log line). The
@@ -1425,16 +1423,16 @@ class App(tk.Tk):
         self._inflight = {}   # pos -> (name, start_monotonic): groups sending right now
         self._tick_heartbeat()
         threading.Thread(target=self._send_worker,
-                         args=(cfg, groups, message, attachments), daemon=True).start()
+                         args=(cfg, groups, message, attachments, resume), daemon=True).start()
 
-    def _send_worker(self, cfg, groups, message, attachments) -> None:
+    def _send_worker(self, cfg, groups, message, attachments, resume=False) -> None:
         try:
             results = engine.broadcast(
                 config=cfg, groups=groups, message=message, attachments=attachments,
                 on_log=lambda m: self.events.put(("log", m)),
                 on_progress=lambda d, t, n, status, secs: self.events.put(("progress", (d, t, n, status, secs))),
                 on_group_start=lambda pos, name: self.events.put(("group_start", (pos, name))),
-                should_stop=self.stop_event.is_set)
+                should_stop=self.stop_event.is_set, resume=resume)
             if not self.stop_event.is_set():  # a stopped run is incomplete — don't arm the cooldown
                 engine.stamp_run()
                 engine.write_run_summary(results)

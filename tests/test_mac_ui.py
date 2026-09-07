@@ -144,6 +144,22 @@ class MacUITests(unittest.TestCase):
                 app.apply_snapshot({**data, "sequence": 1, "job": "send"})
                 self.assertIn("Broadcast stopped", app.operation_text.get())
                 app.apply_snapshot({**data, "sequence": 5})
+                recovery = {"event": "throttled", "reason": "attachment upload throttled", "retry_after": 30}
+                app.apply_snapshot({**data, "sequence": 6, "job": "send",
+                    "send_progress": {"active": 1, "completed": 1, "total": 3}, "send_recovery": recovery,
+                    "events": [{"id": 6, "kind": "send_diagnostic", "value": recovery}]})
+                app.refresh_elapsed()
+                self.assertIn("Photo upload temporarily throttled", app.activity.get("1.0", "end"))
+                self.assertIn("Waiting 30 seconds", app.activity_hint.get())
+                app.apply_snapshot({**data, "sequence": 7,
+                    "last_operation": {"kind": "send", "outcome": "paused"},
+                    "interrupted": {"paused": True, "remaining": [["fixture", ""]], "uncertain": [["unknown", ""]]},
+                    "events": [{"id": 7, "kind": "paused", "value": {"pending": 1}}]})
+                self.assertIn("Broadcast paused", app.operation_text.get())
+                self.assertEqual(app.recovery.cget("text"), "Paused broadcast")
+                self.assertIn("1 unconfirmed groups will not be resent", app.recovery_text.cget("text"))
+                self.assertEqual(str(app.resume_button.cget("state")), "normal")
+                app.apply_snapshot({**data, "sequence": 8})
                 app.images = paths * 5
                 app.refresh_images()
                 app.update()
