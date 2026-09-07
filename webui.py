@@ -383,7 +383,7 @@ self.addEventListener('fetch',event=>{
             failed = [(r.group_id, r.name) for r in results
                       if not r.ok and not r.skipped and not r.uncertain]
             with st.lock:
-                st.failed = failed
+                st.failed = [(r.group_id, r.name) for r in results if r.retryable]
                 st.send_summary = {
                     "sent": sum(1 for r in results if r.ok),
                     "failed": len(failed),

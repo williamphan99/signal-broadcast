@@ -6,7 +6,7 @@ from mac_security import atomic_json
 
 
 def save(results, message, attachments, style):
-    failed = [[r.group_id, r.name] for r in results if not r.ok and not r.skipped and not r.uncertain]
+    failed = [[r.group_id, r.name] for r in results if r.retryable]
     atomic_json(engine.RUNTIME_DIR / "retry.json", {
         "fingerprint": engine.message_fingerprint(message, attachments), "style": style, "groups": failed})
 

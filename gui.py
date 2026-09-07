@@ -1813,7 +1813,7 @@ class App(tk.Tk):
         # Skipped (admin-only) and uncertain (timed out — may have delivered) groups
         # are NOT added to failed_results. Resending a skipped one just fails again;
         # resending an uncertain one could DUPLICATE a message that already went out.
-        self.failed_results = failed + pending
+        self.failed_results = [r for r in failed if r.retryable] + pending
         if skipped:
             self._log(f"Skipped {len(skipped)} admin-only group(s) you can't post in.", "muted")
         if uncertain:

@@ -152,7 +152,7 @@ WATCHER_PLIST = LAUNCH_AGENTS_DIR / f"{WATCHER_LABEL}.plist"
 
 # Throttle fingerprints in signal-cli stderr. These get long exponential backoff;
 # anything else gets a couple of quick retries then is marked failed.
-THROTTLE_PATTERN = re.compile(r"rate.?limit|throttl|\b429\b|\b413\b", re.IGNORECASE)
+THROTTLE_PATTERN = re.compile(r"rate.?limit|throttl|\b429\b|\b413\b|\bRetryLaterException\b", re.IGNORECASE)
 RETRY_AFTER_PATTERN = re.compile(r"retry[ _-]?after[^0-9]*(\d+)", re.IGNORECASE)
 
 THROTTLE_BACKOFF_BASE_S = 30.0   # first throttle wait; doubles each retry
@@ -309,6 +309,11 @@ class GroupSendResult:
     skipped: bool = False   # not attempted on purpose (e.g. admin-only group)
     uncertain: bool = False  # send timed out — may have delivered; never auto-retried/resent
     reason: str = ""        # short why, for skips/failures (PII-safe category)
+    permanent: bool = False  # requires membership/permission repair, not an automatic retry
+
+    @property
+    def retryable(self) -> bool:
+        return not (self.ok or self.skipped or self.uncertain or self.permanent)
 
 
 @dataclass
@@ -2206,10 +2211,12 @@ def _interruptible_sleep(seconds: float, should_stop: StopFn) -> None:
 ADMIN_ONLY_PATTERN = re.compile(
     r"only admins|only administrators|announcement group|not allowed to send|"
     r"sending is restricted|admins?[\s_-]*only", re.I)
+NOT_MEMBER_PATTERN = re.compile(r"user is not a member (?:in|of) group", re.I)
 
 # Map signal-cli's error text to a short, PII-safe reason. We never log the raw
 # text (it can contain a group id or recipient number) — only the category here.
 _ERROR_CATEGORIES = [
+    (NOT_MEMBER_PATTERN, "not a member of this group"),
     (ADMIN_ONLY_PATTERN, "admin-only group (you can't post here)"),
     # BEFORE the network pattern: a broken signal-cli install can't send anything, and
     # calling it a network problem sends you chasing the wrong thing for weeks. This is
@@ -2328,6 +2335,9 @@ def _deliver_to_group(send_one: SendFn, group_id: str,
             # We lost contact before signal-cli confirmed — it may have delivered.
             on_log("Send unconfirmed — it may have gone through; not retrying, to avoid a duplicate.")
             return "uncertain", "timed out — may have sent"
+        if NOT_MEMBER_PATTERN.search(err):
+            on_log("Send failed — not a member of this group. Review membership before sending again.")
+            return "permanent", "not a member of this group"
         if throttled:
             throttle_attempt += 1
             if throttle_attempt > max_retries:
@@ -2528,6 +2538,7 @@ def broadcast(*, config: Config, groups: list[tuple[str, str]], message: str,
                                                reason=reason or "may have sent (timed out)"))
             else:
                 results.append(GroupSendResult(gid, name, ok=(status == "sent"),
+                                               permanent=(status == "permanent"),
                                                reason="" if status == "sent" else reason))
 
         def run_parallel() -> None:
