@@ -1,11 +1,13 @@
 """Recovery regressions using sanitised provider errors and disposable storage."""
 import json
+import argparse
 import unittest
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 import engine
+import broadcast
 import mac_retry
 from runtime import isolated_engine
 
@@ -282,6 +284,22 @@ class BroadcastRecoveryTests(unittest.TestCase):
         remaining = engine.read_interrupted_run()
         self.assertEqual(remaining.remaining, [])
         self.assertEqual(remaining.uncertain, [('g3', '')])
+
+        checkpoint = engine.RUN_PROGRESS_FILE.read_bytes()
+        args = argparse.Namespace(message='fixture', attachments='fixture', groups='fixture',
+                                  limit=None, delay=None, dry_run=False, force=True, resume=False)
+        with mock.patch.object(engine, 'load_config', return_value=self.cfg), \
+             mock.patch.object(engine, 'read_message', return_value='fixture-message') as message, \
+             mock.patch.object(engine, 'read_attachments', return_value=[]), \
+             mock.patch.object(engine, 'read_groups', return_value=[('g3', 'Third')]), \
+             mock.patch.object(engine, 'broadcast') as dispatch:
+            for draft, resume in [('fixture-message', False), ('fixture-message', False),
+                                  ('changed draft', False), ('fixture-message', True)]:
+                message.return_value = draft
+                args.resume = resume
+                self.assertEqual(broadcast.run(args), 2)
+                self.assertEqual(engine.RUN_PROGRESS_FILE.read_bytes(), checkpoint)
+            dispatch.assert_not_called()
 
     def test_paused_ledger_cannot_be_overwritten_by_a_new_broadcast(self):
         self.plan = {'g1': (False, True, UPLOAD_RETRY)}

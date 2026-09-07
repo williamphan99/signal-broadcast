@@ -98,6 +98,15 @@ baseline-to-head diff and sanitised fixtures. The main agent validates every fin
 and commits each accepted review fix separately, then reruns affected checks and the
 full suite. Preserve unrelated work.
 
+Both fresh reviews completed against `f3d507d`. They independently reproduced one
+shared finding: the portable CLI cleared an uncertain-only checkpoint after resume,
+allowing a later scheduled invocation to resend it. Accepted as a duplicate-delivery
+defect and fixed separately. The regression completes repeated pause/resume, then
+checks repeated unattended calls, a changed draft and an empty explicit resume:
+all retain the checkpoint and dispatch nothing. No other actionable findings.
+Native validation passed two UI tests and five integration tests; one optional
+integration test was skipped. All transport calls were synthetic.
+
 Finish or deliberately stop the current real broadcast before updating/restarting
 the app/service. New jobs use the updated engine. A real large-group canary is a
 separate authorisation step; compare sanitised timings, throttling, recovery and

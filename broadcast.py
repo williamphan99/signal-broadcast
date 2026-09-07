@@ -89,11 +89,20 @@ def run(args: argparse.Namespace) -> int:
 
     # Resume an interrupted run instead of re-sending everything. Only when the
     # message+attachments are unchanged (same fingerprint) — otherwise the operator
-    # clearly intends a new send, so start fresh. State is only mutated under the send
+    # intends a new send, unless paused or unconfirmed work still needs review.
+    # State is only mutated under the send
     # lock (clear_run_progress_if_idle) so a launchd fire can't wipe the resume record
     # of a GUI run that's mid-send; dry-run never mutates anything.
     interrupted = engine.read_interrupted_run()
     if interrupted:
+        if interrupted.uncertain and not args.dry_run and (
+            not getattr(args, "resume", False)
+            or interrupted.fingerprint != engine.message_fingerprint(message, attachments)
+            or not interrupted.remaining
+        ):
+            log.error("Saved deliveries are unconfirmed. Review them in Signal and explicitly "
+                      "discard the saved run, or use --resume for its remaining groups.")
+            return 2
         if interrupted.paused and not args.dry_run and not getattr(args, "resume", False):
             log.error("Broadcast paused after throttling. Review it and use --resume when ready.")
             return 2
