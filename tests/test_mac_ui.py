@@ -160,6 +160,19 @@ class MacUITests(unittest.TestCase):
                 self.assertIn("1 unconfirmed groups will not be resent", app.recovery_text.cget("text"))
                 self.assertEqual(str(app.resume_button.cget("state")), "normal")
                 app.apply_snapshot({**data, "sequence": 8})
+                album = []
+                for index in range(16):
+                    photo = Path(directory) / f"note-{index}.png"
+                    photo.write_bytes(png_bytes())
+                    album.append(str(photo))
+                full_text = "Complete album caption. " * 1500
+                app.apply_snapshot({**data, "sequence": 9, "job": "notes",
+                    "notes": [{"ts": 2, "text": full_text, "photos": [{"path": p} for p in album]}],
+                    "events": [{"id": 9, "kind": "receive_status", "value": "Receiving: 16 images saved."}]})
+                self.assertIn("16 images saved", app.notice.get())
+                app.use_note()
+                self.assertEqual(app.images, album)
+                self.assertEqual(app.message.get("1.0", "end-1c"), full_text)
                 app.images = paths * 5
                 app.refresh_images()
                 app.update()

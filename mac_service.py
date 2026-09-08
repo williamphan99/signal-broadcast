@@ -264,6 +264,8 @@ class Service:
         job = self.job
         if job:
             terminate_group(job["proc"])
+            if job["kind"] in ("notes", "sync"):
+                engine._notes_log("receive interrupted: worker stopped; saved notes kept")
             self.job = None
         self.reap_worker()
 
@@ -419,7 +421,7 @@ class Service:
         if kind in ("send", "resume", "retry"):
             self.send_preflight(kind)
         command = [sys.executable, str(PROJECT / "mac_worker.py")]
-        if sys.platform == "darwin" and kind in ("send", "resume", "retry"):
+        if sys.platform == "darwin" and kind in ("send", "resume", "retry", "notes", "sync"):
             command = ["/usr/bin/caffeinate", "-i", *command]
         try:
             proc = self.spawn(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,

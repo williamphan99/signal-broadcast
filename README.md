@@ -73,13 +73,20 @@ old background jobs. Unplugging the Mac no longer erases data.
 - **Notes**: check Signal's Note to Self, select a note and use its text and complete
   attachments as the draft. Deleting a note removes only the local copy.
   Both Notes and group refresh download attachments and save each received note
-  immediately. A receive operation allows up to one hour for large files and shows
-  progress every five seconds. Unrelated pending messages and their attachments can
-  add to the wait. An interrupted check keeps saved notes and reports that it is
+  immediately, including albums of 16 or more images and attachment-backed full text.
+  A receive operation allows up to one hour overall and shows and records progress
+  every five seconds. Unrelated pending messages and their attachments can add to the
+  wait. After three minutes without a processed message or temporary download-file
+  activity, it reconnects once. Active downloads can continue; a second stall stops
+  with connection guidance. Signal decryption/processing errors are reported as an
+  incomplete check, even when the Signal process exits successfully.
+  An interrupted check keeps saved notes and reports that it is
   incomplete; check again to receive the remaining queue. Notes whose attachments
   were skipped by an older version must be forwarded to Note to Self again.
   The app keeps the latest 300 unexpired notes. Debug summaries in
-  `logs/notes-debug.txt` record counts, duration and completion status inside the vault.
+  `logs/notes-debug.txt` record counts, temporary download bytes, time since activity,
+  classified errors, reconnects and completion status inside the vault. Raw Signal
+  error messages and message content are not copied into these diagnostics.
 - **Groups**: search, toggle groups, select/deselect visible matches and save.
   Selections outside the current search are retained.
 - **Schedule**: save daily times, see the next time or pending run, and read schedule activity.
@@ -122,8 +129,9 @@ restart can delay a send; after waking and unlocking when required, only a pendi
 send still within this limit can start. Disabling or resaving the schedule cancels
 pending work. It does not stop an active broadcast.
 
-Active broadcasts use `caffeinate` to prevent idle sleep. This does not wake a
-sleeping Mac or override closing its lid. Keep it awake for on-time schedules.
+Active broadcasts, Notes checks and group refreshes use `caffeinate` to prevent idle
+sleep. This does not wake a sleeping Mac or override closing its lid. Keep it awake
+for on-time schedules.
 An unfinished broadcast blocks a new scheduled broadcast until it is reviewed. **Resume remaining**
 excludes messages with uncertain delivery, avoiding automatic duplicate sends.
 

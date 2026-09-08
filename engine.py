@@ -24,6 +24,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tomllib
@@ -1502,6 +1503,7 @@ def _notes_transaction() -> Iterator[None]:
 NOTES_BURST_S = 10        # signal-cli's own idle cap for one notes drain
 RECEIVE_TIMEOUT_S = 3600  # one hour for large attachments, shared by Notes and Groups
 RECEIVE_PROGRESS_S = 5    # report counts even while signal-cli is downloading a file
+RECEIVE_STALL_S = 180     # no envelopes or download-file changes before reconnecting once
 NOTES_KEEP = 300          # most recent notes retained
 LONG_MESSAGE_MIME = "text/x-signal-plain"
 
@@ -1635,7 +1637,7 @@ def _inspect_receive(
     """Classify a receive stream once, retaining only notes and bounded diagnostics."""
     found = []
     counters = counters if counters is not None else {}
-    counters.update(envelopes=0, transcripts=0, notes=0, invalid=0)
+    counters.update(envelopes=0, transcripts=0, notes=0, invalid=0, receive_errors=0)
     envelopes = transcripts = notes = 0
     samples = collections.deque(maxlen=5)
     had_output = False
@@ -1648,6 +1650,9 @@ def _inspect_receive(
             value = json.loads(line)
         except ValueError:
             counters["invalid"] += 1
+            continue
+        if isinstance(value, dict) and value.get("exception") is not None:
+            counters["receive_errors"] += 1
             continue
         envelope = value.get("envelope") if isinstance(value, dict) else None
         if not isinstance(envelope, dict):
@@ -1835,19 +1840,58 @@ def fetch_notes(account: str, on_log: LogFn = lambda *_: None) -> dict:
 
 def _receive_messages(binary: str, account: str, idle_seconds: int,
                       on_log: LogFn = lambda *_: None) -> dict:
+    """Keep the account lease across one bounded reconnect, retaining saved notes."""
+    started = time.monotonic()
+    totals = dict.fromkeys(("envelopes", "transcripts", "notes", "invalid", "receive_errors",
+                            "new", "missing_attachments"), 0)
+    temporary = RUNTIME_DIR / "temporary"
+    temporary.mkdir(parents=True, exist_ok=True, mode=0o700)
+    on_log("Checking all pending Signal messages, including attachments from other chats. "
+           "Large albums take longer; each complete note appears as soon as it is saved.")
+    for attempt in (1, 2):
+        with tempfile.TemporaryDirectory(prefix="receive-", dir=temporary) as folder:
+            report = _receive_once(binary, account, idle_seconds, Path(folder),
+                                   max(0.01, RECEIVE_TIMEOUT_S - (time.monotonic() - started)), on_log)
+        for key in totals:
+            totals[key] += report[key]
+        if (attempt == 2 or not report["retryable"]
+                or time.monotonic() - started >= RECEIVE_TIMEOUT_S):
+            break
+        message = "Signal made no progress. Reconnecting once; already saved notes are kept."
+        _notes_log("receive retry: no progress; reconnecting once")
+        on_log(message)
+    report.update(totals, attempts=attempt, seconds=round(time.monotonic() - started, 1))
+    _notes_log(f"receive result: attempts={attempt} saved={report['new']} "
+               f"complete={report['complete']} seconds={report['seconds']}")
+    on_log(f"Notes check: {report['envelopes']} message(s), {report['notes']} note(s), "
+           f"{report['new']} new or updated, {report['seconds']}s.")
+    if report["warning"]:
+        on_log(report["warning"])
+    return report
+
+
+def _receive_once(binary: str, account: str, idle_seconds: int, temporary: Path,
+                  timeout_s: float, on_log: LogFn) -> dict:
     """Shared receive path. Caller holds the Signal lock; no attachment-skipping mode."""
     started = time.monotonic()
     counters = {"envelopes": 0, "transcripts": 0, "notes": 0, "invalid": 0, "new": 0,
-                "missing_attachments": 0}
-    on_log("Receiving messages and downloading attachments. Large files can take up to an hour.")
+                "missing_attachments": 0, "receive_errors": 0}
     _notes_log("receive start: attachment downloads enabled")
+    env = dict(_signal_env(binary) or os.environ)
+    env["TMPDIR"] = str(temporary)
+    # signal-cli downloads encrypted media to Java's temp directory before emitting
+    # the envelope. Isolate it inside our store to observe activity without scanning
+    # the account's entire attachment archive or exposing media outside the vault.
+    env["JAVA_TOOL_OPTIONS"] = (env.get("JAVA_TOOL_OPTIONS", "")
+                                + f' -Djava.io.tmpdir="{temporary}"').strip()
+    temp_options = [] if _is_jvm_build(binary) else [f"-Djava.io.tmpdir={temporary}"]
     try:
         proc = subprocess.Popen(
-            _cli(binary, "--config", str(DATA_DIR), *_account_args(account), "-o", "json",
+            _cli(binary, *temp_options, "--config", str(DATA_DIR), *_account_args(account), "-o", "json",
                  "receive", "--timeout", str(idle_seconds),
                  "--ignore-avatars", "--ignore-stickers", "--ignore-stories"),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
-            errors="replace", env=_signal_env(binary))
+            errors="replace", env=env)
     except (OSError, subprocess.SubprocessError):
         _notes_log("receive failed: could not start signal-cli")
         raise ReceiveError("Couldn't start Signal to receive messages. Check the installation and try again.") from None
@@ -1855,6 +1899,9 @@ def _receive_messages(binary: str, account: str, idle_seconds: int,
     stderr_parts = collections.deque(maxlen=200)
     read_failed = threading.Event()
     finished = threading.Event()
+    stalled = threading.Event()
+    last_error = "none"
+    processing_errors = 0
 
     def save_note(note):
         counters["new"] += store_notes([note])
@@ -1870,19 +1917,55 @@ def _receive_messages(binary: str, account: str, idle_seconds: int,
             proc.kill()
 
     def read_stderr():
+        nonlocal last_error, processing_errors
         try:
             if proc.stderr is not None:
                 for line in proc.stderr:
                     stderr_parts.append(line[-2000:])
+                    if any(word in line.lower() for word in ("warn", "error", "exception", "connection closed")):
+                        last_error = _sync_error_summary(line)
+                    if ("Unknown error when receiving messages" in line
+                            or "Unknown error when handling messages" in line):
+                        processing_errors += 1
         except Exception:
             read_failed.set()
             proc.kill()
 
     def progress():
+        previous = None
+        last_activity = started
         while not finished.wait(RECEIVE_PROGRESS_S):
+            now = time.monotonic()
+            files = []
+            try:
+                for path in temporary.iterdir():
+                    if not path.name.startswith("signal-cli_tmp_"):
+                        continue
+                    try:
+                        stat = path.stat()
+                        files.append((path.name, stat.st_size, stat.st_mtime_ns))
+                    except FileNotFoundError:
+                        continue  # a completed attachment was just removed
+            except OSError:
+                # An unreadable temp directory cannot establish a stalled download.
+                last_activity = now
+            activity = (counters['envelopes'], counters.get('receive_errors', 0), sorted(files))
+            if activity != previous:
+                last_activity = now
+                previous = activity
+            quiet = int(now - last_activity)
+            _notes_log(f"receive progress: messages={counters['envelopes']} saved={counters['new']} "
+                       f"download_bytes={sum(item[1] for item in files)} "
+                       f"idle_seconds={quiet} seconds={int(now - started)} reason={last_error}")
             on_log(f"Receiving: {counters['envelopes']} messages processed, "
-                   f"{counters['new']} notes saved, {int(time.monotonic() - started)}s elapsed. "
-                   "A large attachment may still be downloading.")
+                   f"{counters['new']} notes saved, {int(now - started)}s elapsed. "
+                   + (f"Signal reports: {last_error}. " if last_error != "none" else "")
+                   + ("Downloading attachments. " if files else "Waiting for Signal messages or attachments. ")
+                   + f"{quiet}s since last message or download activity.")
+            if now - last_activity >= RECEIVE_STALL_S:
+                stalled.set()
+                proc.kill()
+                return
 
     readers = [threading.Thread(target=read_stdout, daemon=True),
                threading.Thread(target=read_stderr, daemon=True)]
@@ -1892,7 +1975,7 @@ def _receive_messages(binary: str, account: str, idle_seconds: int,
     timed_out = False
     try:
         try:
-            proc.wait(timeout=RECEIVE_TIMEOUT_S)
+            proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
             timed_out = True
             proc.kill()
@@ -1907,10 +1990,14 @@ def _receive_messages(binary: str, account: str, idle_seconds: int,
                 stream.close()
 
     warnings = []
+    counters["receive_errors"] += processing_errors
     err = "".join(stderr_parts)
     if read_failed.is_set():
         warnings.append("Receiving stopped because a message could not be read or saved. "
                         "Check available disk space before retrying; resend any missing note from your phone.")
+    elif stalled.is_set():
+        warnings.append("Signal made no progress receiving messages or downloading attachments. "
+                        "Saved notes are kept. Check the internet or VPN connection, then check again.")
     elif timed_out:
         warnings.append("Receiving reached the one-hour limit. Saved notes are kept. "
                         "Check again to continue receiving pending messages.")
@@ -1923,19 +2010,21 @@ def _receive_messages(binary: str, account: str, idle_seconds: int,
     if counters["invalid"]:
         warnings.append(f"Skipped {counters['invalid']} malformed message(s). "
                         "Valid notes were saved; resend any missing note from your phone.")
+    if counters["receive_errors"]:
+        warnings.append(f"Signal could not decrypt or process {counters['receive_errors']} message(s). "
+                        "Other notes were saved. Check again; if a note is still missing, forward it from your phone.")
     if counters["missing_attachments"]:
         warnings.append(f"{counters['missing_attachments']} note attachment(s) were unavailable. "
                         "Forward the original note again to download them.")
     report = dict(counters, complete=not warnings, warning=" ".join(warnings),
+                  retryable=stalled.is_set() and not (read_failed.is_set() or counters["invalid"]
+                             or counters["receive_errors"] or counters["missing_attachments"]),
                   seconds=round(time.monotonic() - started, 1))
     _notes_log(f"receive end: messages={report['envelopes']} notes={report['notes']} "
                f"saved={report['new']} invalid={report['invalid']} "
-               f"missing={report['missing_attachments']} timeout={timed_out} "
+               f"missing={report['missing_attachments']} receive_errors={report['receive_errors']} "
+               f"timeout={timed_out} stalled={stalled.is_set()} reason={last_error} "
                f"rc={proc.returncode} complete={report['complete']} seconds={report['seconds']}")
-    on_log(f"Notes check: {report['envelopes']} message(s), {report['notes']} note(s), "
-           f"{report['new']} new or updated, {report['seconds']}s.")
-    if report["warning"]:
-        on_log(report["warning"])
     return report
 
 

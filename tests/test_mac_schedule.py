@@ -179,6 +179,21 @@ class ScheduleTests(unittest.TestCase):
         self.service.job = None
         (self.vault.root / 'worker.json').unlink()
 
+    def test_notes_and_sync_prevent_idle_sleep_and_record_cancellation(self):
+        self.prepare()
+        for kind in ('notes', 'sync'):
+            with self.subTest(kind=kind):
+                process = mock.Mock(pid=999999)
+                with mock.patch.object(self.service, 'spawn', return_value=process) as spawn, \
+                     mock.patch('mac_service.threading.Thread'):
+                    self.request('job', kind=kind)
+                self.assertEqual(spawn.call_args.args[0][:2], ['/usr/bin/caffeinate', '-i'])
+                with mock.patch('mac_service.terminate_group'), mock.patch.object(self.service, 'reap_worker'):
+                    self.request('stop')
+                self.assertIsNone(self.service.job)
+                self.assertIn('receive interrupted:', engine.NOTES_DEBUG_FILE.read_text())
+                (self.vault.root / 'worker.json').unlink()
+
     def test_completed_scheduled_run_has_its_own_result(self):
         self.prepare()
         import io

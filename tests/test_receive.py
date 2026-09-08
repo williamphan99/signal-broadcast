@@ -3,6 +3,7 @@ import io
 import json
 import sys
 import threading
+import time
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
@@ -68,7 +69,7 @@ class ReceiveReliability(unittest.TestCase):
         self.assertEqual(saved["missing_photos"], 0)
         self.assertTrue(report["complete"])
         self.assertNotIn("--ignore-attachments", spawn.call_args.args[0])
-        self.assertEqual(process.wait_limits[0], 3600)
+        self.assertTrue(3599 < process.wait_limits[0] <= 3600)
 
     def test_group_refresh_keeps_fifteen_photos_and_full_text(self):
         stream, body = self.large_note(15)
@@ -83,7 +84,7 @@ class ReceiveReliability(unittest.TestCase):
         self.assertEqual(len(saved["photos"]), 15)
         for call in spawn.call_args_list:
             self.assertNotIn("--ignore-attachments", call.args[0])
-        self.assertEqual(processes[0].wait_limits[0], 3600)
+        self.assertTrue(3599 < processes[0].wait_limits[0] <= 3600)
 
     def test_a_note_is_durable_before_receive_finishes(self):
         ready, release = threading.Event(), threading.Event()
@@ -188,3 +189,99 @@ class ReceiveReliability(unittest.TestCase):
         self.assertEqual(report["missing_attachments"], 1)
         self.assertFalse(report["complete"])
         self.assertIn("Forward the original", report["warning"])
+
+    def test_structured_receive_errors_are_not_success_or_saved_as_notes(self):
+        for with_envelope in (False, True):
+            with self.subTest(with_envelope=with_envelope):
+                value = {"exception": {"type": "InvalidMessageException", "message": "private detail"}}
+                if with_envelope:
+                    value.update(json.loads(envelope(note("untrusted content", ts=9))))
+                report, _ = self.receive(Process(json.dumps(value)))
+                self.assertFalse(report["complete"])
+                self.assertEqual(report["receive_errors"], 1)
+                self.assertEqual(engine.read_notes(), [])
+                self.assertIn("decrypt", report["warning"])
+                self.assertNotIn("private detail", engine.NOTES_DEBUG_FILE.read_text())
+
+    def test_sixteen_images_and_full_text_behind_large_backlog(self):
+        stream, body = self.large_note(16)
+        unrelated = json.dumps({"envelope": {"dataMessage": {"message": "unrelated"}}}) + "\n"
+        report, _ = self.receive(Process(unrelated * 100000 + stream))
+        saved = engine.read_notes()[0]
+        self.assertEqual(report["envelopes"], 100001)
+        self.assertEqual(len(saved["photos"]), 16)
+        self.assertEqual(saved["text"], body)
+        self.assertTrue(report["complete"])
+
+    def test_upstream_swallowed_processing_error_is_incomplete(self):
+        report, _ = self.receive(Process(error="ERROR Unknown error when handling messages: private"))
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["receive_errors"], 1)
+        self.assertNotIn("private", report["warning"])
+
+    def test_receive_temporary_media_stays_in_store_and_is_cleaned(self):
+        for jvm in (True, False):
+            with self.subTest(jvm=jvm), mock.patch.object(engine, "_is_jvm_build", return_value=jvm):
+                _, spawn = self.receive(Process())
+                env = spawn.call_args.kwargs["env"]
+                temporary = Path(env["TMPDIR"])
+                self.assertTrue(temporary.is_relative_to(engine.RUNTIME_DIR))
+                self.assertIn(str(temporary), env["JAVA_TOOL_OPTIONS"])
+                self.assertFalse(temporary.exists())
+                if not jvm:
+                    self.assertIn(f"-Djava.io.tmpdir={temporary}", spawn.call_args.args[0])
+
+    def run_child(self, script, logs):
+        with mock.patch.object(engine, "_cli", return_value=[sys.executable, "-u", "-c", script]), \
+             mock.patch.object(engine, "RECEIVE_PROGRESS_S", 0.02), \
+             mock.patch.object(engine, "RECEIVE_STALL_S", 1), \
+             mock.patch.object(engine, "RECEIVE_TIMEOUT_S", 8):
+            return engine.fetch_notes("+19999999999", logs.append)
+
+    def test_stall_reconnects_once_then_saves_complete_album(self):
+        stream, body = self.large_note(16)
+        marker = engine.RUNTIME_DIR / "attempt"
+        first_note = envelope(note("saved before stall", ts=1))
+        script = ("from pathlib import Path; import time,sys\n"
+                  f"marker=Path({str(marker)!r})\n"
+                  "if not marker.exists():\n"
+                  " marker.touch()\n"
+                  f" print({first_note!r}, flush=True)\n"
+                  " print('Connection closed unexpectedly private-token', file=sys.stderr, flush=True)\n"
+                  " time.sleep(30)\n"
+                  f"else: print({stream!r}, flush=True)\n")
+        logs = []
+        report = self.run_child(script, logs)
+        self.assertTrue(report["complete"], report)
+        self.assertEqual(report["attempts"], 2)
+        self.assertEqual(report["new"], 2)
+        self.assertEqual(len(engine.read_notes()[0]["photos"]), 16)
+        self.assertEqual(engine.read_notes()[0]["text"], body)
+        debug = engine.NOTES_DEBUG_FILE.read_text()
+        self.assertIn("receive progress:", debug)
+        self.assertIn("reconnecting", " ".join(logs).lower())
+        self.assertNotIn("private-token", debug)
+
+    def test_download_activity_keeps_slow_album_alive(self):
+        stream, _ = self.large_note(16)
+        script = ("import os,time; from pathlib import Path\n"
+                  "file=Path(os.environ['TMPDIR']) / 'signal-cli_tmp_test.tmp'\n"
+                  "for i in range(30):\n"
+                  " file.write_bytes(b'x' * (i+1)); time.sleep(0.05)\n"
+                  f"print({stream!r}, flush=True)\n")
+        logs = []
+        report = self.run_child(script, logs)
+        self.assertTrue(report["complete"], report)
+        self.assertEqual(report["attempts"], 1)
+        self.assertEqual(len(engine.read_notes()[0]["photos"]), 16)
+        self.assertTrue(any("download" in line.lower() for line in logs))
+
+    def test_permanent_stall_is_bounded_and_explained(self):
+        logs = []
+        started = time.monotonic()
+        report = self.run_child("import time; time.sleep(30)", logs)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["attempts"], 2)
+        self.assertIn("no progress", report["warning"].lower())
+        self.assertIn("connection", report["warning"].lower())

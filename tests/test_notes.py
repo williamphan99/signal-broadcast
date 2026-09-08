@@ -244,7 +244,8 @@ class FetchingNotes(unittest.TestCase):
         self.assertEqual(report["envelopes"], 2)
         self.assertEqual(report["transcripts"], 2)
         self.assertEqual(report["notes"], 1)
-        self.assertEqual(process.wait_timeouts, [engine.RECEIVE_TIMEOUT_S])
+        self.assertEqual(len(process.wait_timeouts), 1)
+        self.assertTrue(engine.RECEIVE_TIMEOUT_S - 1 < process.wait_timeouts[0] <= engine.RECEIVE_TIMEOUT_S)
         self.assertEqual(engine.NOTES_BURST_S, 10)
         command = popen.call_args.args[0]
         self.assertEqual(command[command.index("--timeout") + 1], "10")
