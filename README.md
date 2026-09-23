@@ -100,7 +100,10 @@ old background jobs. Unplugging the Mac no longer erases data.
   unrelated attachment counts cover messages already emitted by Signal only.
   Raw Signal error messages and message content are not copied into these diagnostics.
   Look for `receive mode: media=note-to-self receiver=selective-0.14.7` to confirm
-  the optimisation is active. See [selective receiver verification](docs/NOTES-SELECTIVE-RECEIVE.md).
+  the optimisation is active. Note-to-Self albums download up to four attachments
+  at once, keeping the original order and full text. `receive media:` lines show
+  worker counts and file/album timings; duplicate file references use serial downloads.
+  See [selective receiver verification](docs/NOTES-SELECTIVE-RECEIVE.md).
 - **Groups**: search, toggle groups, select/deselect visible matches and save.
   Selections outside the current search are retained.
 - **Schedule**: save daily times, see the next time or pending run, and read schedule activity.

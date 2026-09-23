@@ -1,6 +1,7 @@
 """Installation and launch boundaries for selective media downloads."""
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -114,6 +115,7 @@ class RealReceiverTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="notes-java-test-") as directory:
             subprocess.run([str(java_home / "bin/javac"), "-cp", str(distribution / "lib/*"),
                             "-d", directory, str(probe)], check=True, timeout=30)
+            timings = {}
             for mode, prefix in (("baseline", ""), ("selective", str(distribution / "notes-receiver/notes-receiver.jar") + os.pathsep)):
                 classpath = prefix + directory + os.pathsep + str(distribution / "lib/*")
                 result = subprocess.run([str(java_home / "bin/java"), "--enable-native-access=ALL-UNNAMED",
@@ -121,3 +123,10 @@ class RealReceiverTests(unittest.TestCase):
                                         check=True, capture_output=True, text=True, timeout=60)
                 print(result.stdout, end="")
                 self.assertIn(f"unrelated_download_calls={202 if mode == 'baseline' else 0} PASS", result.stdout)
+                timings[mode] = int(re.search(r"benchmark_files=24 delay_ms=80 elapsed_ms=(\d+)", result.stdout)[1])
+                if mode == "selective":
+                    self.assertRegex(result.stderr, r"SB_NOTE_MEDIA files=31 workers=4 elapsed_ms=\d+")
+                    self.assertIn("Failed to download attachment", result.stderr)
+                    self.assertNotIn("Long draft:", result.stderr)
+            self.assertLess(timings["selective"], timings["baseline"] * 0.7,
+                            "Four workers should materially reduce the controlled latency fixture")

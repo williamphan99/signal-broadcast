@@ -1973,6 +1973,11 @@ def _receive_once(binary: str, account: str, idle_seconds: int, temporary: Path,
             if proc.stderr is not None:
                 for line in proc.stderr:
                     stderr_parts.append(line[-2000:])
+                    media = re.fullmatch(
+                        r"SB_NOTE_MEDIA (?:files=\d+ workers=[1-4](?: elapsed_ms=\d+)?"
+                        r"|file=\d+ total=\d+ elapsed_ms=\d+)", line.strip())
+                    if media:
+                        _notes_log("receive media: " + media.group()[len("SB_NOTE_MEDIA "):])
                     if any(word in line.lower() for word in ("warn", "error", "exception", "connection closed")):
                         record_warning(line, "stderr")
                     if re.search(r"\bERROR\b", line):

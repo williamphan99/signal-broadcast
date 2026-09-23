@@ -254,6 +254,33 @@ class ReceiveReliability(unittest.TestCase):
         self.assertFalse(report["complete"])
         self.assertNotIn("private-token", report["warning"])
 
+    def test_parallel_media_timings_are_logged_without_message_data(self):
+        diagnostics = ("SB_NOTE_MEDIA files=30 workers=4\n"
+                       "SB_NOTE_MEDIA file=2 total=30 elapsed_ms=82\n"
+                       "SB_NOTE_MEDIA file=1 total=30 elapsed_ms=150\n"
+                       "SB_NOTE_MEDIA files=30 workers=4 elapsed_ms=650\n"
+                       "SB_NOTE_MEDIA private-caption\n"
+                       "SB_NOTE_MEDIA file=1 total=30 elapsed_ms=1 private-filename\n")
+        report, _ = self.receive(Process(envelope(note("private-caption", ts=1)), error=diagnostics))
+        debug = engine.NOTES_DEBUG_FILE.read_text()
+        self.assertTrue(report["complete"])
+        self.assertIn("receive media: files=30 workers=4", debug)
+        self.assertIn("receive media: file=2 total=30 elapsed_ms=82", debug)
+        self.assertIn("receive media: files=30 workers=4 elapsed_ms=650", debug)
+        self.assertNotIn("private-", debug)
+
+    def test_parallel_media_timings_do_not_hide_download_failures(self):
+        stream, body = self.large_note(16)
+        report, _ = self.receive(Process(stream, error=(
+            "SB_NOTE_MEDIA files=17 workers=4\n"
+            "WARN Failed to download attachment (private-id), ignoring: unavailable\n"
+            "SB_NOTE_MEDIA files=17 workers=4 elapsed_ms=900\n")))
+        self.assertFalse(report["complete"])
+        self.assertIn("attachment download failed", report["warning"])
+        self.assertEqual(engine.read_notes()[0]["text"], body)
+        self.assertEqual(len(engine.read_notes()[0]["photos"]), 16)
+        self.assertNotIn("private-id", engine.NOTES_DEBUG_FILE.read_text())
+
     def test_informational_warning_does_not_fail_a_successful_note(self):
         report, _ = self.receive(Process(envelope(note("kept", ts=1)),
                                          error="WARN Optional setting unavailable\n"))

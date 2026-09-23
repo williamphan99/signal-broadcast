@@ -7,6 +7,14 @@ media, previews, quote thumbnails and attachment-backed long text are not fetche
 All ordinary attachments on Note-to-Self messages remain enabled. View-once and
 expiry handling in the app remain unchanged.
 
+Note-to-Self albums download up to **four attachments concurrently** in the same
+Signal process. A single attachment needs no worker pool. Albums with repeated
+output paths use serial downloads to avoid concurrent writes to one file. The
+receiver joins all downloads before extracting full text and emitting the note;
+the attachment list keeps its original order. Worker pools close after each album,
+including on interruption. Download errors still make the app report an incomplete
+check, while successful files and text are retained.
+
 The original `bin/signal-cli` and its libraries are not modified. Only Notes and group
 refresh select `bin/signal-cli-notes`. Sends, linking and other commands use the stock
 launcher. This does not introduce another Signal process sharing the account: the
@@ -28,13 +36,26 @@ A successful Notes check records:
 receive mode: media=note-to-self receiver=selective-0.14.7
 ```
 
+For albums, `notes-debug.txt` also records the actual worker count and durations:
+
+```
+receive media: files=31 workers=4
+receive media: file=2 total=31 elapsed_ms=82
+receive media: files=31 workers=4 elapsed_ms=650
+```
+
+These example timings describe completed attempts, not proof of successful downloads;
+the receive warning and final `complete` status still determine success. The lines
+contain counts and timings only, with no captions, filenames or attachment identifiers.
+
 This is selective attachment downloading, not a per-chat server query. Backlogs,
 Signal errors, group-state fetching and the note's own media can still delay arrival.
 
 ## Verification
 
 The opt-in Java integration test executes the actual upstream receive handler against
-its release libraries with a local-only attachment helper. It runs the same fixtures
+its release libraries, upstream attachment helper and file store. Only network
+retrieval is replaced with local fixture bytes. It runs the same fixtures
 against stock and patched classes. It does not use a Signal account, contact the
 Signal service or measure real-network speed.
 
@@ -44,6 +65,16 @@ Signal service or measure real-network speed.
 - 516,000-character multilingual, multiline attachment-backed text retained exactly.
 - Text-only notes, missing destinations, outgoing DMs, incoming DMs, modern/legacy groups and canonical self identity aliases.
 - Unrelated long-text fallback cannot start an attachment download.
+- Exactly four active downloads for large albums; one for duplicate output paths.
+- Deliberately out-of-order completion preserves each file's distinct bytes and
+  album order; a download barrier prevents premature note emission.
+- One simulated I/O failure preserves other files and full text; interruption
+  terminates workers without emitting a partial note.
+- Controlled latency benchmark: 24 attachments with 80 ms of simulated delay each
+  took **2,019 ms serially versus 509 ms with four workers** in the initial run
+  (about 4x faster). The test requires a material reduction and checks the peak
+  worker count. This is not a measured internet or phone-to-Mac speedup; shared
+  bandwidth, VPNs and Signal service latency can limit the real improvement.
 - Python integration covers large mixed-media notes, duplicate delivery, missing
   media, interrupted receives, fallback mode, verified launcher selection and JVM flags.
 - Native Mac UI fixture passed: 16 photos and a long caption transferred from Notes

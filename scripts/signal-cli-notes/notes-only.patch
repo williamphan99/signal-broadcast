@@ -1,6 +1,89 @@
 --- IncomingMessageHandler.java
 +++ IncomingMessageHandler.java
-@@ -942,7 +942,12 @@
+@@ -55,6 +55,7 @@
+ import org.whispersystems.signalservice.api.crypto.SignalGroupSessionBuilder;
+ import org.whispersystems.signalservice.api.crypto.SignalServiceCipherResult;
+ import org.whispersystems.signalservice.api.messages.EnvelopeContentValidator;
++import org.whispersystems.signalservice.api.messages.SignalServiceAttachment;
+ import org.whispersystems.signalservice.api.messages.SignalServiceContent;
+ import org.whispersystems.signalservice.api.messages.SignalServiceDataMessage;
+ import org.whispersystems.signalservice.api.messages.SignalServiceEnvelope;
+@@ -77,6 +78,10 @@
+ import java.nio.file.Files;
+ import java.util.ArrayList;
+ import java.util.HashMap;
++import java.util.HashSet;
++import java.util.concurrent.Callable;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ExecutionException;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Optional;
+@@ -849,6 +854,63 @@
+         return false;
+     }
+
++    private void downloadNoteAttachments(final List<SignalServiceAttachment> attachments) {
++        if (attachments.isEmpty()) {
++            return;
++        }
++        final var helper = context.getAttachmentHelper();
++        final var paths = new HashSet<java.io.File>();
++        boolean independent = true;
++        for (var attachment : attachments) {
++            // Repeated pointers share output files; retain serial handling for these albums.
++            if (!attachment.isPointer() || !paths.add(helper.getAttachmentFile(attachment.asPointer()))) {
++                independent = false;
++            }
++        }
++        final int workers = independent ? Math.min(4, attachments.size()) : 1;
++        final long started = System.nanoTime();
++        System.err.printf("SB_NOTE_MEDIA files=%d workers=%d%n", attachments.size(), workers);
++        final var tasks = new ArrayList<Callable<Void>>();
++        for (int index = 0; index < attachments.size(); index++) {
++            final var attachment = attachments.get(index);
++            final int ordinal = index + 1;
++            tasks.add(() -> {
++                final long fileStarted = System.nanoTime();
++                try {
++                    helper.downloadAttachment(attachment);
++                } finally {
++                    System.err.printf("SB_NOTE_MEDIA file=%d total=%d elapsed_ms=%d%n",
++                            ordinal, attachments.size(), (System.nanoTime() - fileStarted) / 1_000_000);
++                }
++                return null;
++            });
++        }
++        try {
++            if (workers == 1) {
++                for (var task : tasks) {
++                    task.call();
++                }
++            } else {
++                // The per-album executor is closed before protocol processing or JSON output resumes.
++                try (var executor = Executors.newFixedThreadPool(workers)) {
++                    for (var result : executor.invokeAll(tasks)) {
++                        result.get();
++                    }
++                }
++            }
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            throw new IllegalStateException("Note attachment downloads interrupted", e);
++        } catch (ExecutionException e) {
++            throw new IllegalStateException("Note attachment download failed", e.getCause());
++        } catch (Exception e) {
++            throw new IllegalStateException("Note attachment download failed", e);
++        } finally {
++            System.err.printf("SB_NOTE_MEDIA files=%d workers=%d elapsed_ms=%d%n",
++                    attachments.size(), workers, (System.nanoTime() - started) / 1_000_000);
++        }
++    }
++
+     private Pair<List<HandleAction>, Map<String, String>> handleSignalServiceDataMessage(
+             SignalServiceDataMessage message,
+             boolean isSync,
+@@ -942,10 +1004,15 @@
                                  message.getExpireTimerVersion());
              }
          }
@@ -12,9 +95,13 @@
 +                && source.recipientId().equals(destination.recipientId());
 +        if (downloadConversation && !receiveConfig.ignoreAttachments()) {
              if (message.getAttachments().isPresent()) {
++                downloadNoteAttachments(message.getAttachments().get());
                  for (var attachment : message.getAttachments().get()) {
-                     context.getAttachmentHelper().downloadAttachment(attachment);
-@@ -986,7 +991,7 @@
+-                    context.getAttachmentHelper().downloadAttachment(attachment);
+                     if (attachment.isPointer()) {
+                         final var file = context.getAttachmentHelper().getAttachmentFile(attachment.asPointer());
+                         if (MimeUtils.LONG_TEXT.equals(attachment.getContentType()) && attachment.isPointer()) {
+@@ -986,7 +1053,7 @@
                      }
                  }
              }
