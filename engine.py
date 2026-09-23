@@ -1632,12 +1632,14 @@ def _tail(value) -> str:
 def _inspect_receive(
     receive_lines: Iterable[str], *, collect_notes: bool, log_summary: bool,
     on_note: Callable[[dict], None] | None = None,
+    on_receive_error: Callable[[str], None] | None = None,
     counters: dict | None = None,
 ) -> tuple[list[dict], dict, bool]:
     """Classify a receive stream once, retaining only notes and bounded diagnostics."""
     found = []
     counters = counters if counters is not None else {}
-    counters.update(envelopes=0, transcripts=0, notes=0, invalid=0, receive_errors=0)
+    counters.update(envelopes=0, transcripts=0, notes=0, invalid=0, receive_errors=0,
+                    other_attachments=0)
     envelopes = transcripts = notes = 0
     samples = collections.deque(maxlen=5)
     had_output = False
@@ -1653,6 +1655,8 @@ def _inspect_receive(
             continue
         if isinstance(value, dict) and value.get("exception") is not None:
             counters["receive_errors"] += 1
+            if on_receive_error is not None:
+                on_receive_error(json.dumps(value["exception"]))
             continue
         envelope = value.get("envelope") if isinstance(value, dict) else None
         if not isinstance(envelope, dict):
@@ -1661,10 +1665,15 @@ def _inspect_receive(
         counters["envelopes"] = envelopes
         sync = envelope.get("syncMessage")
         sent = sync.get("sentMessage") if isinstance(sync, dict) else None
+        matched = isinstance(sent, dict) and _is_note_to_self(envelope, sent)
+        if not matched:
+            message = sent if isinstance(sent, dict) else envelope.get("dataMessage")
+            attachments = message.get("attachments") if isinstance(message, dict) else None
+            if isinstance(attachments, list):
+                counters["other_attachments"] += len(attachments)
         if not isinstance(sent, dict):
             continue
         transcripts += 1
-        matched = _is_note_to_self(envelope, sent)
         notes += int(matched)
         counters.update(transcripts=transcripts, notes=notes)
         if collect_notes and matched:
@@ -1842,7 +1851,7 @@ def _receive_messages(binary: str, account: str, idle_seconds: int,
                       on_log: LogFn = lambda *_: None) -> dict:
     """Keep the account lease across one bounded reconnect, retaining saved notes."""
     started = time.monotonic()
-    totals = dict.fromkeys(("envelopes", "transcripts", "notes", "invalid", "receive_errors",
+    totals = dict.fromkeys(("envelopes", "transcripts", "notes", "invalid", "receive_errors", "other_attachments",
                             "new", "missing_attachments"), 0)
     temporary = RUNTIME_DIR / "temporary"
     temporary.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1876,7 +1885,9 @@ def _receive_once(binary: str, account: str, idle_seconds: int, temporary: Path,
     started = time.monotonic()
     counters = {"envelopes": 0, "transcripts": 0, "notes": 0, "invalid": 0, "new": 0,
                 "missing_attachments": 0, "receive_errors": 0}
-    _notes_log("receive start: attachment downloads enabled")
+    _notes_log(f"receive start: attachment downloads enabled; diagnostics=2 "
+               f"filter=note-to-self idle_timeout={idle_seconds}s "
+               f"stall_timeout={RECEIVE_STALL_S}s limit={round(timeout_s)}s")
     env = dict(_signal_env(binary) or os.environ)
     env["TMPDIR"] = str(temporary)
     # signal-cli downloads encrypted media to Java's temp directory before emitting
@@ -1900,30 +1911,61 @@ def _receive_once(binary: str, account: str, idle_seconds: int, temporary: Path,
     read_failed = threading.Event()
     finished = threading.Event()
     stalled = threading.Event()
-    last_error = "none"
+    warning_lock = threading.Lock()
+    warning_counts = collections.Counter()
+    last_warning = ("none", None)
+    stderr_error = threading.Event()
     processing_errors = 0
 
+    def record_warning(message, source):
+        nonlocal last_warning
+        category = _sync_error_summary(message)
+        if category == "signal-cli error":
+            low = message.lower()
+            if "attachment" in low and any(word in low for word in ("fail", "error", "exception")):
+                category = "attachment download failed"
+            elif any(word in low for word in ("invalidmessageexception", "invalidkeyexception", "decrypt")):
+                category = "message decryption failed"
+        with warning_lock:
+            first = warning_counts[category] == 0
+            warning_counts[category] += 1
+            last_warning = (category, time.monotonic())
+        if first:
+            _notes_log(f"receive warning: source={source} category={category}")
+
+    def warning_snapshot():
+        with warning_lock:
+            return dict(warning_counts), last_warning
+
     def save_note(note):
-        counters["new"] += store_notes([note])
+        changed = store_notes([note])
+        counters["new"] += changed
         counters["missing_attachments"] += note.get("missing_photos", 0) + bool(note.get("missing_body"))
+        _notes_log(f"receive note: updated={changed} photos={len(note.get('photos', []))} "
+                   f"missing_photos={note.get('missing_photos', 0)} "
+                   f"missing_body={bool(note.get('missing_body'))} "
+                   f"expired={not bool(prune_notes([note]))}")
 
     def read_stdout():
         try:
             if proc.stdout is not None:
                 _inspect_receive(proc.stdout, collect_notes=True, log_summary=True,
-                                 on_note=save_note, counters=counters)
+                                 on_note=save_note, counters=counters,
+                                 on_receive_error=lambda message: record_warning(message, "json"))
         except Exception:
             read_failed.set()
             proc.kill()
 
     def read_stderr():
-        nonlocal last_error, processing_errors
+        nonlocal processing_errors
         try:
             if proc.stderr is not None:
                 for line in proc.stderr:
                     stderr_parts.append(line[-2000:])
                     if any(word in line.lower() for word in ("warn", "error", "exception", "connection closed")):
-                        last_error = _sync_error_summary(line)
+                        record_warning(line, "stderr")
+                    if re.search(r"\bERROR\b", line):
+                        stderr_error.set()
                     if ("Unknown error when receiving messages" in line
                             or "Unknown error when handling messages" in line):
                         processing_errors += 1
@@ -1949,17 +1991,28 @@ def _receive_once(binary: str, account: str, idle_seconds: int, temporary: Path,
             except OSError:
                 # An unreadable temp directory cannot establish a stalled download.
                 last_activity = now
-            activity = (counters['envelopes'], counters.get('receive_errors', 0), sorted(files))
+            # Errors alone are not evidence that the queue or a download is advancing.
+            activity = (counters['envelopes'], sorted(files))
             if activity != previous:
                 last_activity = now
                 previous = activity
             quiet = int(now - last_activity)
+            categories, (last_error, warning_at) = warning_snapshot()
+            warning_age = int(now - warning_at) if warning_at is not None else -1
             _notes_log(f"receive progress: messages={counters['envelopes']} saved={counters['new']} "
+                       f"transcripts={counters['transcripts']} notes={counters['notes']} "
+                       f"other_attachments={counters.get('other_attachments', 0)} "
+                       f"invalid={counters['invalid']} "
+                       f"receive_errors={counters['receive_errors'] + processing_errors} "
+                       f"warning_events={sum(categories.values())} "
                        f"download_bytes={sum(item[1] for item in files)} "
-                       f"idle_seconds={quiet} seconds={int(now - started)} reason={last_error}")
+                       f"idle_seconds={quiet} seconds={int(now - started)} "
+                       f"last_warning_age_seconds={warning_age} reason={last_error}")
             on_log(f"Receiving: {counters['envelopes']} messages processed, "
-                   f"{counters['new']} notes saved, {int(now - started)}s elapsed. "
-                   + (f"Signal reports: {last_error}. " if last_error != "none" else "")
+                   f"{counters['notes']} notes matched, {counters['new']} notes saved, "
+                   f"{counters['receive_errors'] + processing_errors} receive errors, "
+                   f"{int(now - started)}s elapsed. "
+                   + (f"Last Signal warning ({warning_age}s ago): {last_error}. " if last_error != "none" else "")
                    + ("Downloading attachments. " if files else "Waiting for Signal messages or attachments. ")
                    + f"{quiet}s since last message or download activity.")
             if now - last_activity >= RECEIVE_STALL_S:
@@ -1991,6 +2044,7 @@ def _receive_once(binary: str, account: str, idle_seconds: int, temporary: Path,
 
     warnings = []
     counters["receive_errors"] += processing_errors
+    categories, (last_error, _) = warning_snapshot()
     err = "".join(stderr_parts)
     if read_failed.is_set():
         warnings.append("Receiving stopped because a message could not be read or saved. "
@@ -2011,20 +2065,27 @@ def _receive_once(binary: str, account: str, idle_seconds: int, temporary: Path,
         warnings.append(f"Skipped {counters['invalid']} malformed message(s). "
                         "Valid notes were saved; resend any missing note from your phone.")
     if counters["receive_errors"]:
-        warnings.append(f"Signal could not decrypt or process {counters['receive_errors']} message(s). "
-                        "Other notes were saved. Check again; if a note is still missing, forward it from your phone.")
+        warnings.append(f"Signal reported {counters['receive_errors']} receive/decryption error(s). "
+                        "Any saved notes are kept. Check again; if a note is still missing, forward it from your phone.")
+    signal_error = stderr_error.is_set() or bool(categories.keys() & {
+        "authorization failed", "account not registered", "attachment download failed"})
+    if signal_error:
+        warnings.append("Signal reported warnings or errors: " + ", ".join(sorted(categories)) + ". "
+                        "The check may be incomplete; check the connection and linked-device status on your phone.")
     if counters["missing_attachments"]:
         warnings.append(f"{counters['missing_attachments']} note attachment(s) were unavailable. "
                         "Forward the original note again to download them.")
     report = dict(counters, complete=not warnings, warning=" ".join(warnings),
                   retryable=stalled.is_set() and not (read_failed.is_set() or counters["invalid"]
-                             or counters["receive_errors"] or counters["missing_attachments"]),
+                             or counters["receive_errors"] or counters["missing_attachments"]
+                             or signal_error),
                   seconds=round(time.monotonic() - started, 1))
     _notes_log(f"receive end: messages={report['envelopes']} notes={report['notes']} "
                f"saved={report['new']} invalid={report['invalid']} "
                f"missing={report['missing_attachments']} receive_errors={report['receive_errors']} "
                f"timeout={timed_out} stalled={stalled.is_set()} reason={last_error} "
-               f"rc={proc.returncode} complete={report['complete']} seconds={report['seconds']}")
+               f"rc={proc.returncode} complete={report['complete']} seconds={report['seconds']} "
+               f"warning_categories={json.dumps(categories, sort_keys=True)}")
     return report
 
 

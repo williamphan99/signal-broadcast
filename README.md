@@ -77,16 +77,22 @@ old background jobs. Unplugging the Mac no longer erases data.
   A receive operation allows up to one hour overall and shows and records progress
   every five seconds. Unrelated pending messages and their attachments can add to the
   wait. After three minutes without a processed message or temporary download-file
-  activity, it reconnects once. Active downloads can continue; a second stall stops
-  with connection guidance. Signal decryption/processing errors are reported as an
-  incomplete check, even when the Signal process exits successfully.
+  activity, it reconnects once if no message-processing errors were reported.
+  Errors alone do not reset that timer. Active downloads can continue; a second
+  stall stops with connection guidance. Signal decryption/processing errors,
+  authorisation warnings and stderr errors are reported as an incomplete check,
+  even when the Signal process exits successfully.
   An interrupted check keeps saved notes and reports that it is
   incomplete; check again to receive the remaining queue. Notes whose attachments
   were skipped by an older version must be forwarded to Note to Self again.
   The app keeps the latest 300 unexpired notes. Debug summaries in
-  `logs/notes-debug.txt` record counts, temporary download bytes, time since activity,
-  classified errors, reconnects and completion status inside the vault. Raw Signal
-  error messages and message content are not copied into these diagnostics.
+  `logs/notes-debug.txt` record matched notes, sent transcripts, unrelated attachment
+  counts, temporary download bytes, time since activity, warning counts and age,
+  classified errors, reconnects and completion status inside the vault. Each note
+  logs its saved-photo count, missing attachments and expiry status immediately.
+  `download_bytes` is the current temporary-file size, not total bytes transferred;
+  unrelated attachment counts cover messages already emitted by Signal only.
+  Raw Signal error messages and message content are not copied into these diagnostics.
 - **Groups**: search, toggle groups, select/deselect visible matches and save.
   Selections outside the current search are retained.
 - **Schedule**: save daily times, see the next time or pending run, and read schedule activity.

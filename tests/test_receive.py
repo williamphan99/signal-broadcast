@@ -219,6 +219,76 @@ class ReceiveReliability(unittest.TestCase):
         self.assertEqual(report["receive_errors"], 1)
         self.assertNotIn("private", report["warning"])
 
+    def test_authorization_warning_is_incomplete_even_with_successful_exit(self):
+        report, _ = self.receive(Process(error="WARN Authorization failed: private-token\n"))
+        self.assertFalse(report["complete"])
+        self.assertIn("authorization", report["warning"].lower())
+        self.assertNotIn("private-token", engine.NOTES_DEBUG_FILE.read_text())
+
+    def test_unclassified_stderr_error_is_not_success(self):
+        report, _ = self.receive(Process(error="ERROR Unexpected media failure private-token\n"))
+        self.assertFalse(report["complete"])
+        self.assertNotIn("private-token", report["warning"])
+
+    def test_informational_warning_does_not_fail_a_successful_note(self):
+        report, _ = self.receive(Process(envelope(note("kept", ts=1)),
+                                         error="WARN Optional setting unavailable\n"))
+        self.assertTrue(report["complete"])
+        self.assertEqual(report["new"], 1)
+
+    def test_attachment_warning_is_not_erased_by_a_successful_reconnect(self):
+        marker = engine.RUNTIME_DIR / "attempt"
+        script = ("from pathlib import Path; import time,sys\n"
+                  f"marker=Path({str(marker)!r})\n"
+                  "if not marker.exists():\n"
+                  " marker.touch()\n"
+                  " print('WARN Attachment download failed private-token', file=sys.stderr, flush=True)\n"
+                  " time.sleep(30)\n")
+        report = self.run_child(script, [])
+        self.assertFalse(report["complete"])
+        self.assertIn("attachment download failed", report["warning"])
+        self.assertEqual(report["attempts"], 1)
+
+    def test_progress_explains_filter_and_errors_before_receive_finishes(self):
+        dm = note("private-message", ts=1,
+                  attachments=[{"id": "private-file", "contentType": "image/jpeg"}])
+        dm["destinationUuid"] = "someone-else"
+        dm["destinationNumber"] = None
+        error = json.dumps({"exception": {"type": "NoSessionException", "message": "private-token"}})
+        stream = "\n".join([envelope(dm), error, envelope(note("private-note", ts=2))])
+        script = ("import time\n"
+                  f"print({stream!r}, flush=True)\n"
+                  "time.sleep(0.2)\n")
+        logs = []
+        report = self.run_child(script, logs)
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["new"], 1)
+        debug = engine.NOTES_DEBUG_FILE.read_text()
+        progress = next(line for line in debug.splitlines() if "receive progress:" in line
+                        and "messages=2" in line)
+        for field in ("transcripts=2", "notes=1", "other_attachments=1", "receive_errors=1",
+                      "last_warning_age_seconds=", "warning_events="):
+            self.assertIn(field, progress)
+        self.assertIn("encrypted backlog session unavailable", debug)
+        self.assertIn("receive note:", debug)
+        for secret in ("private-message", "private-file", "private-token", "private-note"):
+            self.assertNotIn(secret, debug)
+
+    def test_repeated_errors_do_not_keep_a_stalled_receive_alive(self):
+        script = ("import time,json\n"
+                  "for i in range(300):\n"
+                  " print(json.dumps({'exception': {'type': 'NoSessionException'}}), flush=True)\n"
+                  " time.sleep(0.025)\n")
+        logs = []
+        started = time.monotonic()
+        report = self.run_child(script, logs)
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["envelopes"], 0)
+        self.assertGreater(report["receive_errors"], 0)
+        self.assertIn("no progress", report["warning"].lower())
+        self.assertNotIn("one-hour", report["warning"])
+
     def test_receive_temporary_media_stays_in_store_and_is_cleaned(self):
         for jvm in (True, False):
             with self.subTest(jvm=jvm), mock.patch.object(engine, "_is_jvm_build", return_value=jvm):
