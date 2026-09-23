@@ -1,0 +1,25 @@
+--- IncomingMessageHandler.java
++++ IncomingMessageHandler.java
+@@ -942,7 +942,12 @@
+                                 message.getExpireTimerVersion());
+             }
+         }
+-        if (!receiveConfig.ignoreAttachments()) {
++        // Signal Broadcast only imports sent-to-self drafts. Keep processing other
++        // conversations for protocol state, without fetching their media or long text.
++        final boolean downloadConversation = isSync && message.getGroupContext().isEmpty()
++                && source != null && destination != null && source.recipientId() != null
++                && source.recipientId().equals(destination.recipientId());
++        if (downloadConversation && !receiveConfig.ignoreAttachments()) {
+             if (message.getAttachments().isPresent()) {
+                 for (var attachment : message.getAttachments().get()) {
+                     context.getAttachmentHelper().downloadAttachment(attachment);
+@@ -986,7 +991,7 @@
+                     }
+                 }
+             }
+-        } else {
++        } else if (downloadConversation) {
+             if (message.getAttachments().isPresent()) {
+                 for (var attachment : message.getAttachments().get()) {
+                     if (MimeUtils.LONG_TEXT.equals(attachment.getContentType()) && attachment.isPointer()) {

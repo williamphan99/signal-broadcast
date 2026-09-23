@@ -35,6 +35,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
 
+import notes_receiver
+
 # Platform switch. Assigning to a bool (rather than testing sys.platform inline)
 # deliberately defeats type-checker platform-narrowing, so the Linux/Termux branches
 # aren't flagged "unreachable" when the checker runs on macOS. The macOS wrapper
@@ -84,7 +86,7 @@ class UpdateResult:
 
 UPDATE_SETUP_FILES = ("Setup.command", "scripts/make-dock-app.sh", "requirements-macos.txt",
                       "scripts/install-mac-service.py", "scripts/mac-security.swift",
-                      "scripts/mac-thumbnail.swift")
+                      "scripts/mac-thumbnail.swift", "notes_receiver.py", "scripts/signal-cli-notes")
 
 
 def _git_head() -> str | None:
@@ -853,7 +855,8 @@ def qrencode_bin() -> str:
 
 def _is_jvm_build(binary: str) -> bool:
     jvm = _jvm_signal_cli()
-    return jvm is not None and str(jvm) == binary
+    return jvm is not None and Path(binary).resolve() in (
+        jvm.resolve(), jvm.with_name("signal-cli-notes").resolve())
 
 
 def _java_home() -> str | None:
@@ -1855,8 +1858,16 @@ def _receive_messages(binary: str, account: str, idle_seconds: int,
                             "new", "missing_attachments"), 0)
     temporary = RUNTIME_DIR / "temporary"
     temporary.mkdir(parents=True, exist_ok=True, mode=0o700)
-    on_log("Checking all pending Signal messages, including attachments from other chats. "
-           "Large albums take longer; each complete note appears as soon as it is saved.")
+    selective = notes_receiver.launcher_for(binary)
+    if selective:
+        binary = selective
+        on_log("Checking pending Signal messages; downloading media and full text only for Note to Self. "
+               "Each complete note appears as soon as it is saved.")
+    else:
+        on_log("Using the compatibility receiver: attachments from all chats are downloaded. "
+               "Run Setup to enable selective Note-to-Self downloads. Each complete note is saved as it arrives.")
+    _notes_log(f"receive mode: media={'note-to-self' if selective else 'all'} "
+               f"receiver={'selective-' + notes_receiver.VERSION if selective else 'compatibility'}")
     for attempt in (1, 2):
         with tempfile.TemporaryDirectory(prefix="receive-", dir=temporary) as folder:
             report = _receive_once(binary, account, idle_seconds, Path(folder),

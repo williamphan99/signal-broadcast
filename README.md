@@ -72,11 +72,17 @@ old background jobs. Unplugging the Mac no longer erases data.
   the send. Locking or closing the window does not stop it.
 - **Notes**: check Signal's Note to Self, select a note and use its text and complete
   attachments as the draft. Deleting a note removes only the local copy.
-  Both Notes and group refresh download attachments and save each received note
-  immediately, including albums of 16 or more images and attachment-backed full text.
+  Both Notes and group refresh use the selective receiver installed by Setup: only
+  Note-to-Self media and full text are downloaded, and each received note is saved
+  immediately, including large albums and attachment-backed full text. Other chats
+  still pass through Signal's receive queue, but their media is skipped on this
+  linked device. The phone and other linked devices are unaffected.
+  If the selective receiver is missing or no longer matches the installed version,
+  the app explains that it is using the compatibility receiver, which downloads
+  all attachments. Run Setup to restore selective downloads.
   A receive operation allows up to one hour overall and shows and records progress
-  every five seconds. Unrelated pending messages and their attachments can add to the
-  wait. After three minutes without a processed message or temporary download-file
+  every five seconds. Pending messages, group-state updates and note media can add
+  to the wait. After three minutes without a processed message or temporary download-file
   activity, it reconnects once if no message-processing errors were reported.
   Errors alone do not reset that timer. Active downloads can continue; a second
   stall stops with connection guidance. Signal decryption/processing errors,
@@ -93,6 +99,8 @@ old background jobs. Unplugging the Mac no longer erases data.
   `download_bytes` is the current temporary-file size, not total bytes transferred;
   unrelated attachment counts cover messages already emitted by Signal only.
   Raw Signal error messages and message content are not copied into these diagnostics.
+  Look for `receive mode: media=note-to-self receiver=selective-0.14.7` to confirm
+  the optimisation is active. See [selective receiver verification](docs/NOTES-SELECTIVE-RECEIVE.md).
 - **Groups**: search, toggle groups, select/deselect visible matches and save.
   Selections outside the current search are retained.
 - **Schedule**: save daily times, see the next time or pending run, and read schedule activity.

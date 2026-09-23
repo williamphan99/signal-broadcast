@@ -31,9 +31,9 @@ SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
 
 # 1. Base tools. python3 runs the engine; qrencode renders the link QR; cron is optional
 #    (only for scheduled sends). Java is handled separately (Temurin 25) in step 1b.
-echo "Installing python3, qrencode, git, curl, cron…"
+echo "Installing python3, qrencode, git, curl, patch, cron…"
 $SUDO apt-get update -y
-$SUDO apt-get install -y python3 python3-flask qrencode git curl ca-certificates cron procps
+$SUDO apt-get install -y python3 python3-flask qrencode git curl patch ca-certificates cron procps
 
 # 1b. Java 25 via a portable Temurin build into ./vendor (Debian/Termux don't package it).
 #     engine._java_home() discovers vendor/jdk*/bin/java automatically — no PATH changes.
@@ -130,6 +130,7 @@ else
 fi
 
 # Existing phones get launcher fixes when they tap Update, not only on a fresh install.
+python3 notes_receiver.py "vendor/signal-cli-${SIGNAL_CLI_VERSION}" || exit 1
 bash scripts/refresh-pixel-widget.sh || true
 
 echo

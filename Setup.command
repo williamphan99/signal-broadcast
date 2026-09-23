@@ -89,6 +89,8 @@ if [ -z "$PY" ]; then
   exit 1
 fi
 
+"$PY" notes_receiver.py "$JVM_DIR" || exit 1
+
 echo
 echo "Building the Dock app…"
 launchctl bootout "gui/$(id -u)/com.user.signal-broadcast.service" >/dev/null 2>&1 || true

@@ -408,7 +408,7 @@ class App(tk.Tk):
         notes = frames["Notes"]
         self.notes_button = ttk.Button(notes, text="Check for new notes", command=lambda: self.job("notes"))
         self.notes_button.pack(anchor="w")
-        ttk.Label(notes, text="Signal checks pending messages from all chats. Other attachments can delay your note. "
+        ttk.Label(notes, text="Send text and photos to Note to Self on your phone. Notes are saved as they arrive. "
                   "Full text and all downloaded images are kept. Check Activity for progress.", wraplength=600).pack(anchor="w", pady=(6, 0))
         self.note_list = tk.Listbox(notes, height=5, exportselection=False)
         self.note_list.pack(fill="both", expand=True, pady=10)

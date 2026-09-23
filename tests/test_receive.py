@@ -86,6 +86,30 @@ class ReceiveReliability(unittest.TestCase):
             self.assertNotIn("--ignore-attachments", call.args[0])
         self.assertTrue(3599 < processes[0].wait_limits[0] <= 3600)
 
+    def test_thirty_mixed_media_files_and_large_unicode_body_are_saved_intact(self):
+        directory = engine.DATA_DIR / "attachments"
+        directory.mkdir(parents=True)
+        body = "Long caption with café, 中文 and 🦷.\nNext paragraph.\n" * 12000
+        (directory / "body.txt").write_text(body, encoding="utf-8")
+        attachments = [{"id": "body.txt", "contentType": "text/x-signal-plain"}]
+        payload = bytes(range(256)) * 256
+        for i in range(30):
+            mime = "video/mp4" if i % 5 == 0 else "image/jpeg"
+            filename = f"media-{i}"
+            (directory / filename).write_bytes(payload)
+            attachments.append({"id": filename, "contentType": mime})
+        stream = envelope(note("short caption", ts=42, attachments=attachments))
+        report, _ = self.receive(Process(stream))
+        saved = engine.read_notes()[0]
+        self.assertTrue(report["complete"])
+        self.assertEqual(saved["text"], body)
+        self.assertEqual(len(saved["photos"]), 30)
+        for media in saved["photos"]:
+            self.assertEqual(Path(media["path"]).read_bytes(), payload)
+        report, _ = self.receive(Process(stream))
+        self.assertEqual(report["new"], 0)
+        self.assertEqual(len(engine.read_notes()), 1)
+
     def test_a_note_is_durable_before_receive_finishes(self):
         ready, release = threading.Event(), threading.Event()
         process = Process()
