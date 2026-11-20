@@ -89,8 +89,9 @@ class UpdateResult:
 
 UPDATE_SETUP_FILES = ("Setup.command", "scripts/make-dock-app.sh", "requirements-macos.txt",
                       "scripts/install-mac-service.py", "scripts/mac-security.swift",
-                      "scripts/mac-thumbnail.swift", "scripts/mac-icon.swift",
-                      "notes_receiver.py", "scripts/signal-cli-notes")
+                      "scripts/mac-thumbnail.swift", "scripts/sudoku-launcher.c", "scripts/install-app.sh",
+                      "mac_migrate.py", "assets/sudoku-icon.png", "notes_receiver.py",
+                      "scripts/signal-cli-notes")
 
 
 def _git_head() -> str | None:

@@ -62,6 +62,14 @@ class WrongPassword(SecurityError):
                          code="locked" if remaining == 0 else "wrong_password")
 
 
+def legacy_paths(project: Path) -> list[Path]:
+    """Runtime files an install from before the encrypted vault kept in its checkout."""
+    paths = [project / name for name in LEGACY_NAMES]
+    for pattern in ("groups.txt.*.tmp", "group-permissions.json.*.tmp", "notes.json*.tmp"):
+        paths.extend(project.glob(pattern))
+    return paths
+
+
 def atomic_json(path: Path, value) -> None:
     atomic_bytes(path, json.dumps(value).encode())
 
@@ -248,10 +256,7 @@ class Vault:
         self.keychain = keychain or Keychain()
 
     def legacy_paths(self):
-        paths = [self.project / name for name in LEGACY_NAMES]
-        for pattern in ("groups.txt.*.tmp", "group-permissions.json.*.tmp", "notes.json*.tmp"):
-            paths.extend(self.project.glob(pattern))
-        return paths
+        return legacy_paths(self.project)
 
     def clear_old_previews(self):
         if self.project != PROJECT:

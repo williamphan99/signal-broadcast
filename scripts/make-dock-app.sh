@@ -1,68 +1,70 @@
 #!/usr/bin/env bash
-# Build "Sudoku.app" — a Dock-pinnable launcher that opens the app with no Terminal
-# window. Its name and icon match the Sudoku front shown while the app is locked. Setup.command runs this automatically; you can also run it
-# by hand to rebuild:  bash scripts/make-dock-app.sh [/path/to/python3]
+# Finish Sudoku.app around this checkout, which Setup keeps at
+# Sudoku.app/Contents/Resources/app: the native launcher, Info.plist and icon.
+# Usage: make-dock-app.sh [PYTHON]   (Setup passes the app's virtual-environment Python)
 set -uo pipefail
-cd "$(dirname "$0")/.."          # project root, whatever the working directory was
+cd "$(dirname "$0")/.."
 PROJECT="$PWD"
-PY="${1:-}"                      # preferred python (Setup passes the one it found)
+CONTENTS="$(cd "$PROJECT/../.." && pwd)"
+case "$CONTENTS" in
+  *.app/Contents) ;;
+  *) echo "Run Setup.command: the app is built inside ~/Applications/Sudoku.app." >&2; exit 1 ;;
+esac
+BUNDLE="$(dirname "$CONTENTS")"
+PY="${1:-$PROJECT/.venv/bin/python}"
+mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
 
-APP="Sudoku.app"
-MACOS="$APP/Contents/MacOS"
-RESOURCES="$APP/Contents/Resources"
-rm -rf "$APP" "Signal Broadcast.app"   # the old, revealing launcher name
-mkdir -p "$MACOS" "$RESOURCES"
-
-# Icon: drawn by a Swift helper, then packed into an .icns. A missing icon is harmless.
+# Icon: shipped as a PNG, packed into an .icns here. A missing icon is harmless.
 ICON_KEY=""
-if [ -f vendor/sudoku-icon.png ]; then
-  ICONSET="$(mktemp -d)/Sudoku.iconset"
-  mkdir -p "$ICONSET"
-  for size in 16 32 128 256 512; do
-    sips -z $size $size vendor/sudoku-icon.png --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
-    sips -z $((size * 2)) $((size * 2)) vendor/sudoku-icon.png --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
-  done
-  if iconutil -c icns "$ICONSET" -o "$RESOURCES/Sudoku.icns"; then
-    ICON_KEY="<key>CFBundleIconFile</key><string>Sudoku</string>"
-  fi
-  rm -rf "$(dirname "$ICONSET")"
+ICONSET="$(mktemp -d)/Sudoku.iconset"
+mkdir -p "$ICONSET"
+for size in 16 32 128 256 512; do
+  sips -z $size $size assets/sudoku-icon.png --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+  sips -z $((size * 2)) $((size * 2)) assets/sudoku-icon.png --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+done
+if iconutil -c icns "$ICONSET" -o "$CONTENTS/Resources/Sudoku.icns"; then
+  ICON_KEY="<key>CFBundleIconFile</key><string>Sudoku</string>"
 fi
+rm -rf "$(dirname "$ICONSET")"
 
-cat > "$APP/Contents/Info.plist" <<PLIST
+cat > "$CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>CFBundleName</key><string>Sudoku</string>
   <key>CFBundleDisplayName</key><string>Sudoku</string>
-  <key>CFBundleIdentifier</key><string>local.sudoku.launcher</string>
-  $ICON_KEY
+  <key>CFBundleIdentifier</key><string>local.sudoku</string>
   <key>CFBundleVersion</key><string>1.0</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleExecutable</key><string>launcher</string>
+  <key>CFBundleExecutable</key><string>Sudoku</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>LSApplicationCategoryType</key><string>public.app-category.puzzle-games</string>
+  $ICON_KEY
 </dict></plist>
 PLIST
 
-# The launcher cd's into the project and execs the GUI under a Python that has both
-# tkinter and tomllib. The project path is baked in, so don't move the folder after
-# setup — if you do, just re-run Setup. Tries the Setup-found python first, then the
-# usual python.org / Homebrew locations, and shows a plain alert if none work.
-cat > "$MACOS/launcher" <<LAUNCH
+# The native launcher runs Python inside this app's own process, so the Dock, menu
+# bar and Activity Monitor say "Sudoku". It links against the Python the virtual
+# environment was made from. If it cannot be built, a script launcher still works.
+BASE="$("$PY" -c 'import sys; print(sys._base_executable)' 2>/dev/null || true)"
+CONFIG="${BASE}-config"
+[ -x "$CONFIG" ] || CONFIG="$(dirname "$BASE")/python3-config"
+if [ -x "$CONFIG" ] && clang scripts/sudoku-launcher.c -o "$CONTENTS/MacOS/Sudoku.new" \
+     $("$CONFIG" --cflags --embed) $("$CONFIG" --ldflags --embed) 2>/dev/null; then
+  mv -f "$CONTENTS/MacOS/Sudoku.new" "$CONTENTS/MacOS/Sudoku"
+else
+  rm -f "$CONTENTS/MacOS/Sudoku.new"
+  echo "(Using the script launcher; the Dock may show Python while the app runs.)"
+  cat > "$CONTENTS/MacOS/Sudoku" <<'LAUNCH'
 #!/bin/bash
-cd "$PROJECT" || exit 1
-for PY in "$PY" /usr/local/bin/python3 /opt/homebrew/bin/python3 \\
-  /Library/Frameworks/Python.framework/Versions/Current/bin/python3 \\
-  /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 \\
-  /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 \\
-  /Library/Frameworks/Python.framework/Versions/3.11/bin/python3; do
-  [ -n "\$PY" ] && [ -x "\$PY" ] || continue
-  if "\$PY" -c 'import tkinter, tomllib' >/dev/null 2>&1; then
-    exec "\$PY" "$PROJECT/gui.py"
-  fi
-done
-osascript -e 'display alert "Sudoku" message "Python is not set up yet. Open the project folder and double-click Setup.command, then try again."'
+cd "$(dirname "$0")/../Resources/app" || exit 1
+[ -x .venv/bin/python ] && exec .venv/bin/python mac_app.py "$@"
+osascript -e 'display alert "Sudoku" message "Run Setup.command inside the app again to finish installing."'
 exit 1
 LAUNCH
-chmod +x "$MACOS/launcher"
-
-echo "Built $APP"
+  chmod +x "$CONTENTS/MacOS/Sudoku"
+fi
+# Tell Launch Services about the new name and icon.
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$BUNDLE" 2>/dev/null || true
+echo "Built $BUNDLE"

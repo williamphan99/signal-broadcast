@@ -1,7 +1,8 @@
 import AppKit
 import Foundation
 
-// Draws the Sudoku app icon as a 1024 px PNG: swiftc mac-icon.swift && ./mac-icon OUT.png
+// Source of assets/sudoku-icon.png (1024 px). To regenerate:
+//   swiftc scripts/mac-icon.swift -o /tmp/mac-icon && /tmp/mac-icon assets/sudoku-icon.png
 guard CommandLine.arguments.count == 2 else { exit(64) }
 let size: CGFloat = 1024
 guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size), pixelsHigh: Int(size),

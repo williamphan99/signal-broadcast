@@ -23,7 +23,7 @@ from sudoku import SudokuView
 from ui_theme import DARK, PALETTE
 
 PROJECT = Path(__file__).resolve().parent
-ICON = PROJECT / "vendor/sudoku-icon.png"
+ICON = PROJECT / "assets/sudoku-icon.png"
 
 
 def recovery_activity(event):
