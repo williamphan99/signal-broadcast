@@ -41,8 +41,9 @@ neutral names, safely and only once:
 | Unencrypted files in the project folder (older installs) | moved into the app, then into the vault at password setup |
 
 The migration checks everything first and stops without changing anything if both
-old and new data exist. It reads the Keychain entry with the helper that created it,
-so no new Keychain approval is needed, and it can simply be run again after a fix.
+old and new data exist. It reads the old Keychain entry with the helper that last
+used it, so normally no new approval is needed; if macOS asks, choose **Always Allow**.
+It can simply be run again after a fix.
 Your Signal link, drafts, photos, schedule and password are kept. Re-pin the app in
 the Dock afterwards.
 

@@ -568,6 +568,8 @@ class Service:
             mac_retry.groups()
 
     def _start_job(self, kind):
+        if self.job and self.job["kind"] == "health" and kind != "health":
+            self.stop_job()  # A background link check gives way to the user; it is rescheduled.
         if self.job:
             raise SecurityError("Signal is busy. Wait for the current operation.")
         if self.update_state and self.update_state.get("changed"):

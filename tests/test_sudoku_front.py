@@ -346,6 +346,16 @@ class HealthSchedulingTests(Fixture):
             self.request("stop")
         self.assertIsNotNone(self.service.health_due)
 
+    def test_a_user_job_preempts_a_background_link_check(self):
+        self.setup()
+        self.service.job = {"kind": "health", "proc": mock.Mock()}
+        with mock.patch("mac_service.terminate_group"), mock.patch.object(self.service, "reap_worker"), \
+             mock.patch.object(self.service, "spawn", side_effect=OSError("stop after preemption")):
+            with self.assertRaises(SecurityError):
+                self.request("job", kind="sync")
+        self.assertIsNone(self.service.job)
+        self.assertIsNotNone(self.service.health_due)
+
     def test_a_send_where_every_group_failed_triggers_a_link_check(self):
         self.setup()
         summary = engine.RunSummary(at="2026-01-01T08:00:00", total=3, sent=0, failed=3)
