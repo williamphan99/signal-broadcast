@@ -19,12 +19,13 @@ if args.count == 2 && args[1] == "observe-lock" {
     withExtendedLifetime([lock, inactive, sleep]) { RunLoop.main.run() }
     exit(0)
 }
-guard args.count == 3 else { exit(64) }
+guard args.count == 3 || args.count == 4 else { exit(64) }
 let operation = args[1], service = args[2]
+let account = args.count == 4 ? args[3] : "vault"  // Older items all used "vault".
 let query: [String: Any] = [
     kSecClass as String: kSecClassGenericPassword,
     kSecAttrService as String: service,
-    kSecAttrAccount as String: "vault",
+    kSecAttrAccount as String: account,
     kSecAttrSynchronizable as String: false
 ]
 var status: OSStatus = errSecParam

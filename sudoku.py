@@ -14,9 +14,9 @@ import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
 
-from mac_security import is_puzzle_code
+from mac_security import ROOT, is_puzzle_code
 
-STATE_FILE = Path.home() / "Library/Application Support/Sudoku/game.json"
+STATE_FILE = ROOT / "game.json"  # Beside the encrypted library, so the folder looks like a game's.
 DIFFICULTIES = ("Easy", "Medium", "Hard")
 CLUES = {"Easy": 40, "Medium": 32, "Hard": 26}
 ALL = 0b1111111110  # bits 1..9

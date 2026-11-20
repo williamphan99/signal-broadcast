@@ -120,6 +120,7 @@ class App(tk.Tk):
         self.setup_mode = "--setup" in sys.argv[1:]
         self.front_enabled = not self.setup_mode
         self.erase_pending = False
+        self.front_passed = False
         self.front_update_pending = False
         self.title("Sudoku")
         try:
@@ -169,7 +170,7 @@ class App(tk.Tk):
                     except SecurityError:
                         pass
                 return
-            if error and on_error and (operation == "unlock" and self.screen == "front"
+            if error and on_error and (operation in ("unlock", "check_code") and self.screen == "front"
                                        or error.code not in ("locked", "unavailable")):
                 self.responses.put((generation, on_error, error, None))
             else:
@@ -266,6 +267,7 @@ class App(tk.Tk):
         self.clear()
         self.client.token = None
         self.auth_pending = False
+        self.front_passed = False
         self.screen = "front"
         self.title("Sudoku")
         self.container.configure(padding=0)
@@ -275,15 +277,24 @@ class App(tk.Tk):
         self.menubar(front=True)
 
     def front_code(self, text, reply):
-        """Any non-puzzle code is a password attempt. Wrong ones count toward the wipe."""
-        def unlocked(result):
+        """Layer one: the password typed as a puzzle code reveals the password screen.
+
+        Wrong codes count toward the wipe and the panic code erases; the service
+        decides both. Layer two is the ordinary password screen, same password."""
+        def passed(_):
+            self.auth_pending = False
             reply("ok")
-            self.authenticated(result)
+            self.front_passed = True
+            self.show_login(from_game=True)
         def failed(error):
             self.auth_pending = False
             reply("invalid" if error.code in ("wrong_password", "locked") else "error")
         self.auth_pending = True
-        self.request("unlock", unlocked, on_error=failed, password=text)
+        self.request("check_code", passed, on_error=failed, password=text)
+
+    def back_to_game(self):
+        self.front_passed = False
+        self.show_front()
 
     def front_status(self, state):
         if not state.get("front", True):
@@ -298,7 +309,7 @@ class App(tk.Tk):
                                 if update.get("changed") else "Couldn't check for updates. Try again later."
                                 if update.get("error") else "You're up to date.", parent=self)
 
-    def show_login(self, text=""):
+    def show_login(self, text="", from_game=False):
         self.clear()
         self.client.token = None
         self.screen = "login"
@@ -327,6 +338,12 @@ class App(tk.Tk):
         ttk.Label(self.container, text="Three consecutive incorrect passwords erase this installation.\n"
             "Background sending may continue while this screen is locked.", wraplength=640).pack(anchor="w", pady=10)
         ttk.Button(self.container, text="Log out and erase", command=self.erase).pack(anchor="w")
+        if from_game:
+            ttk.Button(self.container, text="Back to game", command=self.back_to_game).pack(anchor="w", pady=(12, 0))
+            generation = self.generation
+            # An unattended password screen returns to the game on its own.
+            self.after(90_000, lambda: self.back_to_game() if (
+                self.generation == generation and self.screen == "login" and not self.auth_pending) else None)
         self.notice.set(text)
         self.request("status", self.login_status)
         self.password.focus_set()
@@ -338,7 +355,7 @@ class App(tk.Tk):
         self.refresh_login_update()
         self.setup_required = state["setup_required"]
         self.front_enabled = bool(state.get("front", True))
-        if self.front_enabled and not self.setup_mode and not self.erase_pending:
+        if self.front_enabled and not self.setup_mode and not self.erase_pending and not self.front_passed:
             self.show_front()
             return
         if state["state"] == "erasing":
@@ -346,8 +363,9 @@ class App(tk.Tk):
             self.login_button.configure(state="disabled")
             return
         explainer = ("\n\nNew: after you unlock, this app will look like a Sudoku game. To get back in, choose "
-                     "Game → Enter Puzzle Code… (or Command-K) and type this password. Wrong codes count as "
-                     "wrong passwords. You can turn this off in Security." if state.get("disguise", True) else "")
+                     "Game → Enter Puzzle Code… (or Command-K), type this password, then enter it again here. Wrong codes count as "
+                     "wrong passwords. You can turn this off in Security."
+                     if state.get("disguise", True) and not state.get("front") else "")
         if self.setup_required:
             self.login_description.configure(text="Set a local password of at least 12 characters before linking. "
                 "Existing data will be moved into encrypted storage. There is no password recovery. "
@@ -407,10 +425,12 @@ class App(tk.Tk):
     def authenticated(self, result):
         self.auth_pending = False
         self.setup_mode = False
+        self.front_passed = False
         self.client.token = result["token"]
         if result.get("front_armed_now"):
             messagebox.showinfo("This app now opens as Sudoku", "From now on, when this app is locked it shows a "
-                "Sudoku game.\n\nTo unlock: Game → Enter Puzzle Code… (Command-K), then type your password.\n\n"
+                "Sudoku game.\n\nTo unlock: Game → Enter Puzzle Code… (Command-K) and type your password. The "
+                "password screen then appears; enter the same password there.\n\n"
                 "Six-digit codes just load puzzles. Any other wrong code counts as a wrong password, and three "
                 "in a row erase everything. You can turn this off in Security.", parent=self)
         self.request("snapshot", self.initial_snapshot)
@@ -613,7 +633,8 @@ class App(tk.Tk):
         self.disguise_enabled = tk.BooleanVar(value=self.front_enabled)
         ttk.Checkbutton(disguise, text="Show a Sudoku game when this app is locked", variable=self.disguise_enabled,
                         command=self.save_disguise).pack(anchor="w")
-        ttk.Label(disguise, text="To unlock: Game → Enter Puzzle Code… (Command-K), then type your password. "
+        ttk.Label(disguise, text="To unlock: Game → Enter Puzzle Code… (Command-K), type your password, then "
+            "enter it again on the password screen. "
             "Six-digit codes just load puzzles; any other wrong code counts as a wrong password.",
             wraplength=580).pack(anchor="w", pady=(6, 8))
         panic_row = ttk.Frame(disguise)

@@ -27,7 +27,8 @@ from mac_security import (HELPER, PROJECT, ROOT, SecurityError, Vault, WrongPass
                           unwrap_password, wrap_password)
 from mac_worker import configure_storage
 
-LABEL = "com.user.signal-broadcast.service"
+LABEL = "local.sudoku.helper"
+LEGACY_LABEL = "com.user.signal-broadcast.service"
 MAX_REQUEST = 1024 * 1024
 # Link checks contact Signal. Erasing on an unlink needs two "removed" answers this
 # far apart, so one odd server reply can never wipe a working installation.
@@ -50,7 +51,7 @@ def socket_path(root: Path = ROOT) -> Path:
     # in the owner's private temporary directory; its name contains no account ID.
     import hashlib
     import tempfile
-    directory = Path(tempfile.gettempdir()).resolve() / f"sb-{os.getuid()}"
+    directory = Path(tempfile.gettempdir()).resolve() / f"sudoku-{os.getuid()}"
     directory.mkdir(mode=0o700, exist_ok=True)
     if directory.is_symlink() or directory.stat().st_uid != os.getuid():
         raise SecurityError("Unsafe local service directory.")
@@ -174,6 +175,7 @@ class Service:
         self.removed_since = None
         self.unlink_confirmed = False
         self.failures_before_unlock = 0
+        self.failures_at_code = 0
         self.erase_retry_at = 0.0
 
     def recover(self):
@@ -263,7 +265,9 @@ class Service:
         self.sealed_schedule = None
         self.vault.recover_imports()
         record = self.vault.keychain.load()
-        self.failures_before_unlock = record["failures"]
+        # Wrong codes typed before the Sudoku step passed still get reported once.
+        self.failures_before_unlock = max(self.failures_at_code, record["failures"])
+        self.failures_at_code = 0
         record["failures"] = 0
         newly_armed = record.get("disguise", True) and not record.get("front_armed", False)
         record["front_armed"] = True
@@ -279,6 +283,32 @@ class Service:
         self.health_due = time.monotonic() + HEALTH_AFTER_UNLOCK_S
         self.token = secrets.token_urlsafe(32)
         return {"token": self.token, "front_armed_now": bool(newly_armed)}
+
+    def check_code(self, password):
+        """The Sudoku layer: the same password reveals the password screen, nothing more.
+
+        It opens nothing and returns no token. Wrong codes share the unlock counter, and
+        the panic code erases, so this step is enforced here rather than in the window."""
+        if self.recovery_error:
+            raise SecurityError(self.recovery_error)
+        if not isinstance(password, str) or len(password.encode()) > 4096:
+            raise SecurityError("Password is too long.")
+        record = self.vault.keychain.load()
+        if self.erasing or self.vault.marker.exists() or not record or record["phase"] != "ready":
+            raise WrongPassword(0)  # Nothing to reveal; never counts.
+        if record["failures"] >= 3:
+            self.erase()
+            raise WrongPassword(0)
+        if matches_panic_code(password, record):
+            remaining = max(0, 2 - record["failures"])
+            self.erase()
+            raise WrongPassword(remaining)
+        self._unwrap_password(password, record)
+        record = self.vault.keychain.load()
+        self.failures_at_code = record["failures"]
+        record["failures"] = 0
+        self.vault.keychain.save(record)
+        return {"ok": True}
 
     def _unwrap_password(self, password, record):
         try:
@@ -771,6 +801,8 @@ class Service:
                 return {"restarting": True}
             if op in ("unlock", "setup"):
                 return self.authenticate(request.get("password", ""), setup=op == "setup")
+            if op == "check_code":
+                return self.check_code(request.get("password", ""))
             self._authorized(request)
             if op == "lock":
                 self.lock()
@@ -933,7 +965,8 @@ def serve(service: Service, path: Path):
                     if "error" in response and (service.erasing or service.vault.marker.exists()):
                         response["error_code"] = "locked"
                         payload = json.dumps(response).encode() + b"\n"
-                    if "result" in response and request["op"] not in ("status", "lock", "erase", "update", "restart_update"):
+                    if "result" in response and request["op"] not in ("status", "lock", "erase", "update", "restart_update",
+                                                                       "check_code"):
                         # Serialization can race a lock or logout. Recheck at delivery
                         # and keep revocation serialized with the socket write.
                         authorization = ({"token": result["token"]} if request["op"] in ("setup", "unlock") else request)
