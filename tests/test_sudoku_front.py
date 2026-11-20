@@ -394,6 +394,22 @@ class PuzzleTests(unittest.TestCase):
                 for unit in range(9):
                     self.assertEqual(sorted(solution[i] for i in range(81) if group[i] == unit), list(range(1, 10)))
 
+    def test_undo_restores_pencil_marks_cleared_in_peer_cells(self):
+        view = sudoku.SudokuView.__new__(sudoku.SudokuView)  # Game logic only, no window.
+        view.puzzle, view.solution = sudoku.make_puzzle("123456")
+        view.entries, view.notes, view.history = view.puzzle[:], [set() for _ in range(81)], []
+        view.pencil, view.solved, view.flash = False, False, set()
+        view.save_state = view.draw = lambda: None
+        cell = next(i for i in range(81) if not view.puzzle[i])
+        peer = next(p for p in sudoku.PEERS[cell] if not view.puzzle[p])
+        view.notes[peer] = {2, 5}
+        view.selected = cell
+        view.enter(2)
+        self.assertEqual(view.notes[peer], {5})
+        view.undo()
+        self.assertEqual(view.notes[peer], {2, 5})
+        self.assertEqual(view.entries[cell], 0)
+
     def test_random_codes_match_their_difficulty(self):
         for name in sudoku.DIFFICULTIES:
             code = sudoku.random_code(name)

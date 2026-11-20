@@ -162,7 +162,8 @@ class SudokuView(tk.Frame):
         self.cell = 48
         self.selected = 40
         self.pencil = False
-        self.history: list[tuple[int, int, frozenset]] = []
+        # Each move: (cell, previous value, previous notes, peers whose note it cleared).
+        self.history: list[tuple[int, int, frozenset, tuple[int, ...]]] = []
         self.flash: set[int] = set()
         self.dialog = None
         self.started = time.monotonic()
@@ -302,7 +303,7 @@ class SudokuView(tk.Frame):
         i = self.selected
         if self.solved or self.puzzle[i]:
             return
-        before = (i, self.entries[i], frozenset(self.notes[i]))
+        value, notes, cleared = self.entries[i], frozenset(self.notes[i]), ()
         if self.pencil and digit:
             if self.entries[i]:
                 return
@@ -313,9 +314,10 @@ class SudokuView(tk.Frame):
             self.entries[i] = digit
             self.notes[i] = set()
             if digit:
-                for peer in PEERS[i]:
+                cleared = tuple(peer for peer in PEERS[i] if digit in self.notes[peer])
+                for peer in cleared:
                     self.notes[peer].discard(digit)
-        self.history.append(before)
+        self.history.append((i, value, notes, cleared))
         self.flash.discard(i)
         if self.entries == self.solution:
             self.elapsed_before, self.solved = self.elapsed(), True
@@ -327,7 +329,9 @@ class SudokuView(tk.Frame):
 
     def undo(self):
         if self.history and not self.solved:
-            i, value, notes = self.history.pop()
+            i, value, notes, cleared = self.history.pop()
+            for peer in cleared:
+                self.notes[peer].add(self.entries[i])
             self.entries[i], self.notes[i] = value, set(notes)
             self.selected = i
             self.save_state()
