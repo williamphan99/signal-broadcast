@@ -1942,15 +1942,17 @@ def _receive_messages(binary: str, account: str, idle_seconds: int,
                             "new", "missing_attachments"), 0)
     temporary = RUNTIME_DIR / "temporary"
     temporary.mkdir(parents=True, exist_ok=True, mode=0o700)
-    selective = notes_receiver.launcher_for(binary)
-    if selective:
+    selective = notes_receiver.launcher_for(binary) if KEEP_NOTES else None
+    if not KEEP_NOTES:
+        on_log("Checking pending Signal messages. No attachments are downloaded.")
+    elif selective:
         binary = selective
         on_log("Checking pending Signal messages; downloading media and full text only for Note to Self. "
                "Each complete note appears as soon as it is saved.")
     else:
         on_log("Using the compatibility receiver: attachments from all chats are downloaded. "
                "Run Setup to enable selective Note-to-Self downloads. Each complete note is saved as it arrives.")
-    _notes_log(f"receive mode: media={'note-to-self' if selective else 'all'} "
+    _notes_log(f"receive mode: media={'none' if not KEEP_NOTES else 'note-to-self' if selective else 'all'} "
                f"receiver={'selective-' + notes_receiver.VERSION if selective else 'compatibility'}")
     for attempt in (1, 2):
         with tempfile.TemporaryDirectory(prefix="receive-", dir=temporary) as folder:
@@ -1995,7 +1997,8 @@ def _receive_once(binary: str, account: str, idle_seconds: int, temporary: Path,
         proc = subprocess.Popen(
             _cli(binary, *temp_options, "--config", str(DATA_DIR), *_account_args(account), "-o", "json",
                  "receive", "--timeout", str(idle_seconds),
-                 "--ignore-avatars", "--ignore-stickers", "--ignore-stories"),
+                 "--ignore-avatars", "--ignore-stickers", "--ignore-stories",
+                 *([] if KEEP_NOTES else ["--ignore-attachments"])),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
             errors="replace", env=env)
     except (OSError, subprocess.SubprocessError):
@@ -2046,7 +2049,7 @@ def _receive_once(binary: str, account: str, idle_seconds: int, temporary: Path,
     def read_stdout():
         try:
             if proc.stdout is not None:
-                _inspect_receive(proc.stdout, collect_notes=True, log_summary=True,
+                _inspect_receive(proc.stdout, collect_notes=KEEP_NOTES, log_summary=True,
                                  on_note=save_note, counters=counters,
                                  on_receive_error=lambda message: record_warning(message, "json"))
         except Exception:

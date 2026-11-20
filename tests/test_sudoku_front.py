@@ -292,6 +292,22 @@ class NotesRemovalTests(Fixture):
         self.assertFalse(leftover.exists())
         self.assertEqual(engine.read_attachments(), [str(used)])
 
+    def test_mac_group_refresh_downloads_no_attachments(self):
+        self.setup()
+        started = {}
+        def popen(argv, **kwargs):
+            started["argv"] = argv
+            raise OSError("stop after recording the command")
+        with mock.patch.object(engine, "KEEP_NOTES", False), \
+             mock.patch.object(engine, "_is_jvm_build", return_value=True), \
+             mock.patch.object(engine.subprocess, "Popen", side_effect=popen), \
+             mock.patch.object(engine.notes_receiver, "launcher_for", return_value="/selective") as selective:
+            with self.assertRaises(engine.ReceiveError):
+                engine._receive_messages("/signal-cli", "+19999999999", 1)
+        self.assertIn("--ignore-attachments", started["argv"])
+        self.assertEqual(started["argv"][0], "/signal-cli")
+        selective.assert_not_called()
+
     def test_received_note_media_is_deleted_when_notes_are_off(self):
         self.setup()
         media = engine.DATA_DIR / "attachments" / "incoming"
