@@ -129,7 +129,7 @@ def password_key(password: str, salt: bytes) -> bytes:
 
 def wrap_password(password: str, volume_password: bytes) -> dict:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    if len(password) < 12 or len(password.encode("utf-8")) > 4096:
+    if len(password) < MIN_PASSWORD or len(password.encode("utf-8")) > 4096:
         raise SecurityError("Use a password with at least 12 characters (maximum 4096 UTF-8 bytes).")
     salt, nonce = secrets.token_bytes(16), secrets.token_bytes(12)
     wrapped = AESGCM(password_key(password, salt)).encrypt(nonce, volume_password, AAD)
@@ -138,13 +138,15 @@ def wrap_password(password: str, volume_password: bytes) -> dict:
             "wrapped": base64.b64encode(wrapped).decode()}
 
 
-# Six digits, optionally prefixed with "#", load a Sudoku puzzle. Passwords need at
-# least 12 characters and panic codes may not use this shape, so they never collide.
+# Six digits, optionally prefixed with "#", load a Sudoku puzzle. Only inputs shorter
+# than the 12-character password minimum qualify, so no valid password (even digits
+# padded with spaces) is ever taken for a puzzle. Panic codes may not use this shape.
 PUZZLE_CODE = re.compile(r"#?\d{6}")
+MIN_PASSWORD = 12
 
 
 def is_puzzle_code(text: str) -> bool:
-    return bool(PUZZLE_CODE.fullmatch(text.strip()))
+    return len(text) < MIN_PASSWORD and bool(PUZZLE_CODE.fullmatch(text.strip()))
 
 
 def hash_panic_code(code: str) -> dict:

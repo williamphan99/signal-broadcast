@@ -364,7 +364,7 @@ class PuzzleTests(unittest.TestCase):
     def test_puzzle_codes_never_collide_with_passwords(self):
         self.assertTrue(is_puzzle_code("482913"))
         self.assertTrue(is_puzzle_code(" #482913 "))
-        for text in ("48291", "4829131", "a long local passphrase", "12345678901234"):
+        for text in ("48291", "4829131", "a long local passphrase", "12345678901234", "   123456   "):
             self.assertFalse(is_puzzle_code(text))
 
     def test_codes_make_repeatable_puzzles_with_one_solution(self):
