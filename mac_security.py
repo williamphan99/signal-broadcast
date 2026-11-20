@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import plistlib
+import re
 import secrets
 import shutil
 import stat
@@ -52,7 +53,7 @@ class WrongPassword(SecurityError):
     def __init__(self, remaining: int):
         self.remaining = remaining
         super().__init__(f"Incorrect password. {remaining} attempts remain.",
-                         code="locked" if remaining == 0 else None)
+                         code="locked" if remaining == 0 else "wrong_password")
 
 
 def atomic_json(path: Path, value) -> None:
@@ -127,6 +128,32 @@ def wrap_password(password: str, volume_password: bytes) -> dict:
     return {"version": 1, "phase": "migrating", "failures": 0,
             "salt": base64.b64encode(salt).decode(), "nonce": base64.b64encode(nonce).decode(),
             "wrapped": base64.b64encode(wrapped).decode()}
+
+
+# Six digits, optionally prefixed with "#", load a Sudoku puzzle. Passwords need at
+# least 12 characters and panic codes may not use this shape, so they never collide.
+PUZZLE_CODE = re.compile(r"#?\d{6}")
+
+
+def is_puzzle_code(text: str) -> bool:
+    return bool(PUZZLE_CODE.fullmatch(text.strip()))
+
+
+def hash_panic_code(code: str) -> dict:
+    salt = secrets.token_bytes(16)
+    return {"salt": base64.b64encode(salt).decode(),
+            "hash": base64.b64encode(password_key(code, salt)).decode()}
+
+
+def matches_panic_code(code: str, record: dict) -> bool:
+    panic = record.get("panic")
+    if not isinstance(panic, dict):
+        return False
+    try:
+        salt, expected = (base64.b64decode(panic[key], validate=True) for key in ("salt", "hash"))
+    except (KeyError, ValueError, TypeError):
+        return False
+    return secrets.compare_digest(password_key(code, salt), expected)
 
 
 def unwrap_password(password: str, record: dict) -> bytes:

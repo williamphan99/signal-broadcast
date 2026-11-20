@@ -324,7 +324,7 @@ class SecurityTests(unittest.TestCase):
         self.assertNotIn(self.token, status)
         self.assertNotIn("wrapped", status)
 
-    def test_migration_preserves_link_and_rewrites_notes_and_attachments(self):
+    def test_migration_preserves_link_and_attachments_and_discards_notes(self):
         (self.project / "signal-cli-data/data").mkdir(parents=True)
         (self.project / "signal-cli-data/data/account.db").write_bytes(b"fake link state")
         (self.project / "notes.json").write_text(json.dumps([{"path": str(self.project / "signal-cli-data/photo.png")}]))
@@ -340,7 +340,7 @@ class SecurityTests(unittest.TestCase):
         self.assertTrue((self.project / "logs/.gitkeep").exists())
         paths = (self.vault.data / "attachments.txt").read_text().splitlines()
         self.assertEqual(Path(paths[0]).read_bytes(), b"sample image")
-        self.assertIn(str(self.vault.data), (self.vault.data / "notes.json").read_text())
+        self.assertFalse((self.vault.data / "notes.json").exists())  # The Mac app keeps no notes.
 
     def test_failed_migration_verification_retains_originals(self):
         path = self.project / "message.txt"
@@ -510,14 +510,15 @@ class SecurityTests(unittest.TestCase):
             self.service.tick(datetime(2026, 1, 1, 9, minute))
         self.assertEqual(started, ["send", "send"])
 
-    def test_migration_preserves_note_text_and_moves_a_checkout_attachment(self):
+    def test_migration_discards_note_text_and_moves_a_checkout_attachment(self):
         original = self.project / "my-photo.png"
         original.write_bytes(b"image outside managed legacy directories")
         (self.project / "attachments.txt").write_text(str(original))
         text = "Message mentioning " + str(self.project)
         (self.project / "notes.json").write_text(json.dumps([{"text": text}]))
         self.setup()
-        self.assertEqual(json.loads((self.vault.data / "notes.json").read_text())[0]["text"], text)
+        self.assertEqual(engine.read_notes(), [])
+        self.assertNotIn(text, json.dumps(self.request("snapshot")))
         self.assertFalse(original.exists())
         self.assertEqual(Path(engine.read_attachments()[0]).read_bytes(), b"image outside managed legacy directories")
 

@@ -98,6 +98,10 @@ launchctl bootout "gui/$(id -u)/com.user.signal-broadcast.service" >/dev/null 2>
 .venv/bin/python -m pip install --disable-pip-version-check -r requirements-macos.txt || exit 1
 swiftc scripts/mac-security.swift -o vendor/mac-security || exit 1
 swiftc scripts/mac-thumbnail.swift -o vendor/mac-thumbnail || exit 1
+ICON_TOOL="$(mktemp -d)/mac-icon"
+swiftc scripts/mac-icon.swift -o "$ICON_TOOL" && "$ICON_TOOL" vendor/sudoku-icon.png \
+  || echo "(Couldn't draw the Sudoku icon — the app still works with the default icon.)"
+rm -rf "$(dirname "$ICON_TOOL")"
 .venv/bin/python scripts/install-mac-service.py || exit 1
 PY="$PWD/.venv/bin/python"
 bash scripts/make-dock-app.sh "$PY" \
@@ -105,6 +109,9 @@ bash scripts/make-dock-app.sh "$PY" \
 
 echo
 echo "All set."
-echo "• To keep it handy: open this folder in Finder and drag 'Signal Broadcast.app' onto your Dock."
-echo "• Opening the app now — scan the QR code with your phone to link it."
-exec "$PY" gui.py
+echo "• To keep it handy: open this folder in Finder and drag 'Sudoku.app' onto your Dock."
+echo "  If 'Signal Broadcast' was pinned before, remove that old Dock icon."
+echo "• When locked, the app looks like a Sudoku game. To unlock: Game → Enter Puzzle Code…"
+echo "  (Command-K), then type your password. Three wrong codes erase everything."
+echo "• Opening the password screen now."
+exec "$PY" gui.py --setup

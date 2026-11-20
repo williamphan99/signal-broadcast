@@ -19,7 +19,11 @@ from mac_security import SecurityError
 from mac_service import Client
 from mac_photos import Thumbnails
 from photo_strip import PhotoStrip
-from ui_theme import PALETTE
+from sudoku import SudokuView
+from ui_theme import DARK, PALETTE
+
+PROJECT = Path(__file__).resolve().parent
+ICON = PROJECT / "vendor/sudoku-icon.png"
 
 
 def recovery_activity(event):
@@ -47,13 +51,13 @@ def operation_status(data, pending=None):
         if kind in ("send", "resume", "retry") and data.get("phase") == "preparing":
             return "Preparing message and photos…"
         return {"send": "Sending…", "resume": "Sending remaining groups…",
-                "sync": "Updating groups…", "notes": "Checking for new notes…",
+                "sync": "Updating groups…",
                 "link": "Linking…", "health": "Checking the Signal link…",
                 "import": "Adding and verifying photos…", "update": "Checking for updates…",
                 "retry": "Retrying failed groups…"}.get(kind, "Working…")
     last = data.get("last_operation") or {}
     name = {"send": "Broadcast", "resume": "Broadcast", "retry": "Broadcast", "update": "Update", "sync": "Group update",
-            "notes": "Notes check", "link": "Linking", "health": "Link check"}.get(last.get("kind"), "Operation")
+            "link": "Linking", "health": "Link check"}.get(last.get("kind"), "Operation")
     if last.get("outcome") == "stopped":
         suffix = " Messages already dispatched may still arrive." if last.get("kind") in ("send", "resume", "retry") else ""
         return f"{name} stopped.{suffix}"
@@ -72,12 +76,57 @@ def operation_status(data, pending=None):
     return "Ready to send."
 
 
+def show_as(name: str) -> None:
+    """Name the running app `name` in the menu bar instead of "Python".
+
+    Python's GUI process is Python.app, so the menu bar title comes from its bundle.
+    Overwriting CFBundleName before Tk creates the application changes what the menu
+    bar shows. Best effort: on failure the app still works, only the name leaks."""
+    if sys.platform != "darwin":
+        return
+    import ctypes
+    import ctypes.util
+    try:
+        objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+        ctypes.cdll.LoadLibrary(ctypes.util.find_library("Foundation"))
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.sel_registerName.restype = ctypes.c_void_p
+        address = ctypes.cast(objc.objc_msgSend, ctypes.c_void_p).value
+
+        def send(restype, target, selector, *args, argtypes=()):
+            method = ctypes.CFUNCTYPE(restype, ctypes.c_void_p, ctypes.c_void_p, *argtypes)(address)
+            return method(target, objc.sel_registerName(selector), *args)
+
+        def string(text):
+            return send(ctypes.c_void_p, objc.objc_getClass(b"NSString"), b"stringWithUTF8String:",
+                        text.encode(), argtypes=(ctypes.c_char_p,))
+
+        info = send(ctypes.c_void_p, send(ctypes.c_void_p, objc.objc_getClass(b"NSBundle"), b"mainBundle"),
+                    b"infoDictionary")
+        if info:
+            send(None, info, b"setObject:forKey:", string(name), string("CFBundleName"),
+                 argtypes=(ctypes.c_void_p, ctypes.c_void_p))
+    except (OSError, AttributeError, TypeError):
+        pass
+
+
 class App(tk.Tk):
     def __init__(self, client=None):
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        show_as("Sudoku")
         super().__init__()
         self.client = client or Client()
-        self.title("Signal Broadcast")
+        # Setup opens the app with --setup so the owner sees the password screen once.
+        self.setup_mode = "--setup" in sys.argv[1:]
+        self.front_enabled = not self.setup_mode
+        self.erase_pending = False
+        self.front_update_pending = False
+        self.title("Sudoku")
+        try:
+            self.icon_image = tk.PhotoImage(file=str(ICON))
+            self.iconphoto(True, self.icon_image)
+        except tk.TclError:
+            self.icon_image = None  # Built by Setup; the default icon is harmless.
         self.geometry("760x780")
         self.minsize(620, 650)
         self.responses = queue.Queue()
@@ -95,7 +144,9 @@ class App(tk.Tk):
         self.container.pack(fill="both", expand=True)
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.createcommand("tk::mac::Quit", self.close)
-        self.show_login()
+        self.createcommand("tk::mac::ShowPreferences", lambda: None)
+        self.option_add("*tearOff", False)
+        self.show_locked()
         self.after(80, self.drain)
         self.after(500, self.poll)
 
@@ -118,7 +169,8 @@ class App(tk.Tk):
                     except SecurityError:
                         pass
                 return
-            if error and on_error and error.code not in ("locked", "unavailable"):
+            if error and on_error and (operation == "unlock" and self.screen == "front"
+                                       or error.code not in ("locked", "unavailable")):
                 self.responses.put((generation, on_error, error, None))
             else:
                 self.responses.put((generation, callback, value, error))
@@ -135,8 +187,11 @@ class App(tk.Tk):
                 continue
             if error:
                 self.auth_pending = False
+                if self.screen == "front":
+                    self.polling = False
+                    continue  # Status hiccups stay invisible behind the game.
                 if self.screen != "login" and error.code in ("locked", "unavailable"):
-                    self.show_login(str(error))
+                    self.show_locked(str(error))
                 else:
                     self.notice.set(str(error))
                 self.polling = False
@@ -164,7 +219,7 @@ class App(tk.Tk):
             child.destroy()
         self.data, self.images, self.previews = {}, [], []
         self.qr_image = None
-        self.notes_signature = self.group_signature = None
+        self.group_signature = None
         self.pending_action = None
         self.activity_kind = None
         self.activity_started = None
@@ -176,10 +231,79 @@ class App(tk.Tk):
         self.update_prompted = False
         self.login_state = {}
 
+    def show_locked(self, text=""):
+        """The locked view: the Sudoku front unless it is off or Setup asked for the password screen."""
+        if self.front_enabled and not self.setup_mode:
+            self.show_front()
+        else:
+            self.show_login(text)
+
+    def menubar(self, front):
+        bar = tk.Menu(self)
+        app = tk.Menu(bar, name="apple")
+        bar.add_cascade(menu=app)
+        app.add_command(label="About Sudoku", command=lambda: messagebox.showinfo(
+            "Sudoku", "Sudoku\n\nA quiet, offline number puzzle.", parent=self))
+        app.add_separator()
+        app.add_command(label="Check for Updates…", command=self.check_update)
+        if front:
+            game = tk.Menu(bar)
+            bar.add_cascade(label="Game", menu=game)
+            for name in ("Easy", "Medium", "Hard"):
+                game.add_command(label=f"New {name} Game", command=lambda n=name: self.sudoku.new_game(n))
+            game.add_separator()
+            game.add_command(label="Enter Puzzle Code…", accelerator="Command-K", command=self.sudoku.ask_code)
+            game.add_command(label="Check", command=self.sudoku.check)
+            self.bind("<Command-k>", lambda _: self.sudoku.ask_code())
+        else:
+            self.unbind("<Command-k>")
+            window = tk.Menu(bar)
+            bar.add_cascade(label="Window", menu=window)
+            window.add_command(label="Lock", accelerator="Command-L", command=self.lock)
+        self.configure(menu=bar)
+
+    def show_front(self):
+        self.clear()
+        self.client.token = None
+        self.auth_pending = False
+        self.screen = "front"
+        self.title("Sudoku")
+        self.container.configure(padding=0)
+        self.sudoku = SudokuView(self.container, dark=DARK, on_code=self.front_code)
+        self.sudoku.pack(fill="both", expand=True)
+        self.configure(background=self.sudoku.colors["bg"])
+        self.menubar(front=True)
+
+    def front_code(self, text, reply):
+        """Any non-puzzle code is a password attempt. Wrong ones count toward the wipe."""
+        def unlocked(result):
+            reply("ok")
+            self.authenticated(result)
+        def failed(error):
+            self.auth_pending = False
+            reply("invalid" if error.code in ("wrong_password", "locked") else "error")
+        self.auth_pending = True
+        self.request("unlock", unlocked, on_error=failed, password=text)
+
+    def front_status(self, state):
+        if not state.get("front", True):
+            self.front_enabled = False
+            self.show_login()
+            return
+        self.login_state = state
+        update = state.get("update")
+        if self.front_update_pending and update and not state.get("updating"):
+            self.front_update_pending = False
+            messagebox.showinfo("Software update", "An update is ready. Choose Check for Updates… again to install it."
+                                if update.get("changed") else "Couldn't check for updates. Try again later."
+                                if update.get("error") else "You're up to date.", parent=self)
+
     def show_login(self, text=""):
         self.clear()
         self.client.token = None
         self.screen = "login"
+        self.container.configure(padding=16)
+        self.menubar(front=False)
         self.setup_required = False
         self.auth_pending = False
         ttk.Label(self.container, text="Signal Broadcast", font=("", 22, "bold")).pack(anchor="w", pady=20)
@@ -213,19 +337,26 @@ class App(tk.Tk):
         self.login_state = state
         self.refresh_login_update()
         self.setup_required = state["setup_required"]
+        self.front_enabled = bool(state.get("front", True))
+        if self.front_enabled and not self.setup_mode and not self.erase_pending:
+            self.show_front()
+            return
         if state["state"] == "erasing":
             self.notice.set("Erasure is incomplete. Use Log out and erase to retry cleanup.")
             self.login_button.configure(state="disabled")
             return
+        explainer = ("\n\nNew: after you unlock, this app will look like a Sudoku game. To get back in, choose "
+                     "Game → Enter Puzzle Code… (or Command-K) and type this password. Wrong codes count as "
+                     "wrong passwords. You can turn this off in Security." if state.get("disguise", True) else "")
         if self.setup_required:
             self.login_description.configure(text="Set a local password of at least 12 characters before linking. "
                 "Existing data will be moved into encrypted storage. There is no password recovery. "
-                "Previously attached originals will be moved into the vault after verification.")
+                "Previously attached originals will be moved into the vault after verification." + explainer)
             self.confirm_label.pack(before=self.login_button, anchor="w")
             self.confirm.pack(before=self.login_button, anchor="w", pady=8)
             self.login_button.configure(text="Set password and protect data", state="normal")
         else:
-            self.login_description.configure(text=f"Enter your password. {state['attempts_remaining']} attempts remain.")
+            self.login_description.configure(text=f"Enter your password. {state['attempts_remaining']} attempts remain." + explainer)
             self.login_button.configure(text="Unlock", state="normal")
         if state.get("updating") or self.pending_action == "update":
             self.login_button.configure(state="disabled")
@@ -275,11 +406,24 @@ class App(tk.Tk):
 
     def authenticated(self, result):
         self.auth_pending = False
+        self.setup_mode = False
         self.client.token = result["token"]
+        if result.get("front_armed_now"):
+            messagebox.showinfo("This app now opens as Sudoku", "From now on, when this app is locked it shows a "
+                "Sudoku game.\n\nTo unlock: Game → Enter Puzzle Code… (Command-K), then type your password.\n\n"
+                "Six-digit codes just load puzzles. Any other wrong code counts as a wrong password, and three "
+                "in a row erase everything. You can turn this off in Security.", parent=self)
         self.request("snapshot", self.initial_snapshot)
 
     def initial_snapshot(self, data):
         self.clear()
+        security = data.get("security") or {}
+        self.front_enabled = bool(security.get("disguise", True))
+        self.title("Sudoku" if self.front_enabled else "Signal Broadcast")
+        self.container.configure(padding=16)
+        self.configure(background=PALETTE["text_bg"])
+        self.menubar(front=False)
+        self.bind("<Command-l>", lambda _: self.lock())
         self.data = data
         self.sequence = 0
         self.screen = "main" if data["linked"] else "link"
@@ -294,6 +438,10 @@ class App(tk.Tk):
         else:
             self.build_tabs()
         ttk.Label(self.container, textvariable=self.notice, wraplength=680).pack(fill="x", pady=10)
+        failures = security.get("failures_before_unlock", 0)
+        if failures:
+            self.notice.set(f"{failures} wrong {'code was' if failures == 1 else 'codes were'} entered before "
+                            "this unlock. Three in a row erase everything.")
         self.apply_snapshot(data)
 
     def header(self):
@@ -341,7 +489,7 @@ class App(tk.Tk):
         self.tabs = ttk.Notebook(self.container)
         self.tabs.pack(fill="both", expand=True, pady=12)
         frames = {}
-        for name in ("Send", "Notes", "Groups", "Schedule", "Security"):
+        for name in ("Send", "Groups", "Schedule", "Security"):
             frame = ttk.Frame(self.tabs, padding=12)
             self.tabs.add(frame, text=name)
             frames[name] = frame
@@ -405,26 +553,6 @@ class App(tk.Tk):
             self.send_canvas.yview_scroll(-int(event.delta), "units")
         self.bind("<MouseWheel>", scroll_send)
 
-        notes = frames["Notes"]
-        self.notes_button = ttk.Button(notes, text="Check for new notes", command=lambda: self.job("notes"))
-        self.notes_button.pack(anchor="w")
-        ttk.Label(notes, text="Send text and photos to Note to Self on your phone. Notes are saved as they arrive. "
-                  "Full text and all downloaded images are kept. Check Activity for progress.", wraplength=600).pack(anchor="w", pady=(6, 0))
-        self.note_list = tk.Listbox(notes, height=5, exportselection=False)
-        self.note_list.pack(fill="both", expand=True, pady=10)
-        self.note_list.bind("<<ListboxSelect>>", lambda _: self.preview_note())
-        self.note_list.bind("<Double-Button-1>", lambda _: self.use_note())
-        self.note_preview = tk.Text(notes, height=10, wrap="word", state="disabled",
-                                    background=PALETTE["text_bg"], foreground=PALETTE["text_fg"])
-        self.note_preview.pack(fill="both", expand=True)
-        self.note_details = tk.StringVar()
-        ttk.Label(notes, textvariable=self.note_details, wraplength=600).pack(anchor="w", pady=8)
-        row = ttk.Frame(notes)
-        row.pack(fill="x")
-        ttk.Button(row, text="Use as message", command=self.use_note).pack(side="left")
-        ttk.Button(row, text="Copy text", command=self.copy_note).pack(side="left", padx=8)
-        ttk.Button(row, text="Delete local note", command=self.delete_note).pack(side="left", padx=8)
-        self.notes_signature = None
 
         groups = frames["Groups"]
         self.sync_button = ttk.Button(groups, text="Update list from phone", command=lambda: self.job("sync"))
@@ -476,9 +604,26 @@ class App(tk.Tk):
         self.schedule_history_signature = None
 
         security = frames["Security"]
-        ttk.Label(security, text="Manual locking only. There is no inactivity timer.\n"
-            "Locking hides this interface while sending continues.\n"
+        ttk.Label(security, text="Manual locking only (Command-L). There is no inactivity timer.\n"
+            "Locking hides this interface and closes protected storage once nothing is running. "
+            "Scheduled sends still run.\n"
             "Three wrong passwords or Log out and erase stop work and delete local data.", wraplength=600).pack(anchor="w", pady=10)
+        disguise = ttk.LabelFrame(security, text="Sudoku disguise", padding=10)
+        disguise.pack(fill="x", pady=6)
+        self.disguise_enabled = tk.BooleanVar(value=self.front_enabled)
+        ttk.Checkbutton(disguise, text="Show a Sudoku game when this app is locked", variable=self.disguise_enabled,
+                        command=self.save_disguise).pack(anchor="w")
+        ttk.Label(disguise, text="To unlock: Game → Enter Puzzle Code… (Command-K), then type your password. "
+            "Six-digit codes just load puzzles; any other wrong code counts as a wrong password.",
+            wraplength=580).pack(anchor="w", pady=(6, 8))
+        panic_row = ttk.Frame(disguise)
+        panic_row.pack(fill="x")
+        ttk.Button(panic_row, text="Set panic code…", command=self.set_panic_code).pack(side="left")
+        self.panic_remove = ttk.Button(panic_row, text="Remove panic code",
+                                       command=lambda: self.request("panic_code", self.panic_saved, code=None))
+        self.panic_text = tk.StringVar()
+        ttk.Label(disguise, textvariable=self.panic_text, wraplength=580).pack(anchor="w", pady=(6, 0))
+        self.show_panic_state(bool((self.data.get("security") or {}).get("panic_code")))
         ttk.Button(security, text="Change password", command=self.change_password).pack(anchor="w", pady=8)
         ttk.Button(security, text="Lock now", command=self.lock).pack(anchor="w", pady=8)
         ttk.Button(security, text="Log out and erase", command=self.erase).pack(anchor="w", pady=8)
@@ -501,14 +646,15 @@ class App(tk.Tk):
     def poll(self):
         if self.screen == "main":
             self.refresh_elapsed()
-        if self.screen != "login" and not self.polling:
+        if self.screen not in ("login", "front") and not self.polling:
             self.polling = True
             self.request("snapshot", self.apply_snapshot, after=self.sequence)
-        elif self.screen == "login" and not self.polling:
+        elif self.screen in ("login", "front") and not self.polling and not self.auth_pending:
             self.polling = True
+            handler = self.login_status if self.screen == "login" else self.front_status
             def status(value):
                 self.polling = False
-                self.login_status(value)
+                handler(value)
             self.request("status", status)
         self.after(1000, self.poll)
 
@@ -523,6 +669,9 @@ class App(tk.Tk):
         self.data = data
         self.busy = bool(data["job"])
         self.snapshot_time = time.monotonic()
+        if (data.get("security") or {}).get("link_removed"):
+            self.notice.set("Signal reports this Mac was removed from Linked Devices. If a second check confirms it, "
+                            "all local data on this Mac will be erased.")
         if self.screen == "main":
             signature = [(g["group_id"], g["name"], g["enabled"]) for g in data["groups"]]
             if signature != self.group_signature:
@@ -531,18 +680,6 @@ class App(tk.Tk):
                 self.group_choices = {gid: self.group_choices[gid] for gid, _, _ in signature}
                 self.group_signature = signature
                 self.render_groups()
-            notes_sig = [(n["ts"], n.get("text", ""), len(n.get("photos", []))) for n in data["notes"]]
-            if notes_sig != self.notes_signature:
-                selected = self.note_list.curselection()
-                selected_ts = self.notes_signature[selected[0]][0] if selected and self.notes_signature else None
-                self.note_list.delete(0, "end")
-                for timestamp, text, count in notes_sig:
-                    self.note_list.insert("end", f"{datetime.fromtimestamp(timestamp / 1000):%d %b %H:%M}  {text[:80]}  ({count} photos)")
-                self.notes_signature = notes_sig
-                if notes_sig:
-                    index = next((i for i, n in enumerate(data["notes"]) if n["ts"] == selected_ts), 0)
-                    self.note_list.selection_set(index)
-                self.preview_note()
         for event in data["events"]:
             if event["id"] <= self.sequence:
                 continue
@@ -577,8 +714,7 @@ class App(tk.Tk):
                 elif kind == "phase":
                     text = {"preparing": "Preparing your saved message and photos…",
                             "sending": "Sending your message. Photo uploads can take a while.",
-                            "sync": "Getting the latest groups from Signal…",
-                            "notes": "Receiving notes and downloading their photos…"}.get(value)
+                            "sync": "Getting the latest groups from Signal…"}.get(value)
                     if text:
                         self.add_activity(text)
                 elif kind in ("stopped", "finished", "paused"):
@@ -629,7 +765,6 @@ class App(tk.Tk):
             f"{summary['sent']} sent, {summary['failed']} failed, "
             f"{summary.get('skipped', 0)} skipped, {summary.get('uncertain', 0)} unconfirmed, "
             f"{summary.get('pending', 0)} pending.")
-        self.notes_button.configure(state="disabled" if blocked else "normal")
         self.sync_button.configure(state="disabled" if blocked else "normal")
         self.message.configure(state="disabled" if sending else "normal")
         if self.photo_strip._enabled == bool(sending):
@@ -824,28 +959,9 @@ class App(tk.Tk):
         self.photos_changed([])
         self.refresh_images()
 
-    def selected_note(self):
-        selected = self.note_list.curselection()
-        notes = self.data.get("notes", [])
-        return notes[selected[0]] if selected and selected[0] < len(notes) else None
 
-    def preview_note(self):
-        note = self.selected_note() or {}
-        self.note_preview.configure(state="normal")
-        self.note_preview.delete("1.0", "end")
-        self.note_preview.insert("1.0", note.get("text", ""))
-        self.note_preview.configure(state="disabled")
-        details = f"{len(note.get('photos', []))} photos"
-        if note.get("missing_photos") or note.get("missing_body"):
-            details += ". Incomplete download; forward the original note again."
-        self.note_details.set(details if note else "")
 
-    def copy_note(self):
-        note = self.selected_note()
-        if note:
-            self.clipboard_clear()
-            self.clipboard_append(note.get("text", ""))
-            self.notice.set("Note text copied.")
+
 
     def render_groups(self):
         query = self.group_query.get().casefold().strip()
@@ -874,20 +990,34 @@ class App(tk.Tk):
             self.job("retry")
 
     def check_update(self):
-        state = self.login_state if self.screen == "login" else self.data
+        front = self.screen == "front"
+        state = self.login_state if self.screen in ("login", "front") else self.data
         if self.pending_action or state.get("job") or state.get("background_running") or self.auth_pending:
-            self.notice.set("Wait for the active operation before updating.")
+            if front:
+                messagebox.showinfo("Software update", "Try again in a few minutes.", parent=self)
+            else:
+                self.notice.set("Wait for the active operation before updating.")
             return
         update = state.get("update") or {}
         if update.get("changed"):
+            # Behind the game, the wording must not mention what the app really is.
             if update.get("needs_setup"):
-                if messagebox.askyesno("Finish installing update?", "Open the installer to update dependencies and restart the app? Your vault and Signal link are kept.", parent=self):
+                if messagebox.askyesno("Finish installing update?", "Install the update now? The installer opens in Terminal."
+                                       if front else "Open the installer to update dependencies and restart the app? "
+                                       "Your vault and Signal link are kept.", parent=self):
                     subprocess.Popen(["/usr/bin/open", "-a", "Terminal", str(Path(__file__).with_name("Setup.command"))])
                     self.close()
-            elif messagebox.askyesno("Restart to update?", "Restart the app and its background service now? Your Signal link and saved data are kept. Enter your local password after restarting; no QR code or relinking is needed.", parent=self):
+            elif messagebox.askyesno("Restart to update?", "Restart now to finish the update?" if front else
+                    "Restart the app and its background service now? Your Signal link and saved data are kept. "
+                    "Enter your local password after restarting; no QR code or relinking is needed.", parent=self):
                 self.request("restart_update", self.restart_updated_app, on_error=self.action_failed)
             return
         self.update_prompted = False
+        if front:
+            # Report only once the job has started, so an older result is never shown.
+            self.request("update", lambda _: setattr(self, "front_update_pending", True), on_error=lambda _: messagebox.showinfo(
+                "Software update", "Couldn't check for updates. Try again later.", parent=self))
+            return
         self.pending_action = "update"
         if self.screen == "login":
             self.refresh_login_update()
@@ -903,31 +1033,10 @@ class App(tk.Tk):
             self.job("update")
 
     def restart_updated_app(self, _):
-        self.show_login("Restarting the updated app…")
+        self.show_locked("Restarting the updated app…")
         self.after(1500, lambda: os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve())]))
 
-    def use_note(self):
-        if self.pending_action or self.data.get("job") in ("send", "resume", "retry", "update"):
-            self.notice.set("Wait for the broadcast to stop before replacing the draft.")
-            return
-        selected = self.note_list.curselection()
-        if not selected:
-            return
-        note = self.data["notes"][selected[0]]
-        paths = [photo["path"] for photo in note.get("photos", []) if photo.get("path")]
-        if note.get("missing_photos") or note.get("missing_body") or len(paths) != len(note.get("photos", [])):
-            self.notice.set("Some note attachments are missing. Forward the original note again, then check for new notes.")
-            return
-        self.message.delete("1.0", "end")
-        self.message.insert("1.0", note.get("text", ""))
-        self.images = paths
-        self.refresh_images()
-        self.tabs.select(0)
 
-    def delete_note(self):
-        selected = self.note_list.curselection()
-        if selected:
-            self.request("delete_note", timestamp=self.data["notes"][selected[0]]["ts"])
 
     def toggle_group(self, event):
         item = self.group_list.identify_row(event.y)
@@ -966,11 +1075,45 @@ class App(tk.Tk):
             return
         self.request("change_password", lambda _: self.notice.set("Password changed."), current=current, new=new)
 
+    def save_disguise(self):
+        enabled = self.disguise_enabled.get()
+        def saved(_):
+            self.front_enabled = enabled
+            self.title("Sudoku" if enabled else "Signal Broadcast")
+            self.notice.set("The app will show Sudoku when locked." if enabled
+                            else "The app will show the password screen when locked.")
+        self.request("disguise", saved, on_error=self.action_failed, enabled=enabled)
+
+    def show_panic_state(self, active):
+        if active:
+            self.panic_remove.pack(side="left", padx=8)
+        else:
+            self.panic_remove.pack_forget()
+        self.panic_text.set("A panic code is set. Typing it as a puzzle code erases everything at once, "
+                            "while the game keeps showing." if active else
+                            "Optional: a panic code typed as a puzzle code erases everything at once, "
+                            "while the game keeps showing.")
+
+    def panic_saved(self, _=None):
+        self.request("snapshot", lambda data: self.show_panic_state(bool((data.get("security") or {}).get("panic_code"))))
+        self.notice.set("Panic code saved.")
+
+    def set_panic_code(self):
+        code = simpledialog.askstring("Panic code", "New panic code (4–64 characters, not your password, "
+                                      "not six digits):", show="•", parent=self)
+        if not code:
+            return
+        if simpledialog.askstring("Panic code", "Type the panic code again:", show="•", parent=self) != code:
+            self.notice.set("Panic codes did not match. Nothing changed.")
+            return
+        self.request("panic_code", self.panic_saved, on_error=self.action_failed, code=code)
+
     def lock(self):
         token = self.client.token
         client = Client(self.client.root)
         client.token = token
-        self.show_login()
+        self.unbind("<Command-l>")
+        self.show_locked()
         def work():
             try:
                 client.call("lock")
@@ -982,9 +1125,15 @@ class App(tk.Tk):
         if messagebox.askyesno("Log out and erase?", "Stop every broadcast and schedule and erase all data stored by "
                 "this app, including imported images?\n\nYou must set a password and link again. "
                 "Messages already sent and your phone are unaffected.", default="no", icon="warning"):
+            self.erase_pending = True
             self.show_login("Erasing local data…")
-            self.request("erase", lambda _: self.show_login("Local data erased. Remove this device from Signal's "
-                "Linked Devices on your phone if it is still listed."), confirmed=True)
+            def erased(_):
+                self.erase_pending = False
+                messagebox.showinfo("Local data erased", "Remove this device from Signal's Linked Devices on your "
+                                    "phone if it is still listed.", parent=self)
+                self.front_enabled = True
+                self.show_locked()
+            self.request("erase", erased, confirmed=True)
 
     def close(self):
         self.closing.set()

@@ -18,7 +18,34 @@ interface is separate and does **not** implement this Mac password protection.
    Keychain helper, installs the per-user background service and builds the Dock app.
 3. Set and confirm a password of at least 12 characters. Spaces and paste work.
 4. Scan the QR code from Signal on your phone under **Settings → Linked Devices**.
-5. Drag **Signal Broadcast.app** to the Dock.
+5. Drag **Sudoku.app** to the Dock. If an old **Signal Broadcast** icon is pinned,
+   remove it.
+
+## Sudoku front (on by default)
+
+When the app is locked it looks and plays like an ordinary offline Sudoku game: its
+window, menu bar, Dock name and icon all say Sudoku.
+
+- **Unlock:** choose **Game → Enter Puzzle Code…** (or press Command-K), type your
+  password and press Load.
+- **Six-digit codes** such as `482913` only load a puzzle. They never count as attempts.
+- **Any other wrong code** counts as a wrong password. Three in a row erase everything,
+  exactly like the password screen. The game only ever says "Invalid puzzle code."
+- **Playing never counts.** Wrong digits, Check, Hint and new games have no effect on
+  the counter.
+- **Panic code (optional):** set one under **Security → Sudoku disguise**. Typing it
+  as a puzzle code erases everything immediately, while the game keeps showing.
+- **Turn it off** under **Security → Sudoku disguise**. The app then shows the normal
+  password screen when locked.
+- **First run after updating:** the password screen appears once more, with an
+  explanation. The Sudoku front switches on after that successful unlock.
+- **After an erase** the app is just Sudoku. Run `Setup.command` to set up again.
+- Press **Command-L** to lock back to Sudoku at any time.
+
+The disguise only stops a casual look. The source code is public, and the project folder,
+`~/Library/Application Support/Signal Broadcast`, the background service and its
+`java` Signal process can still be found by someone who digs. Your data is protected
+by the encryption, sealing and erasure described below, not by the game.
 
 Existing installations must also set a password. Setup does not silently encrypt or
 wipe their data. After password setup, migration copies the existing Signal store,
@@ -46,17 +73,19 @@ until you lock it, close the window, or lock the Mac screen.
 
 | Action | What happens |
 |---|---|
-| **Lock now** | Hide the interface and require the password. Background work continues. |
+| **Lock now** (Command-L) | Show Sudoku and require the password. Background work continues. Once nothing is running, protected storage is closed (sealed). |
 | Close window or Cmd-Q | Close and lock the interface. Background work continues. |
 | Reopen | Require the password before showing any account details or content. |
 | Lock the Mac | Lock the app interface. Background work can continue while the Mac is awake. |
 | Sleep | macOS pauses execution. No data is erased. |
 | Mac logout, reboot or service restart | Keep encrypted data; require an initial password unlock before sending resumes. |
 | **Log out and erase** | After confirmation, stop broadcasts and schedules and erase this installation's data. |
-| Third consecutive wrong password | Automatically perform the same erasure. |
+| Third consecutive wrong password or puzzle code | Automatically perform the same erasure. |
+| Panic code typed as a puzzle code | Perform the same erasure at once. |
+| This Mac removed from the phone's Linked Devices | Confirmed by two checks at least 10 minutes apart, then the same erasure. |
 
-**Log out and erase** is available on the password screen and in Security settings.
-It does not require the password. A person who can reach this screen can deliberately
+**Log out and erase** is available in Security settings, and on the password screen
+when the Sudoku front is off. It does not require the password. A person who can reach this screen can deliberately
 erase the installation. There is no way to recover an erased vault through this app.
 
 Successful authentication resets the attempt count. Wrong current passwords in
@@ -177,9 +206,24 @@ local file-based Mac Keychain without iCloud synchronization. The user password 
 unwrapped vault password are not saved. The app excludes its storage from Time
 Machine and its vault from Spotlight indexing.
 
-The background service retains decrypted access while it runs. **Lock now is an
-interface lock**, not a sealed storage state. Full sealing happens when that service
-stops and detaches the vault. After erasure the service restarts with a fresh process.
+While the app is locked and idle, the vault is **detached**: Finder and Terminal see
+no decrypted files. The background service keeps the vault key in memory only, so it
+can reopen the vault for a due scheduled send or a link check, then closes it again.
+The vault stays open while a broadcast, Notes check or group update is running, and
+detaching waits if a Finder window or file inside the vault is still open. Restarting
+the service or the Mac forgets the key. After erasure the service restarts with a fresh
+process.
+
+**Unlinking from the phone erases this Mac.** The service checks the link shortly after
+each unlock, after a failed send or receive, and every six hours. If Signal says this
+device was removed, sending is blocked. If a second check at least 10 minutes later says
+the same, all local data is erased. Network errors and timeouts never count. A Mac that
+is off, or whose service has restarted and not yet been unlocked, notices at the next
+unlock.
+
+**Copy text** in Notes uses a private clipboard. The text stays on this Mac (no Universal
+Clipboard), clipboard managers are asked to skip it, and it is cleared when the app locks
+or quits if you have not copied anything else since.
 
 Keep FileVault enabled. This source-built app is not an OS sandbox, a hardware retry
 counter or a replacement for GrapheneOS security. Modified code, a compromised Mac,

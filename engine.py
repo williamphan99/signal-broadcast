@@ -44,6 +44,9 @@ import notes_receiver
 # elsewhere the portable CLI core (engine send loop + broadcast.py) is what's used.
 IS_DARWIN = sys.platform == "darwin"
 PRIVATE_TRANSPORT = False  # Enabled only by the protected Mac worker.
+# The Mac app has no Notes page. Its worker turns this off so Note-to-Self text and
+# media that arrive during a group refresh are deleted instead of kept.
+KEEP_NOTES = True
 DISPATCH_GUARD = nullcontext
 
 # Everything resolves relative to this file, so behaviour is identical whether a
@@ -86,7 +89,8 @@ class UpdateResult:
 
 UPDATE_SETUP_FILES = ("Setup.command", "scripts/make-dock-app.sh", "requirements-macos.txt",
                       "scripts/install-mac-service.py", "scripts/mac-security.swift",
-                      "scripts/mac-thumbnail.swift", "notes_receiver.py", "scripts/signal-cli-notes")
+                      "scripts/mac-thumbnail.swift", "scripts/mac-icon.swift",
+                      "notes_receiver.py", "scripts/signal-cli-notes")
 
 
 def _git_head() -> str | None:
@@ -1031,6 +1035,37 @@ def _link_is_broken_unlocked() -> bool:
     return not any(e.get("number") or e.get("account") for e in accounts)
 
 
+# Signal's answer when this linked device was removed under the phone's Linked
+# Devices. Deliberately narrower than ACCOUNT_UNUSABLE_PATTERN: bare 401/403 text,
+# timeouts and connection errors must never look like a removal, because the Mac
+# app erases itself when it sees this twice.
+LINK_REMOVED_PATTERN = re.compile(r"user\s+\S+\s+is not registered|authorization failed", re.IGNORECASE)
+
+
+def probe_link() -> str:
+    """Ask Signal whether this device is still linked: "ok", "removed" or "unknown".
+
+    listDevices is an authenticated request that does not consume queued messages,
+    so it cannot lose a Note to Self. Anything inconclusive is "unknown"."""
+    with signal_cli_operation("checking the link"):
+        if _link_is_broken_unlocked():
+            return "removed"
+        try:
+            binary = signal_cli_bin()
+            account = load_config().account
+        except BroadcastError:
+            return "unknown"
+        try:
+            proc = subprocess.run(_cli(binary, "--config", str(DATA_DIR), *_account_args(account), "listDevices"),
+                                  capture_output=True, text=True, errors="replace",
+                                  timeout=SIGNAL_CONTROL_TIMEOUT_S, env=_signal_env(binary))
+        except (OSError, subprocess.SubprocessError):
+            return "unknown"
+        if proc.returncode == 0:
+            return "ok"
+        return "removed" if LINK_REMOVED_PATTERN.search(f"{proc.stdout}\n{proc.stderr}") else "unknown"
+
+
 def _request_sync(binary: str, account: str) -> None:
     """Best-effort nudge: ask the phone (primary) to (re)send contacts + groups.
     Ignored on failure — the phone usually pushes a sync on linking anyway."""
@@ -1534,8 +1569,19 @@ def _attachment_path(att: dict) -> Path | None:
     return DATA_DIR / "attachments" / attachment_id
 
 
+def _remove_note_file(path: Path) -> None:
+    try:
+        if path.is_relative_to(DATA_DIR) and path.is_file() and not path.is_symlink():
+            path.unlink()
+    except OSError:
+        pass
+
+
 def _apply_downloaded_note_attachment(note: dict, att: dict, path: Path) -> None:
     """Add one already-decrypted attachment to its customer-facing note field."""
+    if not KEEP_NOTES:
+        _remove_note_file(path)
+        return
     if att.get("contentType") == LONG_MESSAGE_MIME:
         try:
             note["text"] = path.read_text(encoding="utf-8", errors="replace")
@@ -1810,6 +1856,23 @@ def store_notes(found: list[dict]) -> int:
         return changed
 
 
+def discard_notes() -> int:
+    """Delete every stored note, its downloaded photos and any damaged notes file."""
+    with _notes_transaction():
+        try:
+            notes = json.loads(NOTES_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            notes = []
+        notes = [note for note in notes if isinstance(note, dict)] if isinstance(notes, list) else []
+        for note in notes:
+            for photo in note.get("photos", []):
+                if isinstance(photo, dict) and isinstance(photo.get("path"), str):
+                    _remove_note_file(Path(photo["path"]))
+        for path in (NOTES_FILE, NOTES_CORRUPT_FILE):
+            path.unlink(missing_ok=True)
+    return len(notes)
+
+
 def delete_note(timestamp: int) -> None:
     """Delete one stored note without racing a receive in another process."""
     with _notes_transaction():
@@ -1949,6 +2012,8 @@ def _receive_once(binary: str, account: str, idle_seconds: int, temporary: Path,
             return dict(warning_counts), last_warning
 
     def save_note(note):
+        if not KEEP_NOTES:
+            return  # Its attachments were already deleted as they arrived.
         changed = store_notes([note])
         counters["new"] += changed
         counters["missing_attachments"] += note.get("missing_photos", 0) + bool(note.get("missing_body"))

@@ -179,9 +179,9 @@ class ScheduleTests(unittest.TestCase):
         self.service.job = None
         (self.vault.root / 'worker.json').unlink()
 
-    def test_notes_and_sync_prevent_idle_sleep_and_record_cancellation(self):
+    def test_sync_prevents_idle_sleep_and_records_cancellation(self):
         self.prepare()
-        for kind in ('notes', 'sync'):
+        for kind in ('sync',):
             with self.subTest(kind=kind):
                 process = mock.Mock(pid=999999)
                 with mock.patch.object(self.service, 'spawn', return_value=process) as spawn, \

@@ -1,24 +1,41 @@
 #!/usr/bin/env bash
-# Build "Signal Broadcast.app" — a Dock-pinnable launcher that opens the app with
-# no Terminal window. Setup.command runs this automatically; you can also run it
+# Build "Sudoku.app" — a Dock-pinnable launcher that opens the app with no Terminal
+# window. Its name and icon match the Sudoku front shown while the app is locked. Setup.command runs this automatically; you can also run it
 # by hand to rebuild:  bash scripts/make-dock-app.sh [/path/to/python3]
 set -uo pipefail
 cd "$(dirname "$0")/.."          # project root, whatever the working directory was
 PROJECT="$PWD"
 PY="${1:-}"                      # preferred python (Setup passes the one it found)
 
-APP="Signal Broadcast.app"
+APP="Sudoku.app"
 MACOS="$APP/Contents/MacOS"
-rm -rf "$APP"
-mkdir -p "$MACOS"
+RESOURCES="$APP/Contents/Resources"
+rm -rf "$APP" "Signal Broadcast.app"   # the old, revealing launcher name
+mkdir -p "$MACOS" "$RESOURCES"
+
+# Icon: drawn by a Swift helper, then packed into an .icns. A missing icon is harmless.
+ICON_KEY=""
+if [ -f vendor/sudoku-icon.png ]; then
+  ICONSET="$(mktemp -d)/Sudoku.iconset"
+  mkdir -p "$ICONSET"
+  for size in 16 32 128 256 512; do
+    sips -z $size $size vendor/sudoku-icon.png --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+    sips -z $((size * 2)) $((size * 2)) vendor/sudoku-icon.png --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+  done
+  if iconutil -c icns "$ICONSET" -o "$RESOURCES/Sudoku.icns"; then
+    ICON_KEY="<key>CFBundleIconFile</key><string>Sudoku</string>"
+  fi
+  rm -rf "$(dirname "$ICONSET")"
+fi
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>CFBundleName</key><string>Signal Broadcast</string>
-  <key>CFBundleDisplayName</key><string>Signal Broadcast</string>
-  <key>CFBundleIdentifier</key><string>com.user.signal-broadcast.launcher</string>
+  <key>CFBundleName</key><string>Sudoku</string>
+  <key>CFBundleDisplayName</key><string>Sudoku</string>
+  <key>CFBundleIdentifier</key><string>local.sudoku.launcher</string>
+  $ICON_KEY
   <key>CFBundleVersion</key><string>1.0</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>
@@ -43,7 +60,7 @@ for PY in "$PY" /usr/local/bin/python3 /opt/homebrew/bin/python3 \\
     exec "\$PY" "$PROJECT/gui.py"
   fi
 done
-osascript -e 'display alert "Signal Broadcast" message "Python is not set up yet. Open the project folder and double-click Setup.command, then try again."'
+osascript -e 'display alert "Sudoku" message "Python is not set up yet. Open the project folder and double-click Setup.command, then try again."'
 exit 1
 LAUNCH
 chmod +x "$MACOS/launcher"

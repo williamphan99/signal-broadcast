@@ -49,7 +49,6 @@ class MacUITests(unittest.TestCase):
                 app.initial_snapshot(data)
                 app.update()
                 app.fixture_snapshot = data
-                self.assertEqual(app.note_preview.get("1.0", "end-1c"), "Full note " * 30)
                 self.assertEqual(app.update_button.cget("text"), "Update")
                 app.group_query.set("No match")
                 app.save_groups()
@@ -63,7 +62,7 @@ class MacUITests(unittest.TestCase):
                 app.preview_style()
                 app.save()
                 self.assertEqual(app.requests[-1][1]["message_style"], "bold")
-                app.tabs.select(3)
+                app.tabs.select(2)
                 app.refresh_schedule({"enabled": True, "times": ["12:00"], "pending": "2026-09-05 12:00",
                                       "history": [{"at": "2026-09-05T12:01:00", "state": "waiting",
                                                    "message": "Waiting for the current operation to finish."}]})
@@ -160,19 +159,6 @@ class MacUITests(unittest.TestCase):
                 self.assertIn("1 unconfirmed groups will not be resent", app.recovery_text.cget("text"))
                 self.assertEqual(str(app.resume_button.cget("state")), "normal")
                 app.apply_snapshot({**data, "sequence": 8})
-                album = []
-                for index in range(16):
-                    photo = Path(directory) / f"note-{index}.png"
-                    photo.write_bytes(png_bytes())
-                    album.append(str(photo))
-                full_text = "Complete album caption. " * 1500
-                app.apply_snapshot({**data, "sequence": 9, "job": "notes",
-                    "notes": [{"ts": 2, "text": full_text, "photos": [{"path": p} for p in album]}],
-                    "events": [{"id": 9, "kind": "receive_status", "value": "Receiving: 16 images saved."}]})
-                self.assertIn("16 images saved", app.notice.get())
-                app.use_note()
-                self.assertEqual(app.images, album)
-                self.assertEqual(app.message.get("1.0", "end-1c"), full_text)
                 app.images = paths * 5
                 app.refresh_images()
                 app.update()
@@ -206,7 +192,7 @@ class MacUITests(unittest.TestCase):
                 self.assertIsNotNone(strip._tips[0].window)
                 app.show_login()
                 app.update()
-                app.login_status({"state": "sealed", "setup_required": False, "attempts_remaining": 3,
+                app.login_status({"state": "sealed", "front": False, "setup_required": False, "attempts_remaining": 3,
                                   "background_running": False, "updating": False, "update": None})
                 self.assertTrue(app.update_button.winfo_viewable())
                 self.assertEqual(str(app.update_button.cget("state")), "normal")
@@ -215,7 +201,7 @@ class MacUITests(unittest.TestCase):
                 self.assertEqual(str(app.login_button.cget("state")), "disabled")
                 self.assertTrue(app.login_update_progress.winfo_manager())
                 app.callbacks["update"]({"started": "update"})
-                app.callbacks["status"]({"state": "sealed", "setup_required": False, "attempts_remaining": 3,
+                app.callbacks["status"]({"state": "sealed", "front": False, "setup_required": False, "attempts_remaining": 3,
                     "background_running": False, "updating": False, "update": {"changed": True, "needs_setup": False}})
                 self.assertEqual(app.update_button.cget("text"), "Finish update")
                 self.assertFalse(app.login_update_progress.winfo_manager())
@@ -232,6 +218,50 @@ class MacUITests(unittest.TestCase):
             finally:
                 app.destroy()
 
+    def test_sudoku_front_unlocks_with_password_and_relocks(self):
+        from mac_app import App
+        with isolated_engine(), tempfile.TemporaryDirectory(prefix="sb-ui-front-") as directory:
+            root = Path(directory).resolve()
+            project = root / "project"
+            project.mkdir()
+            vault = DirectoryVault(root / "vault", project, MemoryKeychain())
+            service = Service(vault, retire=lambda _: None)
+            service.authenticate(PASSWORD, setup=True)
+            service.lock()
+            server = serve(service, socket_path(vault.root))
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            game = mock.patch("sudoku.STATE_FILE", root / "game.json")
+            game.start()
+            self.addCleanup(game.stop)
+            app = App(Client(vault.root))
+            def pump(predicate, timeout=10):
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    app.update()
+                    if predicate():
+                        return
+                    time.sleep(0.01)
+                self.fail(f"UI condition not reached; screen={app.screen}")
+            replies = []
+            try:
+                pump(lambda: app.screen == "front")
+                self.assertEqual(app.title(), "Sudoku")
+                app.front_code("not the password", replies.append)
+                pump(lambda: replies == ["invalid"])
+                self.assertEqual(app.screen, "front")
+                self.assertEqual(service.status()["attempts_remaining"], 2)
+                app.front_code(PASSWORD, replies.append)
+                pump(lambda: app.screen in ("main", "link"))
+                self.assertEqual(replies, ["invalid", "ok"])
+                self.assertIn("1 wrong code", app.notice.get())
+                app.lock()
+                pump(lambda: app.screen == "front" and service.token is None)
+            finally:
+                app.destroy()
+                server.shutdown()
+                server.server_close()
+                socket_path(vault.root).unlink(missing_ok=True)
+
     def test_login_manual_lock_close_reopen_and_erase(self):
         from mac_app import App
         with isolated_engine(), tempfile.TemporaryDirectory(prefix="sb-ui-tests-") as directory:
@@ -245,6 +275,7 @@ class MacUITests(unittest.TestCase):
             vault = DirectoryVault(root / "vault", project, MemoryKeychain())
             service = Service(vault, retire=lambda _: None)
             service.authenticate(PASSWORD, setup=True)
+            service.set_disguise(False)  # This test covers the plain password screen.
             service.lock()
             server = serve(service, socket_path(vault.root))
             threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -258,7 +289,7 @@ class MacUITests(unittest.TestCase):
                     time.sleep(0.01)
                 self.fail(f"UI condition not reached; screen={app.screen}, notice={app.notice.get()}")
             try:
-                pump(lambda: str(app.login_button.cget("state")) == "normal")
+                pump(lambda: app.screen == "login" and str(app.login_button.cget("state")) == "normal")
                 self.assertEqual(app.screen, "login")
                 self.assertEqual(app.data, {})
                 app.password.insert(0, PASSWORD)
@@ -272,8 +303,7 @@ class MacUITests(unittest.TestCase):
                 pump(lambda: app.screen == "login" and service.token is None)
                 self.assertIs(service.job, job)
                 self.assertEqual(app.data, {})
-                self.assertIsNone(app.notes_signature)
-                pump(lambda: str(app.login_button.cget("state")) == "normal")
+                pump(lambda: app.screen == "login" and str(app.login_button.cget("state")) == "normal")
                 app.password.insert(0, PASSWORD)
                 app.login()
                 pump(lambda: app.screen == "main")
@@ -281,7 +311,7 @@ class MacUITests(unittest.TestCase):
                 self.assertIsNone(service.token)
                 self.assertIs(service.job, job)
                 app = App(Client(vault.root))
-                pump(lambda: str(app.login_button.cget("state")) == "normal")
+                pump(lambda: app.screen == "login" and str(app.login_button.cget("state")) == "normal")
                 self.assertEqual(app.screen, "login")
                 app.password.insert(0, PASSWORD)
                 app.login()
@@ -290,7 +320,7 @@ class MacUITests(unittest.TestCase):
                 self.assertIsNone(service.token)
                 self.assertIs(service.job, job)
                 app = App(Client(vault.root))
-                pump(lambda: str(app.login_button.cget("state")) == "normal")
+                pump(lambda: app.screen == "login" and str(app.login_button.cget("state")) == "normal")
                 started, release, authenticated = threading.Event(), threading.Event(), threading.Event()
                 authenticate = service.authenticate
                 def delayed_authentication(*args, **kwargs):
@@ -314,11 +344,13 @@ class MacUITests(unittest.TestCase):
                     self.assertIsNone(service.token)
                     self.assertIs(service.job, job)
                 app = App(Client(vault.root))
-                pump(lambda: str(app.login_button.cget("state")) == "normal")
+                pump(lambda: app.screen == "login" and str(app.login_button.cget("state")) == "normal")
                 service.job = None
-                with mock.patch("mac_app.messagebox.askyesno", return_value=True):
+                with mock.patch("mac_app.messagebox.askyesno", return_value=True), \
+                     mock.patch("mac_app.messagebox.showinfo") as told:
                     app.erase()
-                pump(lambda: app.screen == "login" and app.setup_required)
+                    pump(lambda: app.screen == "front")  # After an erase the app is just Sudoku.
+                told.assert_called_once()
                 self.assertFalse(vault.image.exists())
                 self.assertIsNone(vault.keychain.load())
             finally:
