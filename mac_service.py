@@ -664,8 +664,10 @@ class Service:
                 if self.on_restart:
                     self.on_restart()
                 return
-            if self.vault.marker.exists() and not self.shutting_down and time.monotonic() >= self.erase_retry_at:
-                # Finish an interrupted wipe without anyone pressing a button on the front.
+            if ((self.vault.marker.exists() or self.erasing) and not self.shutting_down
+                    and time.monotonic() >= self.erase_retry_at):
+                # Finish an interrupted wipe without anyone pressing a button on the front,
+                # including one whose intent only reached the Keychain (full disk).
                 self.erase_retry_at = time.monotonic() + 60
                 try:
                     self.erase()
