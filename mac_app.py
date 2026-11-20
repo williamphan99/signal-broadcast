@@ -179,6 +179,14 @@ class App(tk.Tk):
         threading.Thread(target=work, daemon=not authenticating).start()
 
     def drain(self):
+        # A failing callback must never stop the response loop, or locks and
+        # unlocks would silently stop reaching the window.
+        try:
+            self._drain_responses()
+        finally:
+            self.after(80, self.drain)
+
+    def _drain_responses(self):
         while True:
             try:
                 generation, callback, value, error = self.responses.get_nowait()
@@ -200,7 +208,6 @@ class App(tk.Tk):
                     self.login_button.configure(state="normal")
             elif callback:
                 callback(value)
-        self.after(80, self.drain)
 
     def clear(self):
         self.unbind("<MouseWheel>")

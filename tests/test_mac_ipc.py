@@ -122,7 +122,7 @@ class ResponseRevocationTests(unittest.TestCase):
             with self.subTest(code=code):
                 app = mock.Mock(generation=0, screen="main", responses=queue.Queue())
                 app.responses.put((0, None, None, SecurityError("Reworded explanation", code=code)))
-                App.drain(app)
+                App._drain_responses(app)
                 app.show_locked.assert_called_once_with("Reworded explanation")
 
     def test_failed_teardown_after_third_current_password_attempt_revokes_ui(self):

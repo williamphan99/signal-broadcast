@@ -455,7 +455,9 @@ class SudokuView(tk.Frame):
         row.pack(fill="x", pady=(10, 0))
         pending = {"active": False}
 
-        def close():
+        def close(force=False):
+            if pending["active"] and not force:
+                return  # The service is still answering; the reply closes or resets the dialog.
             self.dialog = None
             dialog.destroy()
             if self.winfo_exists():
@@ -468,6 +470,7 @@ class SudokuView(tk.Frame):
             if answer == "ok":
                 close()
                 return
+            message.configure(foreground=c["bad"])
             entry.configure(state="normal")
             entry.delete(0, "end")
             entry.focus_set()
@@ -489,7 +492,7 @@ class SudokuView(tk.Frame):
             pending["active"] = True
             message.configure(text="Loading…", foreground=c["muted"])
             entry.configure(state="disabled")
-            self.on_code(text, lambda answer: (message.configure(foreground=c["bad"]), reply(answer)))
+            self.on_code(text, reply)
 
         Pill(row, "Cancel", close, c, font=self.fonts["button"]).pack(side="right", padx=(6, 0))
         Pill(row, "Load", submit, c, accent=True, font=self.fonts["button"]).pack(side="right")
@@ -504,9 +507,9 @@ class SudokuView(tk.Frame):
 
     def destroy(self):
         self.save_state()
-        if self.dialog:
+        if self.dialog and self.dialog.winfo_exists():
             self.dialog.destroy()
-            self.dialog = None
+        self.dialog = None
         super().destroy()
 
 
