@@ -1,8 +1,11 @@
 # Sudoku front and security hardening: plan and gap report
 
-Status: phases 1 and 2 are implemented on the `sudoku-front` branch. Not done:
-the Argon2 upgrade (3.5), iCloud/Photos import warnings (3.4) and phase 3 renames.
-Scope is the Mac app.
+Status: implemented on the `sudoku-front` branch, including phase 3 (neutral names,
+installation as `~/Applications/Sudoku.app`, migration). Decisions taken since this
+report: the unlock is two steps with the same password (puzzle code, then the password
+screen); the Notes page is removed; unlink erasure needs three server-confirmed
+rejections over an hour. Not done: the Argon2 memory upgrade (3.5) and the
+iCloud/Photos import warning (3.4). The README is the current user-facing description.
 
 ## 1. What exists today
 

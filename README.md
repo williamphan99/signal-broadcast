@@ -3,68 +3,91 @@
 A local Mac app for sending a message and images to selected Signal groups. It links
 as a secondary device. Your phone remains the primary Signal device.
 
-The Mac version requires a password and stores its data in an encrypted vault on
-that Mac. Source code stays on GitHub. There is no app account, hosted backend,
-analytics, password-recovery server or cloud backup feature. Signal traffic and
-software downloads still use Signal and the software providers' services.
+On the Mac it installs as **Sudoku.app**: when locked it is an ordinary Sudoku game,
+and the broadcast app sits behind it with a password and an encrypted vault. Source
+code stays on GitHub. There is no app account, hosted backend, analytics,
+password-recovery server or cloud backup feature. Everything is stored on the Mac.
+The only network traffic is Signal's own servers, plus GitHub and Homebrew when you
+run Update or Setup.
 
 For Pixel/Termux instructions, see [PIXEL-SETUP.md](PIXEL-SETUP.md). The Pixel web
 interface is separate and does **not** implement this Mac password protection.
 
 ## Installation and upgrades
 
-1. Clone this repository to a folder you will keep on the Mac.
-2. Double-click **Setup.command**. It installs the dependencies, compiles the local
-   Keychain helper, installs the per-user background service and builds the Dock app.
-3. Set and confirm a password of at least 12 characters. Spaces and paste work.
-4. Scan the QR code from Signal on your phone under **Settings → Linked Devices**.
-5. Drag **Sudoku.app** to the Dock. If an old **Signal Broadcast** icon is pinned,
-   remove it.
+1. Clone this repository anywhere on the Mac.
+2. Double-click **Setup.command**. It copies the app into `~/Applications/Sudoku.app`
+   and continues from there: it installs the dependencies, builds the native app
+   and the local Keychain helper, moves any earlier installation (see below) and
+   installs the background service.
+3. Setup checks FileVault. If it is off, it opens **System Settings → Privacy &
+   Security → FileVault**; turn it on and keep the recovery key offline.
+4. Set and confirm a password of at least 12 characters. Spaces and paste work.
+5. Scan the QR code from Signal on your phone under **Settings → Linked Devices**.
+6. Drag **Sudoku** from `~/Applications` to the Dock.
+7. Setup offers to delete the folder you cloned. Say yes: it now only holds source
+   code, and its name gives the app away. A folder with uncommitted changes is kept.
+
+**Upgrading an earlier installation.** Press **Update**, then **Finish update**; the
+installer opens and does the same steps. It also moves the earlier install to
+neutral names, safely and only once:
+
+| Before | After |
+|---|---|
+| `~/Library/Application Support/Signal Broadcast/data.sparsebundle` | `~/Library/Application Support/Sudoku/library.sparsebundle` (volume "Sudoku Library") |
+| Keychain `com.user.signal-broadcast.vault.v1` | Keychain `local.sudoku.library.v1` |
+| Background service `com.user.signal-broadcast.service` | `local.sudoku.helper` |
+| Dock app `Signal Broadcast.app` in the project folder | `~/Applications/Sudoku.app` |
+| Unencrypted files in the project folder (older installs) | moved into the app, then into the vault at password setup |
+
+The migration checks everything first and stops without changing anything if both
+old and new data exist. It reads the Keychain entry with the helper that created it,
+so no new Keychain approval is needed, and it can simply be run again after a fix.
+Your Signal link, drafts, photos, schedule and password are kept. Re-pin the app in
+the Dock afterwards.
+
+Installs from before the encrypted vault must also set a password. After password
+setup, the vault migration copies the existing Signal store, drafts, group choices
+and logs into the vault, verifies the encrypted copy by reopening it, then removes
+the old copies. A valid link is preserved. If it cannot finish, normal access stays
+blocked and the originals are retained; restore any missing attachments and unlock
+again to retry.
+
+Updates come from the same GitHub project. Code-only updates restart the app and
+service; others open the installer. Active operations must finish first, and
+downloaded updates pause scheduled sends until installed. Enter the password again
+after restarting; no QR scan or relinking is needed.
 
 ## Sudoku front (on by default)
 
 When the app is locked it looks and plays like an ordinary offline Sudoku game: its
-window, menu bar, Dock name and icon all say Sudoku.
+window, menu bar, Dock name, icon and process name all say Sudoku.
 
-- **Unlock:** choose **Game → Enter Puzzle Code…** (or press Command-K), type your
-  password and press Load.
+- **Unlock (two steps, same password):** choose **Game → Enter Puzzle Code…** (or press
+  Command-K) and type your password. The password screen appears; type the same
+  password there. An unattended password screen returns to the game after 90 seconds,
+  or press **Back to game**.
 - **Six-digit codes** such as `482913` only load a puzzle. They never count as attempts.
-- **Any other wrong code** counts as a wrong password. Three in a row erase everything,
-  exactly like the password screen. The game only ever says "Invalid puzzle code."
+- **Any other wrong code** counts as a wrong password, and so does a wrong password on
+  the second screen. Three in a row erase everything. The game only ever says
+  "Invalid puzzle code."
 - **Playing never counts.** Wrong digits, Check, Hint and new games have no effect on
   the counter.
-- **Panic code (optional):** set one under **Security → Sudoku disguise**. Typing it
-  as a puzzle code erases everything immediately, while the game keeps showing.
-- **Turn it off** under **Security → Sudoku disguise**. The app then shows the normal
-  password screen when locked.
+- **Panic code (optional):** set one under **Security → Sudoku disguise**. Typing it as
+  a puzzle code (or as the password) erases everything immediately, while the game
+  keeps showing.
+- **Turn it off** under **Security → Sudoku disguise**. The app then shows the password
+  screen when locked.
 - **First run after updating:** the password screen appears once more, with an
   explanation. The Sudoku front switches on after that successful unlock.
-- **After an erase** the app is just Sudoku. Run `Setup.command` to set up again.
-- Press **Command-L** to lock back to Sudoku at any time.
+- **After an erase** the app is just Sudoku. Run `Setup.command` inside the app
+  (`~/Applications/Sudoku.app/Contents/Resources/app`) to set up again.
+- **Lock now** (or Command-L) returns to Sudoku at any time.
 
-The disguise only stops a casual look. The source code is public, and the project folder,
-`~/Library/Application Support/Signal Broadcast`, the background service and its
-`java` Signal process can still be found by someone who digs. Your data is protected
-by the encryption, sealing and erasure described below, not by the game.
-
-Existing installations must also set a password. Setup does not silently encrypt or
-wipe their data. After password setup, migration copies the existing Signal store,
-notes, drafts, group choices and logs into the vault, verifies the encrypted copy by
-reopening it, then removes the old copies. A valid link is preserved. Previously
-attached original files also move into protected storage.
-
-If migration cannot finish, normal access remains blocked and the originals needed
-for recovery are retained. Restore any missing attachments and unlock again to
-retry. Do not delete your old files manually while migration is incomplete.
-
-Keep the clone in its original location. If you move it, run Setup again. Use
-**Update** on the password screen or in the unlocked header, then **Finish update**. Checking
-and downloading updates does not unlock the vault or sign you out. Code-only updates
-restart the app and service; dependency changes open Setup. Active operations must
-finish first. Downloaded updates pause scheduled sends until installation finishes.
-Your Signal link, drafts, photos and schedule are kept. Enter the local password
-again after restarting; no QR scan or relinking is needed. Older installations without the button need one
-manual `git pull --ff-only` followed by `Setup.command` to receive it.
+The disguise only stops a casual look. The source code is public, and someone who
+digs can find the background service, the `java` Signal process and the app's files.
+What protects the data is the encryption, sealing and erasure described below:
+finding the app gives an intruder nothing they can open.
 
 ## Locking, closing and erasing
 
@@ -99,47 +122,17 @@ old background jobs. Unplugging the Mac no longer erases data.
 
 - **Send**: compose a message, move images into the vault, reorder them and confirm
   the send. Locking or closing the window does not stop it.
-- **Notes**: check Signal's Note to Self, select a note and use its text and complete
-  attachments as the draft. Deleting a note removes only the local copy.
-  Both Notes and group refresh use the selective receiver installed by Setup: only
-  Note-to-Self media and full text are downloaded, and each received note is saved
-  immediately, including large albums and attachment-backed full text. Other chats
-  still pass through Signal's receive queue, but their media is skipped on this
-  linked device. The phone and other linked devices are unaffected.
-  If the selective receiver is missing or no longer matches the installed version,
-  the app explains that it is using the compatibility receiver, which downloads
-  all attachments. Run Setup to restore selective downloads.
-  A receive operation allows up to one hour overall and shows and records progress
-  every five seconds. Pending messages, group-state updates and note media can add
-  to the wait. After three minutes without a processed message or temporary download-file
-  activity, it reconnects once if no message-processing errors were reported.
-  Errors alone do not reset that timer. Active downloads can continue; a second
-  stall stops with connection guidance. Signal decryption/processing errors,
-  authorisation warnings and stderr errors are reported as an incomplete check,
-  even when the Signal process exits successfully.
-  An interrupted check keeps saved notes and reports that it is
-  incomplete; check again to receive the remaining queue. Notes whose attachments
-  were skipped by an older version must be forwarded to Note to Self again.
-  The app keeps the latest 300 unexpired notes. Debug summaries in
-  `logs/notes-debug.txt` record matched notes, sent transcripts, unrelated attachment
-  counts, temporary download bytes, time since activity, warning counts and age,
-  classified errors, reconnects and completion status inside the vault. Each note
-  logs its saved-photo count, missing attachments and expiry status immediately.
-  `download_bytes` is the current temporary-file size, not total bytes transferred;
-  unrelated attachment counts cover messages already emitted by Signal only.
-  Raw Signal error messages and message content are not copied into these diagnostics.
-  Look for `receive mode: media=note-to-self receiver=selective-0.14.7` to confirm
-  the optimisation is active. Note-to-Self albums download up to four attachments
-  at once, keeping the original order and full text. `receive media:` lines show
-  worker counts and file/album timings; duplicate file references use serial downloads.
-  See [selective receiver verification](docs/NOTES-SELECTIVE-RECEIVE.md).
+- **Notes**: removed from the Mac app. It keeps no Note-to-Self copies: group refresh
+  downloads no attachments at all, and copies kept by an earlier version are deleted
+  at the next unlock (photos the saved draft still uses are kept). Your notes remain
+  in Note to Self on the phone.
 - **Groups**: search, toggle groups, select/deselect visible matches and save.
   Selections outside the current search are retained.
 - **Schedule**: save daily times, see the next time or pending run, and read schedule activity.
-- **Security**: change the password, lock, erase, clear logs or adjust sending pace.
+- **Security**: change the password, lock, erase, clear logs, set the Sudoku disguise
+  and panic code, or adjust sending pace.
 
-Choose formatting beside the message. Notes show the complete text before you
-use or copy it. **Retry failed groups** uses the unchanged saved draft and excludes
+Choose formatting beside the message. **Retry failed groups** uses the unchanged saved draft and excludes
 successful, skipped and unconfirmed deliveries. Changing the saved text, photo
 list or formatting disables that retry.
 
@@ -157,10 +150,6 @@ for its workers to exit. **Broadcast stopped** appears only after confirmation.
 Already-dispatched messages may still arrive. Stopping a broadcast leaves any saved
 schedule enabled. Resume and Discard appear only when there is an interrupted run.
 
-After updating to this version, run `Setup.command` once when no broadcast is running.
-It builds the new native image decoder and restarts the service with the new status
-reporting. No password reset or relinking is required for this update.
-
 Importing images is a **move**, not just an attachment reference. The app explains
 this before import, copies and verifies each image, then deletes its selected
 original. If verification or deletion fails, it reports an incomplete import.
@@ -175,7 +164,7 @@ restart can delay a send; after waking and unlocking when required, only a pendi
 send still within this limit can start. Disabling or resaving the schedule cancels
 pending work. It does not stop an active broadcast.
 
-Active broadcasts, Notes checks and group refreshes use `caffeinate` to prevent idle
+Active broadcasts and group refreshes use `caffeinate` to prevent idle
 sleep. This does not wake a sleeping Mac or override closing its lid. Keep it awake
 for on-time schedules.
 An unfinished broadcast blocks a new scheduled broadcast until it is reviewed. **Resume remaining**
@@ -195,53 +184,59 @@ restrict automated sending. Send only to groups expecting the messages.
 
 ## What is protected
 
-The vault is at `~/Library/Application Support/Signal Broadcast/data.sparsebundle`.
-It contains the Signal credentials and databases, account number, groups, notes,
-drafts, images, logs and temporary media. The checkout contains source code and
-installed dependencies, not the migrated account's runtime files.
+The vault is at `~/Library/Application Support/Sudoku/library.sparsebundle`, next to
+the game's saved puzzle. It contains the Signal credentials and databases, account
+number, groups, drafts, images, logs and temporary media. The installed app holds
+source code and dependencies only.
 
 The image uses AES-256 encryption. A random vault password is wrapped with AES-GCM
 using an Argon2id-derived key. The wrapped material and attempt state live in the
-local file-based Mac Keychain without iCloud synchronization. The user password and
-unwrapped vault password are not saved. The app excludes its storage from Time
-Machine and its vault from Spotlight indexing.
+local file-based Mac Keychain (`local.sudoku.library.v1`) without iCloud
+synchronization. The user password and unwrapped vault password are not saved. The
+app excludes its storage from Time Machine and its vault from Spotlight indexing.
 
-While the app is locked and idle, the vault is **detached**: Finder and Terminal see
-no decrypted files. The background service keeps the vault key in memory only, so it
-can reopen the vault for a due scheduled send or a link check, then closes it again.
-The vault stays open while a broadcast, Notes check or group update is running, and
-detaching waits if a Finder window or file inside the vault is still open. Restarting
-the service or the Mac forgets the key. After erasure the service restarts with a fresh
-process.
+While the app is locked and no worker is using it, the vault is **detached**: Finder
+and Terminal see no decrypted files. The background service keeps the vault key in
+memory only, so it can reopen the vault for a due scheduled send or a link check, then
+closes it again. A send that is still waiting (for example on the cooldown) is retried
+every two minutes rather than holding the vault open. The vault stays open while a
+broadcast or group update runs, and detaching waits if a Finder window or file inside
+it is still open. Restarting the service or the Mac forgets the key.
 
 **Unlinking from the phone erases this Mac.** The service checks the link shortly after
-each unlock, after a failed send or receive, and every six hours. If Signal says this
-device was removed, sending is blocked. If a second check at least 10 minutes later says
-the same, all local data is erased. Network errors and timeouts never count. A Mac that
-is off, or whose service has restarted and not yet been unlocked, notices at the next
-unlock.
+each unlock, after a failed send or receive, and every six hours. When Signal rejects
+this device while its server is otherwise reachable, sending is blocked and the link is
+rechecked every ten minutes. After three rejections spanning at least an hour, with no
+successful check in between, all local data is erased, including every photo. Network
+errors, timeouts and an empty local account list never count. A Mac that is off, or
+whose service has restarted and not yet been unlocked, notices at the next unlock.
 
-**Copy text** in Notes uses a private clipboard. The text stays on this Mac (no Universal
-Clipboard), clipboard managers are asked to skip it, and it is cleared when the app locks
-or quits if you have not copied anything else since.
+**What an intruder finds.** With the app locked: a Sudoku game, an encrypted image they
+cannot open, and three guesses before it erases itself. Copying the image to guess
+offline only works against a weak password, so use a long passphrase. Logs live inside
+the vault, hold counts, timings and error categories only (never names, numbers or
+message text), and dated logs are deleted after seven days.
 
-Keep FileVault enabled. This source-built app is not an OS sandbox, a hardware retry
-counter or a replacement for GrapheneOS security. Modified code, a compromised Mac,
-restored backups and other copies remain outside its guarantees. Do not treat file
-deletion as proof that historical SSD remnants or backups are unrecoverable.
+Keep FileVault enabled; the unlocked app warns when it is off. This source-built app is
+not an OS sandbox, a hardware retry counter or a replacement for GrapheneOS security.
+Modified code, a compromised Mac, restored backups and other copies remain outside its
+guarantees. Erasure destroys the vault's key first, so the encrypted image cannot be
+opened even if disk remnants survive, but do not treat file deletion as proof that
+historical backups or local snapshots are gone.
 
-Erasure removes this installation's credentials and app data. To remove its entry
-from your account too, use **Signal → Settings → Linked Devices** on your phone.
-Your primary account and messages on other devices are unaffected.
+Erasure removes this installation's credentials and app data. Unlinking from the phone
+also removes it from your account; after a manual **Log out and erase**, remove it under
+**Signal → Settings → Linked Devices**. Your primary account and messages on other
+devices are unaffected.
 
 ## Terminal and troubleshooting
 
-The protected terminal client prompts for the app password:
+The protected terminal client prompts for the app password. Run it from
+`~/Applications/Sudoku.app/Contents/Resources/app`:
 
 ```sh
 .venv/bin/python mac_cli.py --dry-run
 .venv/bin/python mac_cli.py --sync
-.venv/bin/python mac_cli.py --notes
 .venv/bin/python mac_cli.py --resume
 ```
 
