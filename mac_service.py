@@ -387,6 +387,9 @@ class Service:
             terminate_group(job["proc"])
             if job["kind"] == "sync":
                 engine._notes_log("receive interrupted: worker stopped")
+            if job["kind"] == "health":
+                # Its completion handler will not run, so schedule the next check here.
+                self.health_due = time.monotonic() + HEALTH_RECHECK_S
             self.job = None
         self.reap_worker()
 
@@ -630,7 +633,7 @@ class Service:
                     if job["kind"] == "health":
                         self.health_due = time.monotonic() + (HEALTH_RECHECK_S if self.removed_since is not None
                                                               else HEALTH_INTERVAL_S)
-                    elif returncode != 0 and job["kind"] in ("send", "resume", "retry", "sync"):
+                    elif job["kind"] in ("send", "resume", "retry", "sync") and self._job_failed(job, returncode):
                         # A failure may be the first sign that the phone removed this Mac.
                         soon = time.monotonic() + HEALTH_AFTER_FAILURE_S
                         self.health_due = min(self.health_due or soon, soon)
@@ -644,6 +647,19 @@ class Service:
                             message = "Scheduled broadcast paused after persistent throttling. Review and resume the saved broadcast."
                         self.schedule_result(outcome, message)
                     self._event("finished", job["kind"])
+
+    @staticmethod
+    def _job_failed(job, returncode):
+        """Workers report per-group failures with exit code 0, so read the outcome too."""
+        if returncode != 0:
+            return True
+        if job["kind"] == "sync":
+            return False
+        try:
+            summary = engine.read_run_summary()
+        except (OSError, ValueError, engine.BroadcastError):
+            return False
+        return bool(summary and summary.failed and not summary.sent)
 
     def _link_state(self, value):
         if value == "ok":
@@ -726,7 +742,8 @@ class Service:
             return
         try:
             self._start_job("health")
-        except SecurityError:
+        except (SecurityError, OSError):
+            # Includes failing to record worker.json: retry later, never stop the service.
             self.health_due = time.monotonic() + HEALTH_AFTER_FAILURE_S
             return
         self.health_due = None

@@ -304,6 +304,33 @@ class NotesRemovalTests(Fixture):
         self.assertEqual(note["photos"], [])
 
 
+class HealthSchedulingTests(Fixture):
+    def test_stopping_a_link_check_schedules_the_next_one(self):
+        self.setup()
+        self.service.job, self.service.health_due = {"kind": "health", "proc": mock.Mock()}, None
+        with mock.patch("mac_service.terminate_group"), mock.patch.object(self.service, "reap_worker"):
+            self.request("stop")
+        self.assertIsNotNone(self.service.health_due)
+
+    def test_a_send_where_every_group_failed_triggers_a_link_check(self):
+        self.setup()
+        summary = engine.RunSummary(at="2026-01-01T08:00:00", total=3, sent=0, failed=3)
+        with mock.patch.object(engine, "read_run_summary", return_value=summary):
+            self.assertTrue(self.service._job_failed({"kind": "send"}, 0))
+        with mock.patch.object(engine, "read_run_summary", return_value=engine.RunSummary(
+                at="2026-01-01T08:00:00", total=3, sent=2, failed=1)):
+            self.assertFalse(self.service._job_failed({"kind": "send"}, 0))
+        self.assertTrue(self.service._job_failed({"kind": "sync"}, 1))
+
+    def test_worker_start_errors_during_a_link_check_do_not_stop_the_service(self):
+        self.setup()
+        self.service.health_due = 0
+        with mock.patch.object(engine, "is_linked", return_value=True), \
+             mock.patch.object(self.service, "_start_job", side_effect=OSError("disk full")):
+            self.service.tick(datetime(2026, 1, 1, 8))
+        self.assertGreater(self.service.health_due, 0)
+
+
 class ProbeTests(unittest.TestCase):
     def test_removed_pattern_ignores_network_and_bare_status_codes(self):
         for text in ("Connection closed", "timed out", "[403] Forbidden", "401 Unauthorized",
