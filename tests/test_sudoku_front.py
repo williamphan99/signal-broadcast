@@ -387,6 +387,19 @@ class PrivacyTests(Fixture):
         self.assertFalse(self.request("snapshot")["security"]["filevault"])
 
 
+class HalfUpdateTests(unittest.TestCase):
+    def test_finish_setup_screen_until_installed_and_migrated(self):
+        import mac_app
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            installed = base / "Applications/Sudoku.app/Contents/Resources/app"
+            legacy = base / "Signal Broadcast"
+            self.assertTrue(mac_app.setup_unfinished(base / "Projects/signal-broadcast", legacy))
+            self.assertFalse(mac_app.setup_unfinished(installed, legacy))
+            legacy.mkdir()
+            self.assertTrue(mac_app.setup_unfinished(installed, legacy))
+
+
 class ProbeTests(unittest.TestCase):
     def test_removed_pattern_ignores_network_and_bare_status_codes(self):
         for text in ("Connection closed", "timed out", "[403] Forbidden", "401 Unauthorized",

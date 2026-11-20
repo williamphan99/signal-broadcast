@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from mac_security import SecurityError
+from mac_security import LEGACY_ROOT, SecurityError
 from mac_service import Client
 from mac_photos import Thumbnails
 from photo_strip import PhotoStrip
@@ -74,6 +74,14 @@ def operation_status(data, pending=None):
     if data.get("interrupted"):
         return "Broadcast interrupted. Review the remaining groups below."
     return "Ready to send."
+
+
+def setup_unfinished(project: Path = PROJECT, legacy_root: Path = LEGACY_ROOT) -> bool:
+    """Updated code that Setup has not installed yet: not inside Sudoku.app, or an
+    earlier install still waits to be moved. The background service cannot open the
+    old layout, so the game would otherwise hide a dead end."""
+    installed = project.parent.parent.parent.suffix == ".app"  # Sudoku.app/Contents/Resources/app
+    return not installed or legacy_root.exists()
 
 
 def show_as(name: str) -> None:
@@ -147,7 +155,10 @@ class App(tk.Tk):
         self.createcommand("tk::mac::Quit", self.close)
         self.createcommand("tk::mac::ShowPreferences", lambda: None)
         self.option_add("*tearOff", False)
-        self.show_locked()
+        if client is None and setup_unfinished():
+            self.show_finish_setup()
+        else:
+            self.show_locked()
         self.after(80, self.drain)
         self.after(500, self.poll)
 
@@ -238,6 +249,17 @@ class App(tk.Tk):
         self.group_choices = {}
         self.update_prompted = False
         self.login_state = {}
+
+    def show_finish_setup(self):
+        self.clear()
+        self.screen = "setup"
+        self.container.configure(padding=24)
+        ttk.Label(self.container, text="Finish updating", font=("", 22, "bold")).pack(anchor="w", pady=(10, 12))
+        ttk.Label(self.container, wraplength=600, text="This app was updated, but its installer has not run yet. "
+                  "Open the installer and follow it in Terminal. Your saved data is kept.").pack(anchor="w")
+        ttk.Button(self.container, text="Open installer", command=lambda: (
+            subprocess.Popen(["/usr/bin/open", "-a", "Terminal", str(PROJECT / "Setup.command")]),
+            self.close())).pack(anchor="w", pady=16)
 
     def show_locked(self, text=""):
         """The locked view: the Sudoku front unless it is off or Setup asked for the password screen."""
@@ -677,7 +699,7 @@ class App(tk.Tk):
     def poll(self):
         if self.screen == "main":
             self.refresh_elapsed()
-        if self.screen not in ("login", "front") and not self.polling:
+        if self.screen not in ("login", "front", "setup") and not self.polling:
             self.polling = True
             self.request("snapshot", self.apply_snapshot, after=self.sequence)
         elif self.screen in ("login", "front") and not self.polling and not self.auth_pending:
