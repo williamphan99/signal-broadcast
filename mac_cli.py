@@ -14,7 +14,6 @@ def main():
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--link", action="store_true")
     group.add_argument("--sync", action="store_true")
-    group.add_argument("--notes", action="store_true")
     group.add_argument("--dry-run", action="store_true")
     group.add_argument("--resume", action="store_true")
     args = parser.parse_args()
@@ -23,7 +22,7 @@ def main():
     client = Client()
     if client.call("status")["setup_required"]:
         raise SecurityError("Open the Mac app to set your password before linking.")
-    client.call("unlock", password=getpass.getpass("Signal Broadcast password: "))
+    client.call("unlock", password=getpass.getpass("Password: "))
     try:
         if args.dry_run:
             data = client.call("snapshot")
@@ -31,7 +30,7 @@ def main():
             print(f"Attachments: {len(data['attachments'])}")
             print(data["message"])
             return
-        kind = "link" if args.link else "sync" if args.sync else "notes" if args.notes else "resume" if args.resume else "send"
+        kind = "link" if args.link else "sync" if args.sync else "resume" if args.resume else "send"
         if kind in ("send", "resume") and input("Send the saved draft to the selected groups? Type SEND: ") != "SEND":
             return
         client.call("job", kind=kind)

@@ -43,11 +43,11 @@ class PrivateCommandTests(unittest.TestCase):
                 for operation in ("sendSyncRequest", "receive", "listGroups"):
                     self.assertTrue(any(operation in command for command in argv))
 
-    def test_private_worker_rejects_mismatched_account_before_sync_or_notes(self):
+    def test_private_worker_rejects_mismatched_account_before_sync(self):
         with tempfile.TemporaryDirectory(prefix="sb-private-worker-") as temporary:
             root = Path(temporary) / "mounted" / "store"
             root.mkdir(parents=True)
-            for kind in ("sync", "notes"):
+            for kind in ("sync",):
                 with self.subTest(kind=kind), mock.patch("pathlib.Path.is_mount", return_value=True), \
                      mock.patch.dict(mac_worker.os.environ), \
                      mock.patch.object(engine, "load_config", return_value=mock.Mock(account="+19999999999")), \
@@ -59,22 +59,18 @@ class PrivateCommandTests(unittest.TestCase):
                     sync.assert_not_called()
                     notes.assert_not_called()
 
-    def test_incomplete_notes_job_fails_with_the_safe_receive_warning(self):
+    def test_mac_worker_has_no_notes_job_and_never_keeps_notes(self):
         with tempfile.TemporaryDirectory(prefix="sb-private-notes-") as temporary:
             root = Path(temporary) / "mounted" / "store"
             root.mkdir(parents=True)
-            def receive(_account, on_log):
-                on_log("Receiving: 1 message processed.")
-                return {"complete": False, "warning": "Receiving reached the one-hour limit."}
             with mock.patch("pathlib.Path.is_mount", return_value=True), \
                  mock.patch.dict(mac_worker.os.environ), \
-                 mock.patch.object(engine, "load_config", return_value=mock.Mock(account="+19999999999")), \
-                 mock.patch.object(engine, "detect_account", return_value="+19999999999"), \
-                 mock.patch.object(engine, "fetch_notes", side_effect=receive), \
-                 mock.patch.object(mac_worker, "emit") as emit:
-                with self.assertRaisesRegex(engine.ReceiveError, "one-hour"):
+                 mock.patch.object(engine, "KEEP_NOTES", True), \
+                 mock.patch.object(engine, "fetch_notes") as receive:
+                with self.assertRaisesRegex(engine.BroadcastError, "Unsupported"):
                     mac_worker.run({"root": str(root), "job": "notes"})
-                emit.assert_any_call("receive_status", "Receiving: 1 message processed.")
+                receive.assert_not_called()
+                self.assertFalse(engine.KEEP_NOTES)
 
     def test_private_account_detection_rejects_ambiguous_legacy_store(self):
         accounts = '[{"number":"+19999999999"},{"number":"+18888888888"}]'

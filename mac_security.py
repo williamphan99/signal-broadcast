@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import plistlib
+import re
 import secrets
 import shutil
 import stat
@@ -21,9 +22,15 @@ from contextlib import contextmanager
 from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parent
-ROOT = Path.home() / "Library/Application Support/Signal Broadcast"
+# Neutral names: nothing on disk, in the Keychain or in `mount` says what this app is.
+# The LEGACY_* names are the earlier ones, read only by the installer's migration.
+ROOT = Path.home() / "Library/Application Support/Sudoku"
+LEGACY_ROOT = Path.home() / "Library/Application Support/Signal Broadcast"
 HELPER = PROJECT / "vendor/mac-security"
-SERVICE = "com.user.signal-broadcast.vault.v1"
+SERVICE, ACCOUNT = "local.sudoku.library.v1", "library"
+LEGACY_SERVICE, LEGACY_ACCOUNT = "com.user.signal-broadcast.vault.v1", "vault"
+IMAGE_NAME, MOUNT_NAME, VOLUME_NAME = "library.sparsebundle", "library", "Sudoku Library"
+LEGACY_IMAGE_NAME, LEGACY_MOUNT_NAME = "data.sparsebundle", "mounted"
 LEGACY_NAMES = (
     "signal-cli-data", "config.toml", "groups.txt", "group-permissions.json",
     "message.txt", "attachments.txt", "notes.json", "notes.corrupt.json",
@@ -52,7 +59,15 @@ class WrongPassword(SecurityError):
     def __init__(self, remaining: int):
         self.remaining = remaining
         super().__init__(f"Incorrect password. {remaining} attempts remain.",
-                         code="locked" if remaining == 0 else None)
+                         code="locked" if remaining == 0 else "wrong_password")
+
+
+def legacy_paths(project: Path) -> list[Path]:
+    """Runtime files an install from before the encrypted vault kept in its checkout."""
+    paths = [project / name for name in LEGACY_NAMES]
+    for pattern in ("groups.txt.*.tmp", "group-permissions.json.*.tmp", "notes.json*.tmp"):
+        paths.extend(project.glob(pattern))
+    return paths
 
 
 def atomic_json(path: Path, value) -> None:
@@ -76,12 +91,14 @@ def atomic_bytes(path: Path, value: bytes) -> None:
 
 
 class Keychain:
-    def __init__(self, service: str = SERVICE, helper: Path = HELPER):
-        self.service, self.helper = service, helper
+    def __init__(self, service: str = SERVICE, helper: Path = HELPER, account: str | None = ACCOUNT):
+        self.service, self.helper, self.account = service, helper, account
 
     def _call(self, operation: str, data: bytes | None = None):
+        # Older helpers only know the account "vault" and take no account argument.
+        account = [self.account] if self.account else []
         try:
-            proc = subprocess.run([str(self.helper), operation, self.service], input=data,
+            proc = subprocess.run([str(self.helper), operation, self.service, *account], input=data,
                                   capture_output=True, timeout=60)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise SecurityError("Mac Keychain is unavailable. Run Setup.command if needed.") from exc
@@ -120,13 +137,41 @@ def password_key(password: str, salt: bytes) -> bytes:
 
 def wrap_password(password: str, volume_password: bytes) -> dict:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    if len(password) < 12 or len(password.encode("utf-8")) > 4096:
+    if len(password) < MIN_PASSWORD or len(password.encode("utf-8")) > 4096:
         raise SecurityError("Use a password with at least 12 characters (maximum 4096 UTF-8 bytes).")
     salt, nonce = secrets.token_bytes(16), secrets.token_bytes(12)
     wrapped = AESGCM(password_key(password, salt)).encrypt(nonce, volume_password, AAD)
     return {"version": 1, "phase": "migrating", "failures": 0,
             "salt": base64.b64encode(salt).decode(), "nonce": base64.b64encode(nonce).decode(),
             "wrapped": base64.b64encode(wrapped).decode()}
+
+
+# Six digits, optionally prefixed with "#", load a Sudoku puzzle. Only inputs shorter
+# than the 12-character password minimum qualify, so no valid password (even digits
+# padded with spaces) is ever taken for a puzzle. Panic codes may not use this shape.
+PUZZLE_CODE = re.compile(r"#?\d{6}")
+MIN_PASSWORD = 12
+
+
+def is_puzzle_code(text: str) -> bool:
+    return len(text) < MIN_PASSWORD and bool(PUZZLE_CODE.fullmatch(text.strip()))
+
+
+def hash_panic_code(code: str) -> dict:
+    salt = secrets.token_bytes(16)
+    return {"salt": base64.b64encode(salt).decode(),
+            "hash": base64.b64encode(password_key(code, salt)).decode()}
+
+
+def matches_panic_code(code: str, record: dict) -> bool:
+    panic = record.get("panic")
+    if not isinstance(panic, dict):
+        return False
+    try:
+        salt, expected = (base64.b64decode(panic[key], validate=True) for key in ("salt", "hash"))
+    except (KeyError, ValueError, TypeError):
+        return False
+    return secrets.compare_digest(password_key(code, salt), expected)
 
 
 def unwrap_password(password: str, record: dict) -> bytes:
@@ -204,17 +249,14 @@ def delete_original(receipt: dict) -> None:
 class Vault:
     def __init__(self, root: Path = ROOT, project: Path = PROJECT, keychain=None):
         self.root, self.project = root, project
-        self.image = root / "data.sparsebundle"
-        self.mount = root / "mounted"
+        self.image = root / IMAGE_NAME
+        self.mount = root / MOUNT_NAME
         self.data = self.mount / "store"
         self.marker = root / "erase.json"
         self.keychain = keychain or Keychain()
 
     def legacy_paths(self):
-        paths = [self.project / name for name in LEGACY_NAMES]
-        for pattern in ("groups.txt.*.tmp", "group-permissions.json.*.tmp", "notes.json*.tmp"):
-            paths.extend(self.project.glob(pattern))
-        return paths
+        return legacy_paths(self.project)
 
     def clear_old_previews(self):
         if self.project != PROJECT:
@@ -272,7 +314,7 @@ class Vault:
         self.prepare()
         if not self.image.exists():
             self._disk(["create", "-size", "1t", "-type", "SPARSEBUNDLE", "-fs", "APFS",
-                        "-volname", "Signal Broadcast", "-encryption", "AES-256", "-stdinpass",
+                        "-volname", VOLUME_NAME, "-encryption", "AES-256", "-stdinpass",
                         "-nospotlight", str(self.image)], password)
         self.attach(password)
 
@@ -288,6 +330,7 @@ class Vault:
         if not self.mount.is_mount():
             raise SecurityError("Vault did not mount. Access denied.")
         os.chmod(self.mount, 0o700)
+        self.rename_volume()
         self.data.mkdir(mode=0o700, exist_ok=True)
         for path in (self.root, self.data):
             proc = subprocess.run(["/usr/bin/tmutil", "addexclusion", str(path)], capture_output=True)
@@ -295,6 +338,17 @@ class Vault:
                 self.detach()
                 raise SecurityError("Could not exclude the vault from Time Machine. Access denied.")
         (self.mount / ".metadata_never_index").touch(mode=0o600)
+
+    def rename_volume(self):
+        """Give a vault made by an earlier version the neutral volume name. Best effort."""
+        try:
+            info = subprocess.run(["/usr/sbin/diskutil", "info", "-plist", str(self.mount)],
+                                  capture_output=True, timeout=30)
+            if info.returncode == 0 and plistlib.loads(info.stdout).get("VolumeName") != VOLUME_NAME:
+                subprocess.run(["/usr/sbin/diskutil", "rename", str(self.mount), VOLUME_NAME],
+                               capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
 
     def detach(self):
         device = self.attached_device()

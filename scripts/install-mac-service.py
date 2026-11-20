@@ -7,9 +7,13 @@ import sys
 from pathlib import Path
 
 project = Path(__file__).resolve().parent.parent
-label = "com.user.signal-broadcast.service"
+label = "local.sudoku.helper"
 directory = Path.home() / "Library/LaunchAgents"
 directory.mkdir(parents=True, exist_ok=True)
+# The earlier, revealing label is replaced, never run beside the new one.
+legacy = "com.user.signal-broadcast.service"
+subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{legacy}"], capture_output=True)
+(directory / (legacy + ".plist")).unlink(missing_ok=True)
 plist = directory / (label + ".plist")
 value = {
     "Label": label,

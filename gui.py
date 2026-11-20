@@ -1845,6 +1845,6 @@ if __name__ == "__main__":
         python = Path(__file__).resolve().parent / ".venv/bin/python"
         if not python.exists():
             raise SystemExit("Run Setup.command to install Mac password protection first.")
-        os.execv(str(python), [str(python), str(Path(__file__).with_name("mac_app.py"))])
+        os.execv(str(python), [str(python), str(Path(__file__).with_name("mac_app.py")), *sys.argv[1:]])
     else:
         App().mainloop()

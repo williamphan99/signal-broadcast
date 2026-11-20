@@ -58,6 +58,7 @@ def run(request):
         raise engine.BroadcastError("The encrypted vault is not mounted.")
     configure_storage(root)
     engine.PRIVATE_TRANSPORT = True
+    engine.KEEP_NOTES = False  # No Notes page on the Mac: received note media is deleted.
     engine.DISPATCH_GUARD = partial(dispatch_guard, root.parents[1])
     temp = root / "temporary"
     temp.mkdir(mode=0o700, exist_ok=True)
@@ -81,22 +82,15 @@ def run(request):
             if not account:
                 raise engine.BroadcastError("Signal did not confirm the link. Try again.")
             engine.save_account(account)
-    elif kind in ("sync", "notes", "health"):
+    elif kind in ("sync", "health"):
         if kind == "health":
-            emit("link_broken", engine.link_is_broken())
+            emit("link_state", engine.probe_link())
         else:
             account = engine.load_config().account
             if engine.detect_account(require_single=True) != account:
                 raise engine.AccountSelectionError("The linked account does not match the saved configuration.")
-            if kind == "sync":
-                emit("phase", "sync")
-                emit("groups", engine.sync_groups(account, on_log=lambda text: emit("receive_status", text)))
-            else:
-                emit("phase", "notes")
-                report = engine.fetch_notes(account, on_log=lambda text: emit("receive_status", text))
-                emit("notes", report)
-                if not report.get("complete", True):
-                    raise engine.ReceiveError(report["warning"])
+            emit("phase", "sync")
+            emit("groups", engine.sync_groups(account, on_log=lambda text: emit("receive_status", text)))
     elif kind in ("send", "resume", "retry"):
         emit("phase", "preparing")
         cfg = engine.load_config()

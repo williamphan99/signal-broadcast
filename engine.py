@@ -44,6 +44,9 @@ import notes_receiver
 # elsewhere the portable CLI core (engine send loop + broadcast.py) is what's used.
 IS_DARWIN = sys.platform == "darwin"
 PRIVATE_TRANSPORT = False  # Enabled only by the protected Mac worker.
+# The Mac app has no Notes page. Its worker turns this off so Note-to-Self text and
+# media that arrive during a group refresh are deleted instead of kept.
+KEEP_NOTES = True
 DISPATCH_GUARD = nullcontext
 
 # Everything resolves relative to this file, so behaviour is identical whether a
@@ -86,7 +89,9 @@ class UpdateResult:
 
 UPDATE_SETUP_FILES = ("Setup.command", "scripts/make-dock-app.sh", "requirements-macos.txt",
                       "scripts/install-mac-service.py", "scripts/mac-security.swift",
-                      "scripts/mac-thumbnail.swift", "notes_receiver.py", "scripts/signal-cli-notes")
+                      "scripts/mac-thumbnail.swift", "scripts/sudoku-launcher.c", "scripts/install-app.sh",
+                      "mac_migrate.py", "assets/sudoku-icon.png", "notes_receiver.py",
+                      "scripts/signal-cli-notes")
 
 
 def _git_head() -> str | None:
@@ -1031,6 +1036,51 @@ def _link_is_broken_unlocked() -> bool:
     return not any(e.get("number") or e.get("account") for e in accounts)
 
 
+# signal-cli's answers when Signal rejects this device's credentials, as it does once
+# the phone removes it from Linked Devices. Deliberately narrower than
+# ACCOUNT_UNUSABLE_PATTERN: timeouts and connection errors never match. signal-cli
+# reports any 401/403 this way, so one answer is a suspicion, not proof; the Mac
+# service only erases after repeated answers over an hour (see mac_service).
+LINK_REMOVED_PATTERN = re.compile(r"user\s+\S+\s+is not registered|authorization failed", re.IGNORECASE)
+SIGNAL_SERVER = ("chat.signal.org", 443)
+
+
+def signal_reachable() -> bool:
+    """A TLS handshake with Signal's server, so a rejection is not a network fault."""
+    import socket
+    import ssl
+    try:
+        with socket.create_connection(SIGNAL_SERVER, timeout=SIGNAL_CONTROL_TIMEOUT_S) as raw:
+            with ssl.create_default_context().wrap_socket(raw, server_hostname=SIGNAL_SERVER[0]):
+                return True
+    except OSError:
+        return False
+
+
+def probe_link() -> str:
+    """Ask Signal whether this device is still linked: "ok", "removed" or "unknown".
+
+    listDevices is an authenticated request that does not consume queued messages.
+    An empty local account list is not evidence: signal-cli can omit an account
+    after a failed network check. Anything inconclusive is "unknown"."""
+    with signal_cli_operation("checking the link"):
+        try:
+            binary = signal_cli_bin()
+            account = load_config().account
+        except BroadcastError:
+            return "unknown"
+        try:
+            proc = subprocess.run(_cli(binary, "--config", str(DATA_DIR), *_account_args(account), "listDevices"),
+                                  capture_output=True, text=True, errors="replace",
+                                  timeout=SIGNAL_CONTROL_TIMEOUT_S, env=_signal_env(binary))
+        except (OSError, subprocess.SubprocessError):
+            return "unknown"
+        if proc.returncode == 0:
+            return "ok"
+        rejected = LINK_REMOVED_PATTERN.search(f"{proc.stdout}\n{proc.stderr}")
+        return "removed" if rejected and signal_reachable() else "unknown"
+
+
 def _request_sync(binary: str, account: str) -> None:
     """Best-effort nudge: ask the phone (primary) to (re)send contacts + groups.
     Ignored on failure — the phone usually pushes a sync on linking anyway."""
@@ -1534,8 +1584,19 @@ def _attachment_path(att: dict) -> Path | None:
     return DATA_DIR / "attachments" / attachment_id
 
 
+def _remove_note_file(path: Path) -> None:
+    try:
+        if path.is_relative_to(DATA_DIR) and path.is_file() and not path.is_symlink():
+            path.unlink()
+    except OSError:
+        pass
+
+
 def _apply_downloaded_note_attachment(note: dict, att: dict, path: Path) -> None:
     """Add one already-decrypted attachment to its customer-facing note field."""
+    if not KEEP_NOTES:
+        _remove_note_file(path)
+        return
     if att.get("contentType") == LONG_MESSAGE_MIME:
         try:
             note["text"] = path.read_text(encoding="utf-8", errors="replace")
@@ -1810,6 +1871,60 @@ def store_notes(found: list[dict]) -> int:
         return changed
 
 
+def _draft_files() -> set[str]:
+    try:
+        return {str(Path(line.strip()).resolve()) for line in ATTACHMENTS_FILE.read_text().splitlines() if line.strip()}
+    except OSError:
+        return set()
+
+
+# Where signal-cli keeps media it received: attachments from any chat (including the
+# old Notes downloads and the compatibility receiver), contacts' profile pictures and
+# stickers. The Mac app sends from its own imports and receives with these ignored.
+RECEIVED_MEDIA_DIRS = ("attachments", "avatars", "stickers")
+
+
+def discard_received_media() -> int:
+    """Delete every received file in Signal's store except ones the saved draft uses."""
+    draft, removed = _draft_files(), 0
+    for name in RECEIVED_MEDIA_DIRS:
+        folder = DATA_DIR / name
+        if not folder.is_dir() or folder.is_symlink():
+            continue
+        for path in sorted(folder.rglob("*"), reverse=True):
+            try:
+                if path.is_symlink() or path.is_file():
+                    if str(path.resolve()) not in draft:
+                        path.unlink()
+                        removed += 1
+                elif path.is_dir() and not any(path.iterdir()):
+                    path.rmdir()
+            except OSError:
+                pass
+    return removed
+
+
+def discard_notes() -> int:
+    """Delete every stored note, its downloaded photos and any damaged or half-written
+    notes file. Photos the saved draft still uses (the old "Use as message") stay."""
+    draft = _draft_files()
+    with _notes_transaction():
+        try:
+            notes = json.loads(NOTES_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            notes = []
+        notes = [note for note in notes if isinstance(note, dict)] if isinstance(notes, list) else []
+        for note in notes:
+            photos = note.get("photos")
+            for photo in photos if isinstance(photos, list) else []:
+                path = photo.get("path") if isinstance(photo, dict) else None
+                if isinstance(path, str) and str(Path(path).resolve()) not in draft:
+                    _remove_note_file(Path(path))
+        for path in (NOTES_FILE, NOTES_CORRUPT_FILE, *NOTES_FILE.parent.glob(NOTES_FILE.name + ".*.tmp")):
+            path.unlink(missing_ok=True)
+    return len(notes)
+
+
 def delete_note(timestamp: int) -> None:
     """Delete one stored note without racing a receive in another process."""
     with _notes_transaction():
@@ -1858,15 +1973,17 @@ def _receive_messages(binary: str, account: str, idle_seconds: int,
                             "new", "missing_attachments"), 0)
     temporary = RUNTIME_DIR / "temporary"
     temporary.mkdir(parents=True, exist_ok=True, mode=0o700)
-    selective = notes_receiver.launcher_for(binary)
-    if selective:
+    selective = notes_receiver.launcher_for(binary) if KEEP_NOTES else None
+    if not KEEP_NOTES:
+        on_log("Checking pending Signal messages. No attachments are downloaded.")
+    elif selective:
         binary = selective
         on_log("Checking pending Signal messages; downloading media and full text only for Note to Self. "
                "Each complete note appears as soon as it is saved.")
     else:
         on_log("Using the compatibility receiver: attachments from all chats are downloaded. "
                "Run Setup to enable selective Note-to-Self downloads. Each complete note is saved as it arrives.")
-    _notes_log(f"receive mode: media={'note-to-self' if selective else 'all'} "
+    _notes_log(f"receive mode: media={'none' if not KEEP_NOTES else 'note-to-self' if selective else 'all'} "
                f"receiver={'selective-' + notes_receiver.VERSION if selective else 'compatibility'}")
     for attempt in (1, 2):
         with tempfile.TemporaryDirectory(prefix="receive-", dir=temporary) as folder:
@@ -1911,7 +2028,8 @@ def _receive_once(binary: str, account: str, idle_seconds: int, temporary: Path,
         proc = subprocess.Popen(
             _cli(binary, *temp_options, "--config", str(DATA_DIR), *_account_args(account), "-o", "json",
                  "receive", "--timeout", str(idle_seconds),
-                 "--ignore-avatars", "--ignore-stickers", "--ignore-stories"),
+                 "--ignore-avatars", "--ignore-stickers", "--ignore-stories",
+                 *([] if KEEP_NOTES else ["--ignore-attachments"])),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
             errors="replace", env=env)
     except (OSError, subprocess.SubprocessError):
@@ -1949,6 +2067,8 @@ def _receive_once(binary: str, account: str, idle_seconds: int, temporary: Path,
             return dict(warning_counts), last_warning
 
     def save_note(note):
+        if not KEEP_NOTES:
+            return  # Its attachments were already deleted as they arrived.
         changed = store_notes([note])
         counters["new"] += changed
         counters["missing_attachments"] += note.get("missing_photos", 0) + bool(note.get("missing_body"))
@@ -1960,7 +2080,7 @@ def _receive_once(binary: str, account: str, idle_seconds: int, temporary: Path,
     def read_stdout():
         try:
             if proc.stdout is not None:
-                _inspect_receive(proc.stdout, collect_notes=True, log_summary=True,
+                _inspect_receive(proc.stdout, collect_notes=KEEP_NOTES, log_summary=True,
                                  on_note=save_note, counters=counters,
                                  on_receive_error=lambda message: record_warning(message, "json"))
         except Exception:
@@ -3143,6 +3263,25 @@ def append_activity(line: str) -> None:
     out = LOGS_DIR / f"activity-{datetime.now():%Y-%m-%d}.txt"
     with out.open("a", encoding="utf-8") as fh:
         fh.write(f"{datetime.now():%H:%M:%S}  {line}\n")
+
+
+LOG_RETENTION_DAYS = 7
+
+
+def prune_logs(days: int = LOG_RETENTION_DAYS) -> int:
+    """Delete dated activity and debug logs older than `days`. Even without names or
+    message text, a long history of timestamps shows when someone was active."""
+    cutoff = time.time() - days * 86400
+    removed = 0
+    for pattern in ("activity-*.txt", "debug-*.txt"):
+        for path in LOGS_DIR.glob(pattern):
+            try:
+                if path.is_file() and not path.is_symlink() and path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                pass
+    return removed
 
 
 def clear_logs() -> None:

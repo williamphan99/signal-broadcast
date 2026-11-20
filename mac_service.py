@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import collections
+import copy
 import fcntl
 import json
 import os
@@ -22,11 +23,26 @@ from pathlib import Path
 
 import engine
 from mac_security import (HELPER, PROJECT, ROOT, SecurityError, Vault, WrongPassword,
-                          atomic_json, unwrap_password, wrap_password)
+                          atomic_json, hash_panic_code, is_puzzle_code, matches_panic_code,
+                          unwrap_password, wrap_password)
 from mac_worker import configure_storage
 
-LABEL = "com.user.signal-broadcast.service"
+LABEL = "local.sudoku.helper"
+LEGACY_LABEL = "com.user.signal-broadcast.service"
 MAX_REQUEST = 1024 * 1024
+# Link checks contact Signal. Erasing on an unlink needs HEALTH_CONFIRM_COUNT
+# "removed" answers spanning HEALTH_CONFIRM_S with no "ok" between them, so a
+# passing server or credential problem can never wipe a working installation.
+HEALTH_AFTER_UNLOCK_S = 5
+HEALTH_AFTER_FAILURE_S = 30
+HEALTH_RECHECK_S = 600
+HEALTH_CONFIRM_S = 3600
+HEALTH_CONFIRM_COUNT = 3
+HEALTH_INTERVAL_S = 6 * 3600
+SEAL_RETRY_S = 30
+WAKE_RETRY_S = 120  # Reopening for a send still waiting (cooldown, busy) or after a failed mount.
+# Survives password changes; everything else in the record is rebuilt by wrap_password.
+CARRIED_FIELDS = ("pending_originals", "disguise", "front_armed", "panic")
 
 
 class WorkerStartError(SecurityError):
@@ -34,12 +50,21 @@ class WorkerStartError(SecurityError):
 
 
 
+def filevault_on() -> bool:
+    """Whole-disk encryption status. Unknown counts as on, so no false alarm."""
+    try:
+        proc = subprocess.run(["/usr/bin/fdesetup", "isactive"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return proc.stdout.strip() != "false"
+
+
 def socket_path(root: Path = ROOT) -> Path:
     # Darwin's sockaddr_un path limit is 104 bytes. Keep the actual socket short,
     # in the owner's private temporary directory; its name contains no account ID.
     import hashlib
     import tempfile
-    directory = Path(tempfile.gettempdir()).resolve() / f"sb-{os.getuid()}"
+    directory = Path(tempfile.gettempdir()).resolve() / f"sudoku-{os.getuid()}"
     directory.mkdir(mode=0o700, exist_ok=True)
     if directory.is_symlink() or directory.stat().st_uid != os.getuid():
         raise SecurityError("Unsafe local service directory.")
@@ -153,6 +178,22 @@ class Service:
         self.phase = None
         self.schedule_error = None
         self.schedule_retry_at = None
+        # The volume password stays in this process only, so a locked, idle vault can
+        # be detached and reattached for a scheduled send or link check.
+        self.key = None
+        self.mounted = False
+        self.sealed_schedule = None
+        self.seal_retry_at = 0.0
+        self.wake_retry_at = 0.0
+        self.health_due = None
+        self.removed_since = None
+        self.removed_count = 0
+        self.unlink_confirmed = False
+        self.failures_before_unlock = 0
+        self.failures_at_code = 0
+        self.flags = {"disguise": True, "panic_code": False}
+        self.filevault = True
+        self.erase_retry_at = 0.0
 
     def recover(self):
         self.vault.prepare()
@@ -190,7 +231,13 @@ class Service:
             state = "unlocked" if self.token else "screen_locked"
         else:
             state = "sealed"
+        # The Sudoku front is on unless the owner turned it off. An existing user sees
+        # the explained password screen once; afterwards the front is armed. With no
+        # record (fresh or erased) there is nothing to protect, so show the game.
+        front = (record.get("disguise", True) and record.get("front_armed", False)) if record else True
         return {"state": state, "attempts_remaining": max(0, 3 - record["failures"]) if record else 3,
+                "front": bool(front or state == "erasing"),
+                "disguise": bool(record.get("disguise", True)) if record else True,
                 "background_running": bool(self.job), "setup_required": not record and not exists,
                 "updating": bool(self.job and self.job["kind"] == "update"),
                 "update": ({key: bool(self.update_state.get(key)) for key in ("changed", "needs_setup", "error")}
@@ -219,24 +266,83 @@ class Service:
             if record["failures"] >= 3:
                 self.erase()
                 raise SecurityError("Data erased after three incorrect attempts.")
+            if record["phase"] == "ready" and matches_panic_code(password, record):
+                # Indistinguishable from a wrong attempt to whoever typed it.
+                remaining = max(0, 2 - record["failures"])
+                self.erase()
+                raise WrongPassword(remaining)
             volume_password = self._unwrap_password(password, record)
-        if record["phase"] == "migrating":
-            self.retire(self.vault.project)
-            self.vault.create_image(volume_password)
-            self.vault.migrate(volume_password)
-        elif not self.open:
-            self.vault.attach(volume_password)
+        try:
+            if record["phase"] == "migrating":
+                self.retire(self.vault.project)
+                self.vault.create_image(volume_password)
+                self.vault.migrate(volume_password)
+            elif not self.mounted:
+                self.vault.attach(volume_password)
+            self.mounted = True
+            self.sealed_schedule = None
+            return self._open_session(volume_password)
+        except Exception:
+            # A failure after mounting must not leave decrypted files behind the game.
+            if not self.token and not self.job:
+                try:
+                    self.vault.detach()
+                    self.mounted = False
+                except SecurityError:
+                    pass  # Still busy; the next tick seals it.
+            raise
+
+    def _open_session(self, volume_password):
         self.vault.recover_imports()
         record = self.vault.keychain.load()
+        # Wrong codes typed before the Sudoku step passed still get reported once.
+        self.failures_before_unlock = max(self.failures_at_code, record["failures"])
+        self.failures_at_code = 0
         record["failures"] = 0
+        newly_armed = record.get("disguise", True) and not record.get("front_armed", False)
+        record["front_armed"] = True
         self.vault.keychain.save(record)
+        self._remember_flags(record)
         configure_storage(self.vault.data)
         engine.PRIVATE_TRANSPORT = True
+        # The Mac app has no Notes page. Remove note copies an older version kept.
+        engine.discard_notes()
+        engine.discard_received_media()
+        engine.prune_logs()
+        self.filevault = filevault_on()
+        self.key = volume_password
         self.open = True
         engine.ensure_config()
         engine.set_config_value("wipe_on_close", False)
+        self.health_due = time.monotonic() + HEALTH_AFTER_UNLOCK_S
         self.token = secrets.token_urlsafe(32)
-        return {"token": self.token}
+        return {"token": self.token, "front_armed_now": bool(newly_armed)}
+
+    def check_code(self, password):
+        """The Sudoku layer: the same password reveals the password screen, nothing more.
+
+        It opens nothing and returns no token. Wrong codes share the unlock counter, and
+        the panic code erases, so this step is enforced here rather than in the window."""
+        if self.recovery_error:
+            raise SecurityError(self.recovery_error)
+        if not isinstance(password, str) or len(password.encode()) > 4096:
+            raise SecurityError("Password is too long.")
+        record = self.vault.keychain.load()
+        if self.erasing or self.vault.marker.exists() or not record or record["phase"] != "ready":
+            raise WrongPassword(0)  # Nothing to reveal; never counts.
+        if record["failures"] >= 3:
+            self.erase()
+            raise WrongPassword(0)
+        if matches_panic_code(password, record):
+            remaining = max(0, 2 - record["failures"])
+            self.erase()
+            raise WrongPassword(remaining)
+        self._unwrap_password(password, record)
+        record = self.vault.keychain.load()
+        self.failures_at_code = max(self.failures_at_code, record["failures"])
+        record["failures"] = 0
+        self.vault.keychain.save(record)
+        return {"ok": True}
 
     def _unwrap_password(self, password, record):
         try:
@@ -254,18 +360,54 @@ class Service:
             raise SecurityError("New password must have at least 12 characters.")
         record = self.vault.keychain.load()
         secret = self._unwrap_password(current, record)
+        if matches_panic_code(new, record):
+            raise SecurityError("The new password cannot be the same as the panic code.")
         replacement = wrap_password(new, secret)
         replacement["phase"] = "ready"
-        replacement["pending_originals"] = record.get("pending_originals", [])
+        replacement.update({key: record[key] for key in CARRIED_FIELDS if key in record})
         self.vault.keychain.save(replacement)
         return {"changed": True}
+
+    def set_disguise(self, enabled):
+        if not isinstance(enabled, bool):
+            raise SecurityError("Invalid setting.")
+        record = self.vault.keychain.load()
+        record["disguise"] = enabled
+        self.vault.keychain.save(record)
+        self._remember_flags(record)
+        return {"saved": True}
+
+    def set_panic_code(self, code):
+        record = self.vault.keychain.load()
+        if code is None:
+            record.pop("panic", None)
+            self.vault.keychain.save(record)
+            self._remember_flags(record)
+            return {"saved": True}
+        if not isinstance(code, str) or not 4 <= len(code.strip()) <= 64 or code != code.strip():
+            raise SecurityError("Use a panic code of 4 to 64 characters, without leading or trailing spaces.")
+        if is_puzzle_code(code):
+            raise SecurityError("Six digits load a puzzle. Choose a panic code with letters or a different length.")
+        try:
+            unwrap_password(code, record)
+        except WrongPassword:
+            pass  # Comparing against the password never counts as an attempt.
+        else:
+            raise SecurityError("The panic code cannot be your password.")
+        record["panic"] = hash_panic_code(code)
+        self.vault.keychain.save(record)
+        self._remember_flags(record)
+        return {"saved": True}
 
     def stop_job(self):
         job = self.job
         if job:
             terminate_group(job["proc"])
-            if job["kind"] in ("notes", "sync"):
-                engine._notes_log("receive interrupted: worker stopped; saved notes kept")
+            if job["kind"] == "sync":
+                engine._notes_log("receive interrupted: worker stopped")
+            if job["kind"] == "health":
+                # Its completion handler will not run, so schedule the next check here.
+                self.health_due = time.monotonic() + HEALTH_RECHECK_S
             self.job = None
         self.reap_worker()
 
@@ -288,9 +430,11 @@ class Service:
 
     def erase(self):
         self.token = None
+        self.key = None
         self.events.clear()
         self.open = False
         self.erasing = True
+        self.unlink_confirmed = False
         try:
             self.vault.prepare()
             with (self.vault.root / "dispatch.lock").open("a") as lease:
@@ -318,6 +462,10 @@ class Service:
             finally:
                 self.stop_job()
         self.vault.erase()
+        self.mounted = False
+        self.sealed_schedule = None
+        self.health_due = self.removed_since = None
+        self.removed_count = 0
         self.link_broken = False
         self.erasing = False
         self.recovery_error = None
@@ -333,12 +481,11 @@ class Service:
             except engine.BroadcastError:
                 return default
         cfg = safe(engine.load_config, None)
-        notes = engine.read_notes()
         interrupted = safe(engine.read_interrupted_run, None) if not self.job else None
         return {"linked": engine.is_linked() and cfg is not None and not self.link_broken,
                 "config": asdict(cfg) if cfg else None,
                 "groups": [asdict(group) for group in engine.read_group_entries()],
-                "notes": notes, "message": safe(engine.read_message, ""),
+                "message": safe(engine.read_message, ""),
                 "attachments": safe(engine.read_attachments, []),
                 "schedule": self.schedule_snapshot(), "job": self.job["kind"] if self.job else None,
                 "last_operation": self.last_operation,
@@ -351,7 +498,16 @@ class Service:
                 "events": [event for event in self.events if event["id"] > after],
                 "sequence": self.sequence,
                 "interrupted": asdict(interrupted) if interrupted else None,
-                "summary": asdict(summary) if (summary := engine.read_run_summary()) else None}
+                "summary": asdict(summary) if (summary := engine.read_run_summary()) else None,
+                "security": self.security_snapshot()}
+
+    def _remember_flags(self, record):
+        # Cached so the once-a-second snapshot never runs the Keychain helper.
+        self.flags = {"disguise": bool(record.get("disguise", True)), "panic_code": "panic" in record}
+
+    def security_snapshot(self):
+        return {**self.flags, "filevault": self.filevault, "failures_before_unlock": self.failures_before_unlock,
+                "link_removed": self.removed_since is not None}
 
     def schedule(self):
         return mac_schedule.read(self.vault.data / "schedule.json")
@@ -412,16 +568,18 @@ class Service:
             mac_retry.groups()
 
     def _start_job(self, kind):
+        if self.job and self.job["kind"] == "health" and kind != "health":
+            self.stop_job()  # A background link check gives way to the user; it is rescheduled.
         if self.job:
             raise SecurityError("Signal is busy. Wait for the current operation.")
         if self.update_state and self.update_state.get("changed"):
             raise SecurityError("Restart or finish installing the downloaded update first.")
-        if kind not in {"link", "sync", "notes", "send", "resume", "retry", "health", "update"}:
+        if kind not in {"link", "sync", "send", "resume", "retry", "health", "update"}:
             raise SecurityError("Unsupported job.")
         if kind in ("send", "resume", "retry"):
             self.send_preflight(kind)
         command = [sys.executable, str(PROJECT / "mac_worker.py")]
-        if sys.platform == "darwin" and kind in ("send", "resume", "retry", "notes", "sync"):
+        if sys.platform == "darwin" and kind in ("send", "resume", "retry", "sync"):
             command = ["/usr/bin/caffeinate", "-i", *command]
         try:
             proc = self.spawn(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -476,8 +634,8 @@ class Service:
                         self.phase = event["value"]
                     if event["kind"] == "update":
                         self.update_state = event["value"]
-                    if event["kind"] == "link_broken" and event["value"] is True:
-                        self.link_broken = True
+                    if event["kind"] == "link_state":
+                        self._link_state(event["value"])
                     if event["kind"] in {"log", "progress", "results", "qr", "error", "done", "phase", "receive_status", "send_diagnostic", "paused"}:
                         self._event(event["kind"], event["value"])
             returncode = proc.wait()
@@ -493,6 +651,14 @@ class Service:
                     (self.vault.root / "worker.json").unlink(missing_ok=True)
                     if job["kind"] == "link":
                         self.link_broken = False
+                        self.removed_since, self.removed_count = None, 0
+                    if job["kind"] == "health":
+                        self.health_due = time.monotonic() + (HEALTH_RECHECK_S if self.removed_since is not None
+                                                              else HEALTH_INTERVAL_S)
+                    elif job["kind"] in ("send", "resume", "retry", "sync") and self._job_failed(job, returncode):
+                        # A failure may be the first sign that the phone removed this Mac.
+                        soon = time.monotonic() + HEALTH_AFTER_FAILURE_S
+                        self.health_due = min(self.health_due or soon, soon)
                     if job.get("scheduled"):
                         summary = engine.read_run_summary() if returncode == 0 else None
                         message = (f"Scheduled broadcast finished: {summary.sent} sent, {summary.failed} failed, "
@@ -504,15 +670,66 @@ class Service:
                         self.schedule_result(outcome, message)
                     self._event("finished", job["kind"])
 
+    @staticmethod
+    def _job_failed(job, returncode):
+        """Workers report per-group failures with exit code 0, so read the outcome too."""
+        if returncode != 0:
+            return True
+        if job["kind"] == "sync":
+            return False
+        try:
+            summary = engine.read_run_summary()
+        except (OSError, ValueError, engine.BroadcastError):
+            return False
+        return bool(summary and summary.failed and not summary.sent)
+
+    def _link_state(self, value):
+        if value == "ok":
+            self.removed_since, self.removed_count = None, 0
+            self.link_broken = False
+        elif value == "removed":
+            self.link_broken = True  # Block sends while later checks confirm it.
+            now = time.monotonic()
+            if self.removed_since is None:
+                self.removed_since = now
+            self.removed_count += 1
+            if self.removed_count >= HEALTH_CONFIRM_COUNT and now - self.removed_since >= HEALTH_CONFIRM_S:
+                self.unlink_confirmed = True
+
     def tick(self, now: datetime | None = None):
         with self.mutex:
             if self.restart_requested:
                 if self.on_restart:
                     self.on_restart()
                 return
+            if ((self.vault.marker.exists() or self.erasing) and not self.shutting_down
+                    and time.monotonic() >= self.erase_retry_at):
+                # Finish an interrupted wipe without anyone pressing a button on the front,
+                # including one whose intent only reached the Keychain (full disk).
+                self.erase_retry_at = time.monotonic() + 60
+                try:
+                    self.erase()
+                except (OSError, SecurityError):
+                    pass
+                return
             if not self.open or self.vault.marker.exists() or self.shutting_down:
                 return
+            if self.unlink_confirmed:
+                # The phone removed this Mac. Leave nothing behind.
+                self.erase()
+                return
             now = now or datetime.now()
+            if not self.mounted:
+                if not self._wake_needed(now):
+                    return
+                try:
+                    self.vault.attach(self.key)
+                except SecurityError:
+                    # Back off: hdiutil runs under the mutex that every request needs.
+                    self.wake_retry_at = time.monotonic() + WAKE_RETRY_S
+                    self.schedule_error = "Could not open protected storage for scheduled work. Unlock the app."
+                    return
+                self.mounted = True
             try:
                 self._schedule_tick(now)
             except (OSError, ValueError, KeyError, TypeError, SecurityError, engine.BroadcastError):
@@ -520,6 +737,63 @@ class Service:
                 if self.schedule_error != message:
                     self._event("schedule_status", message)
                 self.schedule_error = message
+            self._health_tick()
+            self._seal_if_idle()
+
+    def _health_due(self):
+        return (self.health_due is not None and time.monotonic() >= self.health_due and not self.job
+                and not (self.update_state and self.update_state.get("changed")))
+
+    def _wake_needed(self, now):
+        """While sealed, reattach only for a due link check or a due scheduled send."""
+        if time.monotonic() < self.wake_retry_at:
+            return False
+        if self._health_due():
+            return True
+        if not self.sealed_schedule:
+            return False
+        data = copy.deepcopy(self.sealed_schedule)
+        mac_schedule.advance(data, now)
+        return bool(data.get("pending"))
+
+    def _health_tick(self):
+        if not self._health_due():
+            return
+        if not engine.is_linked():
+            self.health_due = time.monotonic() + HEALTH_INTERVAL_S
+            return
+        try:
+            self._start_job("health")
+        except (SecurityError, OSError):
+            # Includes failing to record worker.json: retry later, never stop the service.
+            self.health_due = time.monotonic() + HEALTH_AFTER_FAILURE_S
+            return
+        self.health_due = None
+
+    def _seal_if_idle(self):
+        """Detach the vault whenever the interface is locked and no worker uses it.
+
+        Finder and Terminal then see no decrypted files. The key and a copy of the
+        schedule stay in memory, so due sends and link checks reopen it briefly.
+        A send still waiting (cooldown, a pending update) is retried every
+        WAKE_RETRY_S instead of holding the vault open while it waits."""
+        if self.token or self.job or not self.mounted or time.monotonic() < self.seal_retry_at:
+            return
+        try:
+            data = self.schedule()
+        except (OSError, ValueError, KeyError, TypeError, engine.BroadcastError):
+            data = None  # Unreadable: nothing to wake for; unlocking shows the problem.
+        engine.prune_logs()
+        try:
+            self.vault.detach()
+        except SecurityError:
+            # Usually a Finder window or file still open inside the vault.
+            self.seal_retry_at = time.monotonic() + SEAL_RETRY_S
+            return
+        self.mounted = False
+        self.sealed_schedule = data
+        if data and data.get("pending"):
+            self.wake_retry_at = time.monotonic() + WAKE_RETRY_S
 
     def _schedule_tick(self, now):
         data = self.schedule()
@@ -593,6 +867,8 @@ class Service:
                 return {"restarting": True}
             if op in ("unlock", "setup"):
                 return self.authenticate(request.get("password", ""), setup=op == "setup")
+            if op == "check_code":
+                return self.check_code(request.get("password", ""))
             self._authorized(request)
             if op == "lock":
                 self.lock()
@@ -601,6 +877,10 @@ class Service:
                 return self.snapshot(int(request.get("after", 0)))
             if op == "change_password":
                 return self.change_password(request.get("current", ""), request.get("new", ""))
+            if op == "disguise":
+                return self.set_disguise(request.get("enabled"))
+            if op == "panic_code":
+                return self.set_panic_code(request.get("code"))
             if op == "job":
                 return self._start_job(request.get("kind"))
             if op == "stop":
@@ -673,9 +953,6 @@ class Service:
                     else:
                         raise SecurityError("Unsupported setting.")
                 return {"saved": True}
-            if op == "delete_note":
-                engine.delete_note(int(request["timestamp"]))
-                return {"deleted": True}
             if op == "discard":
                 if self.job:
                     raise SecurityError("Wait for the active job.")
@@ -696,6 +973,8 @@ class Service:
             self.stop_job()
             self.events.clear()
             self.vault.detach()
+            self.mounted = False
+            self.key = None
             self.open = False
 
 
@@ -752,7 +1031,8 @@ def serve(service: Service, path: Path):
                     if "error" in response and (service.erasing or service.vault.marker.exists()):
                         response["error_code"] = "locked"
                         payload = json.dumps(response).encode() + b"\n"
-                    if "result" in response and request["op"] not in ("status", "lock", "erase", "update", "restart_update"):
+                    if "result" in response and request["op"] not in ("status", "lock", "erase", "update", "restart_update",
+                                                                       "check_code"):
                         # Serialization can race a lock or logout. Recheck at delivery
                         # and keep revocation serialized with the socket write.
                         authorization = ({"token": result["token"]} if request["op"] in ("setup", "unlock") else request)
