@@ -182,6 +182,7 @@ class Service:
         self.unlink_confirmed = False
         self.failures_before_unlock = 0
         self.failures_at_code = 0
+        self.flags = {"disguise": True, "panic_code": False}
         self.erase_retry_at = 0.0
 
     def recover(self):
@@ -291,6 +292,7 @@ class Service:
         newly_armed = record.get("disguise", True) and not record.get("front_armed", False)
         record["front_armed"] = True
         self.vault.keychain.save(record)
+        self._remember_flags(record)
         configure_storage(self.vault.data)
         engine.PRIVATE_TRANSPORT = True
         # The Mac app has no Notes page. Remove note copies an older version kept.
@@ -359,6 +361,7 @@ class Service:
         record = self.vault.keychain.load()
         record["disguise"] = enabled
         self.vault.keychain.save(record)
+        self._remember_flags(record)
         return {"saved": True}
 
     def set_panic_code(self, code):
@@ -366,6 +369,7 @@ class Service:
         if code is None:
             record.pop("panic", None)
             self.vault.keychain.save(record)
+            self._remember_flags(record)
             return {"saved": True}
         if not isinstance(code, str) or not 4 <= len(code.strip()) <= 64 or code != code.strip():
             raise SecurityError("Use a panic code of 4 to 64 characters, without leading or trailing spaces.")
@@ -379,6 +383,7 @@ class Service:
             raise SecurityError("The panic code cannot be your password.")
         record["panic"] = hash_panic_code(code)
         self.vault.keychain.save(record)
+        self._remember_flags(record)
         return {"saved": True}
 
     def stop_job(self):
@@ -483,10 +488,12 @@ class Service:
                 "summary": asdict(summary) if (summary := engine.read_run_summary()) else None,
                 "security": self.security_snapshot()}
 
+    def _remember_flags(self, record):
+        # Cached so the once-a-second snapshot never runs the Keychain helper.
+        self.flags = {"disguise": bool(record.get("disguise", True)), "panic_code": "panic" in record}
+
     def security_snapshot(self):
-        record = self.vault.keychain.load() or {}
-        return {"disguise": bool(record.get("disguise", True)), "panic_code": "panic" in record,
-                "failures_before_unlock": self.failures_before_unlock,
+        return {**self.flags, "failures_before_unlock": self.failures_before_unlock,
                 "link_removed": self.removed_since is not None}
 
     def schedule(self):
