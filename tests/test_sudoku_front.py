@@ -151,6 +151,18 @@ class SealingTests(Fixture):
             self.service.tick(datetime(2026, 1, 1, 8))
         attach.assert_called_once()
 
+    def test_failed_unlock_after_mounting_detaches_again(self):
+        self.setup()
+        self.request("lock")
+        self.service.tick(datetime(2026, 1, 1, 8))
+        self.assertFalse(self.vault.attached)
+        with mock.patch.object(engine, "discard_notes", side_effect=PermissionError("notes.json")):
+            with self.assertRaises(PermissionError):
+                self.service.authenticate(PASSWORD)
+        self.assertFalse(self.vault.attached)
+        self.assertFalse(self.service.mounted)
+        self.assertIsNone(self.service.token)
+
     def test_unlocked_or_busy_vault_stays_mounted(self):
         self.setup()
         self.service.tick(datetime(2026, 1, 1, 8))

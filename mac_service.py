@@ -261,14 +261,27 @@ class Service:
                 self.erase()
                 raise WrongPassword(remaining)
             volume_password = self._unwrap_password(password, record)
-        if record["phase"] == "migrating":
-            self.retire(self.vault.project)
-            self.vault.create_image(volume_password)
-            self.vault.migrate(volume_password)
-        elif not self.mounted:
-            self.vault.attach(volume_password)
-        self.mounted = True
-        self.sealed_schedule = None
+        try:
+            if record["phase"] == "migrating":
+                self.retire(self.vault.project)
+                self.vault.create_image(volume_password)
+                self.vault.migrate(volume_password)
+            elif not self.mounted:
+                self.vault.attach(volume_password)
+            self.mounted = True
+            self.sealed_schedule = None
+            return self._open_session(volume_password)
+        except Exception:
+            # A failure after mounting must not leave decrypted files behind the game.
+            if not self.token and not self.job:
+                try:
+                    self.vault.detach()
+                    self.mounted = False
+                except SecurityError:
+                    pass  # Still busy; the next tick seals it.
+            raise
+
+    def _open_session(self, volume_password):
         self.vault.recover_imports()
         record = self.vault.keychain.load()
         # Wrong codes typed before the Sudoku step passed still get reported once.
