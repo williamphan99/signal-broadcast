@@ -466,6 +466,9 @@ class App(tk.Tk):
             self.build_tabs()
         ttk.Label(self.container, textvariable=self.notice, wraplength=680).pack(fill="x", pady=10)
         failures = security.get("failures_before_unlock", 0)
+        if not security.get("filevault", True):
+            self.notice.set("FileVault is off. Turn it on in System Settings → Privacy & Security → FileVault, "
+                            "so this Mac's whole disk is encrypted, not just this app's library.")
         if failures:
             self.notice.set(f"{failures} wrong {'code was' if failures == 1 else 'codes were'} entered before "
                             "this unlock. Three in a row erase everything.")

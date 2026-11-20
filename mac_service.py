@@ -50,6 +50,15 @@ class WorkerStartError(SecurityError):
 
 
 
+def filevault_on() -> bool:
+    """Whole-disk encryption status. Unknown counts as on, so no false alarm."""
+    try:
+        proc = subprocess.run(["/usr/bin/fdesetup", "isactive"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return proc.stdout.strip() != "false"
+
+
 def socket_path(root: Path = ROOT) -> Path:
     # Darwin's sockaddr_un path limit is 104 bytes. Keep the actual socket short,
     # in the owner's private temporary directory; its name contains no account ID.
@@ -183,6 +192,7 @@ class Service:
         self.failures_before_unlock = 0
         self.failures_at_code = 0
         self.flags = {"disguise": True, "panic_code": False}
+        self.filevault = True
         self.erase_retry_at = 0.0
 
     def recover(self):
@@ -297,6 +307,8 @@ class Service:
         engine.PRIVATE_TRANSPORT = True
         # The Mac app has no Notes page. Remove note copies an older version kept.
         engine.discard_notes()
+        engine.prune_logs()
+        self.filevault = filevault_on()
         self.key = volume_password
         self.open = True
         engine.ensure_config()
@@ -493,7 +505,7 @@ class Service:
         self.flags = {"disguise": bool(record.get("disguise", True)), "panic_code": "panic" in record}
 
     def security_snapshot(self):
-        return {**self.flags, "failures_before_unlock": self.failures_before_unlock,
+        return {**self.flags, "filevault": self.filevault, "failures_before_unlock": self.failures_before_unlock,
                 "link_removed": self.removed_since is not None}
 
     def schedule(self):
@@ -768,6 +780,7 @@ class Service:
             data = self.schedule()
         except (OSError, ValueError, KeyError, TypeError, engine.BroadcastError):
             data = None  # Unreadable: nothing to wake for; unlocking shows the problem.
+        engine.prune_logs()
         try:
             self.vault.detach()
         except SecurityError:

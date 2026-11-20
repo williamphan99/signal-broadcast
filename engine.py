@@ -3235,6 +3235,25 @@ def append_activity(line: str) -> None:
         fh.write(f"{datetime.now():%H:%M:%S}  {line}\n")
 
 
+LOG_RETENTION_DAYS = 7
+
+
+def prune_logs(days: int = LOG_RETENTION_DAYS) -> int:
+    """Delete dated activity and debug logs older than `days`. Even without names or
+    message text, a long history of timestamps shows when someone was active."""
+    cutoff = time.time() - days * 86400
+    removed = 0
+    for pattern in ("activity-*.txt", "debug-*.txt"):
+        for path in LOGS_DIR.glob(pattern):
+            try:
+                if path.is_file() and not path.is_symlink() and path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                pass
+    return removed
+
+
 def clear_logs() -> None:
     """Delete everything in logs/ — activity logs, debug logs, the last-send summary,
     the last-run marker — keeping only the tracked .gitkeep. The Security tab's

@@ -53,6 +53,7 @@ CONFIG="${BASE}-config"
 if [ -x "$CONFIG" ] && clang scripts/sudoku-launcher.c -o "$CONTENTS/MacOS/Sudoku.new" \
      $("$CONFIG" --cflags --embed) $("$CONFIG" --ldflags --embed) 2>/dev/null; then
   mv -f "$CONTENTS/MacOS/Sudoku.new" "$CONTENTS/MacOS/Sudoku"
+  rm -rf "$CONTENTS/MacOS/Sudoku.new.dSYM"   # debug symbols clang writes beside it
 else
   rm -f "$CONTENTS/MacOS/Sudoku.new"
   echo "(Using the script launcher; the Dock may show Python while the app runs.)"

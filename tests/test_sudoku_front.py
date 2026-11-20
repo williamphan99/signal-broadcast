@@ -347,6 +347,28 @@ class HealthSchedulingTests(Fixture):
         self.assertGreater(self.service.health_due, 0)
 
 
+class PrivacyTests(Fixture):
+    def test_old_dated_logs_are_pruned_and_recent_ones_kept(self):
+        self.setup()
+        engine.LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        old, recent = engine.LOGS_DIR / "activity-2026-01-01.txt", engine.LOGS_DIR / "activity-2026-01-09.txt"
+        for path in (old, recent):
+            path.write_text("12:00:00  Broadcast finished.")
+        week = engine.LOG_RETENTION_DAYS * 86400
+        import os, time
+        os.utime(old, (time.time() - week - 60,) * 2)
+        self.assertEqual(engine.prune_logs(), 1)
+        self.assertFalse(old.exists())
+        self.assertTrue(recent.exists())
+
+    def test_filevault_status_reaches_the_unlocked_window(self):
+        with mock.patch("mac_service.subprocess.run", return_value=mock.Mock(stdout="false\n")):
+            self.assertFalse(mac_service.filevault_on())
+        with mock.patch("mac_service.filevault_on", return_value=False):
+            self.setup()
+        self.assertFalse(self.request("snapshot")["security"]["filevault"])
+
+
 class ProbeTests(unittest.TestCase):
     def test_removed_pattern_ignores_network_and_bare_status_codes(self):
         for text in ("Connection closed", "timed out", "[403] Forbidden", "401 Unauthorized",
