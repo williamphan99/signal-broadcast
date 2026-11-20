@@ -308,6 +308,24 @@ class NotesRemovalTests(Fixture):
         self.assertEqual(started["argv"][0], "/signal-cli")
         selective.assert_not_called()
 
+    def test_unlock_clears_all_received_media_except_draft_photos(self):
+        self.setup()
+        files = {}
+        for relative in ("attachments/other-chat.jpg", "attachments/old-note.png", "attachments/kept.png",
+                         "avatars/profile-+19999999999", "stickers/pack/1.webp", "data/account.db"):
+            path = engine.DATA_DIR / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"x")
+            files[relative] = path
+        engine.write_attachments([str(files["attachments/kept.png"])])
+        # A migrated legacy note still points at the old checkout, so only the sweep finds it.
+        engine.NOTES_FILE.write_text(json.dumps([{"ts": 1, "photos": [{"path": "/old/checkout/old-note.png"}]}]))
+        self.request("lock")
+        self.token = self.service.authenticate(PASSWORD)["token"]
+        remaining = {r for r, path in files.items() if path.exists()}
+        self.assertEqual(remaining, {"attachments/kept.png", "data/account.db"})
+        self.assertFalse((engine.DATA_DIR / "stickers/pack").exists())
+
     def test_received_note_media_is_deleted_when_notes_are_off(self):
         self.setup()
         media = engine.DATA_DIR / "attachments" / "incoming"

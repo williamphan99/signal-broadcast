@@ -307,6 +307,7 @@ class Service:
         engine.PRIVATE_TRANSPORT = True
         # The Mac app has no Notes page. Remove note copies an older version kept.
         engine.discard_notes()
+        engine.discard_received_media()
         engine.prune_logs()
         self.filevault = filevault_on()
         self.key = volume_password

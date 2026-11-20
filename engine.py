@@ -1871,13 +1871,43 @@ def store_notes(found: list[dict]) -> int:
         return changed
 
 
+def _draft_files() -> set[str]:
+    try:
+        return {str(Path(line.strip()).resolve()) for line in ATTACHMENTS_FILE.read_text().splitlines() if line.strip()}
+    except OSError:
+        return set()
+
+
+# Where signal-cli keeps media it received: attachments from any chat (including the
+# old Notes downloads and the compatibility receiver), contacts' profile pictures and
+# stickers. The Mac app sends from its own imports and receives with these ignored.
+RECEIVED_MEDIA_DIRS = ("attachments", "avatars", "stickers")
+
+
+def discard_received_media() -> int:
+    """Delete every received file in Signal's store except ones the saved draft uses."""
+    draft, removed = _draft_files(), 0
+    for name in RECEIVED_MEDIA_DIRS:
+        folder = DATA_DIR / name
+        if not folder.is_dir() or folder.is_symlink():
+            continue
+        for path in sorted(folder.rglob("*"), reverse=True):
+            try:
+                if path.is_symlink() or path.is_file():
+                    if str(path.resolve()) not in draft:
+                        path.unlink()
+                        removed += 1
+                elif path.is_dir() and not any(path.iterdir()):
+                    path.rmdir()
+            except OSError:
+                pass
+    return removed
+
+
 def discard_notes() -> int:
     """Delete every stored note, its downloaded photos and any damaged or half-written
     notes file. Photos the saved draft still uses (the old "Use as message") stay."""
-    try:
-        draft = {str(Path(line.strip()).resolve()) for line in ATTACHMENTS_FILE.read_text().splitlines() if line.strip()}
-    except OSError:
-        draft = set()
+    draft = _draft_files()
     with _notes_transaction():
         try:
             notes = json.loads(NOTES_FILE.read_text(encoding="utf-8"))
