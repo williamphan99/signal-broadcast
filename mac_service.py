@@ -30,11 +30,14 @@ from mac_worker import configure_storage
 LABEL = "local.sudoku.helper"
 LEGACY_LABEL = "com.user.signal-broadcast.service"
 MAX_REQUEST = 1024 * 1024
-# Link checks contact Signal. Erasing on an unlink needs two "removed" answers this
-# far apart, so one odd server reply can never wipe a working installation.
+# Link checks contact Signal. Erasing on an unlink needs HEALTH_CONFIRM_COUNT
+# "removed" answers spanning HEALTH_CONFIRM_S with no "ok" between them, so a
+# passing server or credential problem can never wipe a working installation.
 HEALTH_AFTER_UNLOCK_S = 5
 HEALTH_AFTER_FAILURE_S = 30
-HEALTH_CONFIRM_S = 600
+HEALTH_RECHECK_S = 600
+HEALTH_CONFIRM_S = 3600
+HEALTH_CONFIRM_COUNT = 3
 HEALTH_INTERVAL_S = 6 * 3600
 SEAL_RETRY_S = 30
 # Survives password changes; everything else in the record is rebuilt by wrap_password.
@@ -173,6 +176,7 @@ class Service:
         self.seal_retry_at = 0.0
         self.health_due = None
         self.removed_since = None
+        self.removed_count = 0
         self.unlink_confirmed = False
         self.failures_before_unlock = 0
         self.failures_at_code = 0
@@ -425,6 +429,7 @@ class Service:
         self.mounted = False
         self.sealed_schedule = None
         self.health_due = self.removed_since = None
+        self.removed_count = 0
         self.link_broken = False
         self.erasing = False
         self.recovery_error = None
@@ -606,9 +611,9 @@ class Service:
                     (self.vault.root / "worker.json").unlink(missing_ok=True)
                     if job["kind"] == "link":
                         self.link_broken = False
-                        self.removed_since = None
+                        self.removed_since, self.removed_count = None, 0
                     if job["kind"] == "health":
-                        self.health_due = time.monotonic() + (HEALTH_CONFIRM_S if self.removed_since is not None
+                        self.health_due = time.monotonic() + (HEALTH_RECHECK_S if self.removed_since is not None
                                                               else HEALTH_INTERVAL_S)
                     elif returncode != 0 and job["kind"] in ("send", "resume", "retry", "sync"):
                         # A failure may be the first sign that the phone removed this Mac.
@@ -627,14 +632,15 @@ class Service:
 
     def _link_state(self, value):
         if value == "ok":
-            self.removed_since = None
+            self.removed_since, self.removed_count = None, 0
             self.link_broken = False
         elif value == "removed":
-            self.link_broken = True  # Block sends while the second check confirms it.
+            self.link_broken = True  # Block sends while later checks confirm it.
             now = time.monotonic()
             if self.removed_since is None:
                 self.removed_since = now
-            elif now - self.removed_since >= HEALTH_CONFIRM_S:
+            self.removed_count += 1
+            if self.removed_count >= HEALTH_CONFIRM_COUNT and now - self.removed_since >= HEALTH_CONFIRM_S:
                 self.unlink_confirmed = True
 
     def tick(self, now: datetime | None = None):

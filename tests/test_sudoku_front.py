@@ -162,27 +162,30 @@ class UnlinkTests(Fixture):
         with mock.patch("mac_service.time.monotonic", return_value=at):
             self.service._link_state(state)
 
-    def test_two_removed_answers_apart_erase_everything(self):
+    def test_repeated_removed_answers_over_an_hour_erase_everything(self):
         self.setup()
-        self.finish_health("removed", 1000)
+        hour = mac_service.HEALTH_CONFIRM_S
+        for at in (1000, 1000 + hour / 2):
+            self.finish_health("removed", at)
+            self.service.tick(datetime(2026, 1, 1, 8))
+            self.assertIsNotNone(self.store.record)
         self.assertTrue(self.service.link_broken)
-        self.service.tick(datetime(2026, 1, 1, 8))
-        self.assertIsNotNone(self.store.record)
-        self.finish_health("removed", 1000 + mac_service.HEALTH_CONFIRM_S)
+        self.finish_health("removed", 1000 + hour)
         self.service.tick(datetime(2026, 1, 1, 8))
         self.assertIsNone(self.store.record)
         self.assertFalse(self.vault.image.exists())
 
-    def test_quick_repeat_unknown_or_recovered_answers_never_erase(self):
+    def test_quick_repeats_unknown_or_recovered_answers_never_erase(self):
         self.setup()
-        self.finish_health("removed", 1000)
-        self.finish_health("removed", 1010)
-        self.finish_health("unknown", 2000)
+        hour = mac_service.HEALTH_CONFIRM_S
+        for at in (1000, 1010, 1020, 1030):  # Many answers, but not an hour apart.
+            self.finish_health("removed", at)
+        self.finish_health("unknown", 1000 + 2 * hour)
         self.service.tick(datetime(2026, 1, 1, 8))
         self.assertIsNotNone(self.store.record)
-        self.finish_health("ok", 3000)
+        self.finish_health("ok", 1000 + 2 * hour)
         self.assertFalse(self.service.link_broken)
-        self.finish_health("removed", 1000 + 10 * mac_service.HEALTH_CONFIRM_S)
+        self.finish_health("removed", 1000 + 10 * hour)  # The count restarts after "ok".
         self.service.tick(datetime(2026, 1, 1, 8))
         self.assertIsNotNone(self.store.record)
 
@@ -243,16 +246,20 @@ class ProbeTests(unittest.TestCase):
     def test_probe_link_classifies_signal_answers(self):
         def run(returncode, stderr=""):
             return mock.Mock(returncode=returncode, stdout="", stderr=stderr)
-        cases = ((run(0), "ok"), (run(1, "Authorization failed!"), "removed"), (run(1, "Connection closed"), "unknown"))
+        cases = ((run(0), True, "ok"), (run(1, "Authorization failed!"), True, "removed"),
+                 (run(1, "Authorization failed!"), False, "unknown"),  # Rejection while offline proves nothing.
+                 (run(1, "Connection closed"), True, "unknown"))
         with tempfile.TemporaryDirectory() as directory, \
              mock.patch.object(engine, "LOGS_DIR", Path(directory)), \
              mock.patch.object(engine, "SIGNAL_CLI_LOCK_FILE", Path(directory) / "lock"), \
-             mock.patch.object(engine, "_link_is_broken_unlocked", return_value=False), \
+             mock.patch.object(engine, "_link_is_broken_unlocked", return_value=True) as accounts, \
              mock.patch.object(engine, "signal_cli_bin", return_value="signal-cli"), \
              mock.patch.object(engine, "load_config", return_value=mock.Mock(account="+19999999999")):
-            for result, expected in cases:
-                with mock.patch.object(engine.subprocess, "run", return_value=result):
+            for result, reachable, expected in cases:
+                with mock.patch.object(engine.subprocess, "run", return_value=result), \
+                     mock.patch.object(engine, "signal_reachable", return_value=reachable):
                     self.assertEqual(engine.probe_link(), expected)
+            accounts.assert_not_called()  # An empty local account list is never evidence.
             with mock.patch.object(engine.subprocess, "run", side_effect=engine.subprocess.TimeoutExpired("x", 1)):
                 self.assertEqual(engine.probe_link(), "unknown")
 

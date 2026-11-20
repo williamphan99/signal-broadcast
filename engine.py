@@ -1035,21 +1035,34 @@ def _link_is_broken_unlocked() -> bool:
     return not any(e.get("number") or e.get("account") for e in accounts)
 
 
-# Signal's answer when this linked device was removed under the phone's Linked
-# Devices. Deliberately narrower than ACCOUNT_UNUSABLE_PATTERN: bare 401/403 text,
-# timeouts and connection errors must never look like a removal, because the Mac
-# app erases itself when it sees this twice.
+# signal-cli's answers when Signal rejects this device's credentials, as it does once
+# the phone removes it from Linked Devices. Deliberately narrower than
+# ACCOUNT_UNUSABLE_PATTERN: timeouts and connection errors never match. signal-cli
+# reports any 401/403 this way, so one answer is a suspicion, not proof; the Mac
+# service only erases after repeated answers over an hour (see mac_service).
 LINK_REMOVED_PATTERN = re.compile(r"user\s+\S+\s+is not registered|authorization failed", re.IGNORECASE)
+SIGNAL_SERVER = ("chat.signal.org", 443)
+
+
+def signal_reachable() -> bool:
+    """A TLS handshake with Signal's server, so a rejection is not a network fault."""
+    import socket
+    import ssl
+    try:
+        with socket.create_connection(SIGNAL_SERVER, timeout=SIGNAL_CONTROL_TIMEOUT_S) as raw:
+            with ssl.create_default_context().wrap_socket(raw, server_hostname=SIGNAL_SERVER[0]):
+                return True
+    except OSError:
+        return False
 
 
 def probe_link() -> str:
     """Ask Signal whether this device is still linked: "ok", "removed" or "unknown".
 
-    listDevices is an authenticated request that does not consume queued messages,
-    so it cannot lose a Note to Self. Anything inconclusive is "unknown"."""
+    listDevices is an authenticated request that does not consume queued messages.
+    An empty local account list is not evidence: signal-cli can omit an account
+    after a failed network check. Anything inconclusive is "unknown"."""
     with signal_cli_operation("checking the link"):
-        if _link_is_broken_unlocked():
-            return "removed"
         try:
             binary = signal_cli_bin()
             account = load_config().account
@@ -1063,7 +1076,8 @@ def probe_link() -> str:
             return "unknown"
         if proc.returncode == 0:
             return "ok"
-        return "removed" if LINK_REMOVED_PATTERN.search(f"{proc.stdout}\n{proc.stderr}") else "unknown"
+        rejected = LINK_REMOVED_PATTERN.search(f"{proc.stdout}\n{proc.stderr}")
+        return "removed" if rejected and signal_reachable() else "unknown"
 
 
 def _request_sync(binary: str, account: str) -> None:
