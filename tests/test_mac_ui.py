@@ -218,6 +218,35 @@ class MacUITests(unittest.TestCase):
             finally:
                 app.destroy()
 
+    def test_code_dialog_cannot_close_while_a_check_is_pending(self):
+        import tkinter as tk
+        import sudoku
+        with tempfile.TemporaryDirectory(prefix="sb-ui-dialog-") as directory:
+            window = tk.Tk()
+            replies = []
+            try:
+                view = sudoku.SudokuView(window, on_code=lambda text, reply: replies.append(reply),
+                                         state_file=Path(directory) / "game.json")
+                view.pack()
+                view.ask_code()
+                window.update()
+                entry = next(child for child in view.dialog.winfo_children() if isinstance(child, tk.Entry))
+                entry.insert(0, "a long local passphrase")
+                entry.event_generate("<Return>")
+                window.update()
+                self.assertEqual(len(replies), 1)
+                entry.event_generate("<Escape>")  # Ignored while the service answers.
+                window.update()
+                self.assertTrue(view.dialog.winfo_exists())
+                replies[0]("invalid")
+                self.assertEqual(str(entry.cget("state")), "normal")
+                entry.event_generate("<Escape>")
+                window.update()
+                self.assertIsNone(view.dialog)
+                replies[0]("ok")  # A late reply after closing is harmless.
+            finally:
+                window.destroy()
+
     def test_sudoku_front_unlocks_with_password_and_relocks(self):
         from mac_app import App
         with isolated_engine(), tempfile.TemporaryDirectory(prefix="sb-ui-front-") as directory:
@@ -251,8 +280,16 @@ class MacUITests(unittest.TestCase):
                 self.assertEqual(app.screen, "front")
                 self.assertEqual(service.status()["attempts_remaining"], 2)
                 app.front_code(PASSWORD, replies.append)
-                pump(lambda: app.screen in ("main", "link"))
+                pump(lambda: app.screen == "login")  # Layer two: the ordinary password screen.
                 self.assertEqual(replies, ["invalid", "ok"])
+                self.assertIsNone(service.token)
+                app.back_to_game()
+                self.assertEqual(app.screen, "front")
+                app.front_code(PASSWORD, replies.append)
+                pump(lambda: app.screen == "login" and str(app.login_button.cget("state")) == "normal")
+                app.password.insert(0, PASSWORD)
+                app.login()
+                pump(lambda: app.screen in ("main", "link"))
                 self.assertIn("1 wrong code", app.notice.get())
                 app.lock()
                 pump(lambda: app.screen == "front" and service.token is None)

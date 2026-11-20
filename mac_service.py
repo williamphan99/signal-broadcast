@@ -324,7 +324,7 @@ class Service:
             raise WrongPassword(remaining)
         self._unwrap_password(password, record)
         record = self.vault.keychain.load()
-        self.failures_at_code = record["failures"]
+        self.failures_at_code = max(self.failures_at_code, record["failures"])
         record["failures"] = 0
         self.vault.keychain.save(record)
         return {"ok": True}
