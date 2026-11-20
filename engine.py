@@ -1871,7 +1871,12 @@ def store_notes(found: list[dict]) -> int:
 
 
 def discard_notes() -> int:
-    """Delete every stored note, its downloaded photos and any damaged notes file."""
+    """Delete every stored note, its downloaded photos and any damaged or half-written
+    notes file. Photos the saved draft still uses (the old "Use as message") stay."""
+    try:
+        draft = {str(Path(line.strip()).resolve()) for line in ATTACHMENTS_FILE.read_text().splitlines() if line.strip()}
+    except OSError:
+        draft = set()
     with _notes_transaction():
         try:
             notes = json.loads(NOTES_FILE.read_text(encoding="utf-8"))
@@ -1879,10 +1884,12 @@ def discard_notes() -> int:
             notes = []
         notes = [note for note in notes if isinstance(note, dict)] if isinstance(notes, list) else []
         for note in notes:
-            for photo in note.get("photos", []):
-                if isinstance(photo, dict) and isinstance(photo.get("path"), str):
-                    _remove_note_file(Path(photo["path"]))
-        for path in (NOTES_FILE, NOTES_CORRUPT_FILE):
+            photos = note.get("photos")
+            for photo in photos if isinstance(photos, list) else []:
+                path = photo.get("path") if isinstance(photo, dict) else None
+                if isinstance(path, str) and str(Path(path).resolve()) not in draft:
+                    _remove_note_file(Path(path))
+        for path in (NOTES_FILE, NOTES_CORRUPT_FILE, *NOTES_FILE.parent.glob(NOTES_FILE.name + ".*.tmp")):
             path.unlink(missing_ok=True)
     return len(notes)
 

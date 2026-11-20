@@ -262,6 +262,24 @@ class NotesRemovalTests(Fixture):
         with self.assertRaisesRegex(SecurityError, "Unsupported"):
             self.request("delete_note", timestamp=1)
 
+    def test_discarding_notes_keeps_photos_the_saved_draft_uses(self):
+        self.setup()
+        attachments = engine.DATA_DIR / "attachments"
+        attachments.mkdir(parents=True, exist_ok=True)
+        used, unused = attachments / "used", attachments / "unused"
+        used.write_bytes(b"in the draft")
+        unused.write_bytes(b"only in a note")
+        engine.write_attachments([str(used)])
+        engine.NOTES_FILE.write_text(json.dumps([{"ts": 1, "photos": [{"path": str(used)}, {"path": str(unused)}]},
+                                                 {"ts": 2, "photos": None}, "not a note"]))
+        leftover = engine.NOTES_FILE.with_name(engine.NOTES_FILE.name + ".123.tmp")
+        leftover.write_text("half-written note text")
+        self.assertEqual(engine.discard_notes(), 2)
+        self.assertTrue(used.exists())
+        self.assertFalse(unused.exists())
+        self.assertFalse(leftover.exists())
+        self.assertEqual(engine.read_attachments(), [str(used)])
+
     def test_received_note_media_is_deleted_when_notes_are_off(self):
         self.setup()
         media = engine.DATA_DIR / "attachments" / "incoming"
