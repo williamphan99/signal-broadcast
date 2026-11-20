@@ -118,6 +118,39 @@ class SealingTests(Fixture):
         self.assertTrue(self.vault.attached)
         self.request("snapshot")
 
+    def test_waiting_send_or_pending_update_never_holds_the_vault_open(self):
+        self.setup()
+        engine.set_config_value("account", "+19999999999")
+        engine.GROUPS_FILE.write_text("fixture\tFixture\n")
+        engine.write_message("Disposable scheduled draft")
+        self.request("schedule", times=["09:00"], enabled=True)
+        self.service.update_state = {"changed": True}  # A downloaded update waits; sends wait too.
+        self.request("lock")
+        clock = [1000.0]
+        with mock.patch("mac_service.time.monotonic", side_effect=lambda: clock[0]):
+            self.service.tick(datetime(2026, 1, 1, 9))
+            self.assertFalse(self.vault.attached)  # Sealed although the 09:00 send is pending.
+            self.assertTrue(self.service.sealed_schedule["pending"])
+            clock[0] += 10
+            self.service.tick(datetime(2026, 1, 1, 9, 0, 10))
+            self.assertFalse(self.vault.attached)  # Not reopened before the retry delay.
+            attach = mock.Mock(wraps=self.vault.attach)
+            with mock.patch.object(self.vault, "attach", attach):
+                clock[0] += mac_service.WAKE_RETRY_S
+                self.service.tick(datetime(2026, 1, 1, 9, 2, 10))
+            attach.assert_called_once()
+            self.assertFalse(self.vault.attached)  # Checked, still waiting, sealed again.
+
+    def test_failed_background_mount_backs_off(self):
+        self.setup()
+        self.request("lock")
+        self.service.tick(datetime(2026, 1, 1, 8))
+        self.service.health_due = 0
+        with mock.patch.object(self.vault, "attach", side_effect=SecurityError("busy")) as attach:
+            self.service.tick(datetime(2026, 1, 1, 8))
+            self.service.tick(datetime(2026, 1, 1, 8))
+        attach.assert_called_once()
+
     def test_unlocked_or_busy_vault_stays_mounted(self):
         self.setup()
         self.service.tick(datetime(2026, 1, 1, 8))
@@ -149,12 +182,18 @@ class SealingTests(Fixture):
         self.service.tick(datetime(2026, 1, 1, 8, 58))
         self.assertFalse(self.vault.attached)
         started = []
-        self.service._start_job = lambda kind: started.append(kind)
+        def start(kind):
+            started.append(kind)
+            self.service.job = {"kind": kind}
+        self.service._start_job = start
         self.service.tick(datetime(2026, 1, 1, 8, 59))
         self.assertFalse(self.vault.attached)
         self.service.tick(datetime(2026, 1, 1, 9))
         self.assertEqual(started, ["send"])
-        self.assertTrue(self.vault.attached)  # Stays open while the scheduled run is recorded.
+        self.assertTrue(self.vault.attached)  # Stays open while the scheduled send runs.
+        self.service.job = None
+        self.service.tick(datetime(2026, 1, 1, 9, 1))
+        self.assertFalse(self.vault.attached)  # And closes once it has finished.
 
 
 class UnlinkTests(Fixture):

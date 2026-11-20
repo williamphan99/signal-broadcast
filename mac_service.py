@@ -40,6 +40,7 @@ HEALTH_CONFIRM_S = 3600
 HEALTH_CONFIRM_COUNT = 3
 HEALTH_INTERVAL_S = 6 * 3600
 SEAL_RETRY_S = 30
+WAKE_RETRY_S = 120  # Reopening for a send still waiting (cooldown, busy) or after a failed mount.
 # Survives password changes; everything else in the record is rebuilt by wrap_password.
 CARRIED_FIELDS = ("pending_originals", "disguise", "front_armed", "panic")
 
@@ -174,6 +175,7 @@ class Service:
         self.mounted = False
         self.sealed_schedule = None
         self.seal_retry_at = 0.0
+        self.wake_retry_at = 0.0
         self.health_due = None
         self.removed_since = None
         self.removed_count = 0
@@ -670,10 +672,11 @@ class Service:
                 try:
                     self.vault.attach(self.key)
                 except SecurityError:
+                    # Back off: hdiutil runs under the mutex that every request needs.
+                    self.wake_retry_at = time.monotonic() + WAKE_RETRY_S
                     self.schedule_error = "Could not open protected storage for scheduled work. Unlock the app."
                     return
                 self.mounted = True
-                self.sealed_schedule = None
             try:
                 self._schedule_tick(now)
             except (OSError, ValueError, KeyError, TypeError, SecurityError, engine.BroadcastError):
@@ -690,6 +693,8 @@ class Service:
 
     def _wake_needed(self, now):
         """While sealed, reattach only for a due link check or a due scheduled send."""
+        if time.monotonic() < self.wake_retry_at:
+            return False
         if self._health_due():
             return True
         if not self.sealed_schedule:
@@ -712,20 +717,18 @@ class Service:
         self.health_due = None
 
     def _seal_if_idle(self):
-        """Detach the vault while the interface is locked and nothing needs it.
+        """Detach the vault whenever the interface is locked and no worker uses it.
 
-        Finder and Terminal then see no decrypted files. The key stays in memory
-        so schedules and link checks keep working without the password."""
+        Finder and Terminal then see no decrypted files. The key and a copy of the
+        schedule stay in memory, so due sends and link checks reopen it briefly.
+        A send still waiting (cooldown, a pending update) is retried every
+        WAKE_RETRY_S instead of holding the vault open while it waits."""
         if self.token or self.job or not self.mounted or time.monotonic() < self.seal_retry_at:
-            return
-        if self.update_state and self.update_state.get("changed"):
             return
         try:
             data = self.schedule()
         except (OSError, ValueError, KeyError, TypeError, engine.BroadcastError):
-            return  # Keep it mounted; the schedule tick reports the problem.
-        if data.get("pending") or data.get("running"):
-            return
+            data = None  # Unreadable: nothing to wake for; unlocking shows the problem.
         try:
             self.vault.detach()
         except SecurityError:
@@ -734,6 +737,8 @@ class Service:
             return
         self.mounted = False
         self.sealed_schedule = data
+        if data and data.get("pending"):
+            self.wake_retry_at = time.monotonic() + WAKE_RETRY_S
 
     def _schedule_tick(self, now):
         data = self.schedule()
